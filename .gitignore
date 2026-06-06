@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated data (reproducible via scripts)
+data/china_data/
+
+# Training artifacts
+checkpoints/
+tensorboard_logs/
+exported_models/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp / debugging scripts
+*.tmp
+*.log
+test_modes.py
+train_1m.py
+train_3b.py
+train_round2.py
+train_lstm.py
