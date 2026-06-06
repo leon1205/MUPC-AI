@@ -5,6 +5,7 @@ __pycache__/
 
 # Generated data (reproducible via scripts)
 data/china_data/
+data/smart_ds_augmented/
 
 # Training artifacts
 checkpoints/
