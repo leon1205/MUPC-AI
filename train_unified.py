@@ -35,23 +35,29 @@ def _concat_datasets(*datasets: dict) -> dict:
     merged["month"] = (np.arange(n) // (96 * 30) % 12 + 1).astype(np.float32)
     merged["hour_encoded"] = np.sin(hours * 2 * np.pi / 24).astype(np.float32)
 
-    # 合成缺失字段
-    merged["grid_power"] = np.zeros(n, dtype=np.float32)
-    merged["transformer_load"] = np.zeros(n, dtype=np.float32)
-    merged["battery_power"] = np.zeros(n, dtype=np.float32)
-    for ph in ("a", "b", "c"):
-        merged[f"voltage_phase_{ph}"] = np.ones(n, dtype=np.float32)
-    merged["pv_forecast"] = np.zeros(n, dtype=np.float32)
-    merged["load_forecast"] = np.zeros(n, dtype=np.float32)
-    merged["current_electricity_price"] = np.zeros(n, dtype=np.float32)
-    merged["next_period_price"] = np.zeros(n, dtype=np.float32)
-    merged["price_tariff_id"] = np.zeros(n, dtype=np.int32)
-    merged["current_demand"] = np.zeros(n, dtype=np.float32)
-    merged["contract_demand"] = np.full(n, 300.0, dtype=np.float32)
-    merged["peak_demand_this_month"] = np.zeros(n, dtype=np.float32)
-    merged["solar_irradiance"] = np.zeros(n, dtype=np.float32)
-    merged["temperature"] = np.zeros(n, dtype=np.float32)
-    merged["dispatch_p_set"] = np.zeros(n, dtype=np.float32)
+    # 补充源数据中确实不存在的字段 (仅当 key 不存在时才设置)
+    _defaults = {
+        "grid_power": np.zeros(n, dtype=np.float32),
+        "transformer_load": np.zeros(n, dtype=np.float32),
+        "battery_power": np.zeros(n, dtype=np.float32),
+        "voltage_phase_a": np.ones(n, dtype=np.float32),
+        "voltage_phase_b": np.ones(n, dtype=np.float32),
+        "voltage_phase_c": np.ones(n, dtype=np.float32),
+        "pv_forecast": np.zeros(n, dtype=np.float32),
+        "load_forecast": np.zeros(n, dtype=np.float32),
+        "current_electricity_price": np.zeros(n, dtype=np.float32),
+        "next_period_price": np.zeros(n, dtype=np.float32),
+        "price_tariff_id": np.zeros(n, dtype=np.int32),
+        "current_demand": np.zeros(n, dtype=np.float32),
+        "contract_demand": np.full(n, 300.0, dtype=np.float32),
+        "peak_demand_this_month": np.zeros(n, dtype=np.float32),
+        "solar_irradiance": np.zeros(n, dtype=np.float32),
+        "temperature": np.zeros(n, dtype=np.float32),
+        "dispatch_p_set": np.zeros(n, dtype=np.float32),
+    }
+    for key, default_val in _defaults.items():
+        if key not in merged:
+            merged[key] = default_val
 
     return merged
 

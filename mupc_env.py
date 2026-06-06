@@ -223,9 +223,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._episode_start = np.random.randint(0, max(1, max_start))
         self._step_idx = self._episode_start
 
-        # 随机模式 (多模式训练)
+        # 设置当前场景
         if self._mode == "all":
             self._current_mode = np.random.choice(ALL_MODES)
+        else:
+            self._current_mode = self._mode  # 单模式: 固定为指定场景
 
         # 重置校验器
         self._validator.reset()
