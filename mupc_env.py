@@ -57,7 +57,7 @@ EPISODE_LENGTH = 96             # 1 天 = 96 步 × 15 分钟
 
 DEFAULT_WEIGHTS: dict[str, list[float]] = {
     "MODE-01": [1.0, 0.5, 2.0],     # w1(光伏消纳), w2(电池), w3(过载)
-    "MODE-02": [1.0, 1.0],           # w1(价差), w2(电池)
+    "MODE-02": [1.0, 1.0, 2.0],      # w1(价差), w2(电池), w3(过载)
     "MODE-03": [1.0, 0.5],           # w1(需量减免), w2(舒适度)
     "MODE-04": [1.0, 2.0, 1.0],      # w1(辅助收益), w2(响应精度), w3(延迟)
     "MODE-05": [1.0, 1.0],           # w1(绿电), w2(碳减排)
@@ -498,7 +498,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-02: 自主套利 ──────────────────────────────
 
     def _reward_arbitrage(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """R = w1*R_spread - w2*P_batt_deg"""
+        """R = w1*R_spread - w2*P_batt_deg - w3*P_overload"""
         price = float(self._data["current_electricity_price"][self._step_idx])
         avg_price = 0.8
         r_spread = r["p_batt"] * (price - avg_price) / (P_BATT_MAX_KW * 0.4)
@@ -507,10 +507,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         delta_soc = abs(self._soc - r["soc_new"])
         p_batt_deg = delta_soc
 
-        total = w[0] * r_spread - w[1] * p_batt_deg
+        p_overload = max(0.0, r["load_rate"] - 1.0)  # w3: 过载惩罚
+        w3 = w[2] if len(w) > 2 else 0.0
+
+        total = w[0] * r_spread - w[1] * p_batt_deg - w3 * p_overload
         info = {
             "r_price_spread": float(r_spread),
             "p_battery_degradation": float(-p_batt_deg),
+            "p_transformer_overload": float(-p_overload) if w3 > 0 else 0.0,
         }
         return float(total), info
 
