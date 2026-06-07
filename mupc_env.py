@@ -272,10 +272,25 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 5. 电网交换功率
         grid_power = p_load_eff - p_pv_eff + p_batt
 
-        # 6. 变压器负载率
+        # 6. 变压器负载率 + 过载硬约束 (SAFETY)
         q_load = p_load_eff * math.tan(math.acos(LOAD_PF))
         s_transformer = math.sqrt(grid_power ** 2 + (q_load - q_batt) ** 2)
         load_rate = s_transformer / TRANSFORMER_KVA
+
+        # SAFETY: 变压器过载硬约束, 类似 SOC clamp
+        # 当 load_rate > 1.0 时, 自动限制 p_batt 使负载率不超过 100%
+        if load_rate > 1.0:
+            q_net = q_load - q_batt
+            s_max = TRANSFORMER_KVA
+            # 计算目标有功功率 (保持符号不变)
+            p_target = math.sqrt(max(0, s_max**2 - q_net**2))
+            if grid_power < 0:
+                p_target = -p_target
+            p_batt_clamped = p_target - (p_load_eff - p_pv_eff)
+            p_batt = float(np.clip(p_batt_clamped, -P_BATT_MAX_KW, P_BATT_MAX_KW))
+            grid_power = p_load_eff - p_pv_eff + p_batt
+            s_transformer = math.sqrt(grid_power**2 + q_net**2)
+            load_rate = s_transformer / TRANSFORMER_KVA
 
         # 7. 电压更新
         p_net = p_pv_eff - p_load_eff + p_batt
