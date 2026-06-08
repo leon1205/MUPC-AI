@@ -311,13 +311,13 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 
 **5 种场景与奖励函数**（与 MUPC AI 引擎 PRD 第 6 章完全对齐）：
 
-| 场景 ID | 命令行 | 优化目标 | 公式 |
+| 场景 | 命令行 | 优化目标 | 公式 |
 |---------|--------|----------|------|
-| MODE-01 | `MODE-01` | 农网灌溉：最大化光伏消纳 + 防止过载 + 电压质量 + 功率变化率 | `R = w1·R_pv_consumption - w2·P_battery_degradation - w3·P_transformer_overload - w4·P_voltage_deviation - w5·R_ramp` |
-| MODE-02 | `MODE-02` | 自主套利：最大化峰谷价差 + 最小化电池损耗 | `R = w1·R_price_spread - w2·P_battery_degradation` |
-| MODE-03 | `MODE-03` | 需量控制：减免需量罚金 | `R = w1·R_demand_penalty_avoidance - w2·P_comfort_loss` |
-| MODE-04 | `MODE-04` | 虚拟电厂：辅助服务收益 + 响应精度 | `R = w1·R_ancillary_service + w2·R_response_accuracy - w3·P_deadline_deviation` |
-| MODE-05 | `MODE-05` | 极致绿色：最大化绿电消纳 + 最小化碳排放 | `R = w1·R_green_consumption + w2·R_carbon_reduction` |
+| SCENE-01: 台区季节性负荷模式 (MODE-01) | `MODE-01` | 最大化光伏消纳 + 防止过载 + 电压质量 + 功率变化率 | `R = w1·R_pv_consumption - w2·P_battery_degradation - w3·P_transformer_overload - w4·P_voltage_deviation - w5·R_ramp` |
+| SCENE-B1: 工商业模式-自主套利 (MODE-02) | `MODE-02` | 最大化峰谷价差 + 最小化电池损耗 | `R = w1·R_price_spread - w2·P_battery_degradation` |
+| SCENE-B2: 工商业模式-需量控制 (MODE-03) | `MODE-03` | 减免需量罚金 | `R = w1·R_demand_penalty_avoidance - w2·P_comfort_loss` |
+| SCENE-B3: 工商业模式-虚拟电厂 (MODE-04) | `MODE-04` | 辅助服务收益 + 响应精度 | `R = w1·R_ancillary_service + w2·R_response_accuracy - w3·P_deadline_deviation` |
+| SCENE-B5: 工商业模式-极致绿色 (MODE-05) | `MODE-05` | 最大化绿电消纳 + 最小化碳排放 | `R = w1·R_green_consumption + w2·R_carbon_reduction` |
 
 > 各场景奖励公式的完整定义见 MUPC AI 引擎 PRD 第 6.2~6.6 节。本环境在 `mupc_env.py` 中逐项实现。
 
