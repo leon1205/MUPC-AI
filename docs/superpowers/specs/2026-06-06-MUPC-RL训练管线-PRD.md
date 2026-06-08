@@ -2,12 +2,16 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
-| v2.0 | 2026-06-06 | 需求分析师 | **[REVIEWED: PASS]** |
+| v2.2 | 2026-06-08 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.2 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.5 (`[REVIEWED: PASS]`)
 
 ---
 
+> **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
+>
+> **v2.1 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
+>
 > **v2.0 变更说明：** 本版本完全对齐 MUPC AI 引擎 PRD v2.2 的完整规格。状态空间从 6 维扩展为 48/49 维（21 字段序列化），动作空间从 2 维扩展为 4 维，奖励函数从简化版升级为 5 种场景的完整公式。新增 LSTM 预测模型训练和动作约束校验功能。旧版 v1.0 基于 CLAUDE.md 的简化方案已废弃。
 
 ---
@@ -19,7 +23,7 @@
 MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python 工具链。它负责训练两个核心模型并通过 ONNX 交付给 MUPC AI 引擎（RK3588 NPU 部署）：
 
 1. **LSTM 时序预测模型** — 光伏出力 / 负荷功率时序预测
-2. **PPO/SAC 强化学习决策模型** — 4 维动作空间的多目标优化控制
+2. **PPO/SAC 强化学习决策模型** — 2 维动作空间的多目标优化控制
 
 本管线是 MUPC AI 引擎的**模型供给侧**。训练的模型经 ONNX 导出后，由部署端进行 INT8 量化（rknn-toolkit2）并在 RK3588 NPU 上执行推理。
 
@@ -39,8 +43,8 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 │  MUPC AI 引擎 (RK3588, Rust)                                      │
 │                                                                    │
 │  DataFusionEngine(5数据源) → FusedSystemState(21字段)             │
-│    → to_input_vector() [48维] → RKNN Runtime → ActionOutput(4维) │
-│    → ActionValidator(5条约束) → strategy-engine                  │
+│    → to_input_vector() [58维] → RKNN Runtime → ActionOutput(2维) │
+│    → ActionValidator(3条约束) → strategy-engine                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +59,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 推理框架 | 不涉及 | RKNN Runtime (NPU) |
 | 动作校验 | 环境内部 clamp | ActionValidator (5条规则) |
 
-> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.2。差异仅在于数据获取方式。
+> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.4。差异仅在于数据获取方式。
 
 ### 1.3 目标平台
 
@@ -98,10 +102,10 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 编号 | 功能 | 优先级 | 说明 |
 |------|------|--------|------|
 | F1 | SMART-DS 数据加载与合成 | P0 | 加载光伏/负荷数据 + 合成缺失的 21 字段数据 |
-| F2 | MUPC 全状态环境仿真 | P0 | 48 维观测 + 4 维动作 + 5 种场景奖励的 Gymnasium 环境 |
+| F2 | MUPC 全状态环境仿真 | P0 | 58 维观测 + 2 维动作 + 5 种场景奖励的 Gymnasium 环境 |
 | F3 | LSTM 时序预测模型训练 | P0 | 光伏/负荷预测，输出 15 分钟预测向量 |
-| F4 | 多模式 RL 训练 | P0 | PPO/SAC 训练，多模式单模型，48/49 维输入 |
-| F5 | 动作约束校验 | P0 | 5 条约束规则，环境内 clamp |
+| F4 | 多模式 RL 训练 | P0 | PPO/SAC 训练，多模式单模型，58/59 维输入 |
+| F5 | 动作约束校验 | P0 | 3 条约束规则（ACT-01/03/05），环境内 clamp |
 | F6 | 模型导出 | P0 | LSTM + RL 策略网络 → ONNX，含 onnxruntime 验证 |
 | F7 | 训练监控 | P1 | TensorBoard + CSV 日志，21 字段各自可追踪 |
 
@@ -175,49 +179,50 @@ V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
 
 #### 功能描述
 
-`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.2 完整规格的 Gymnasium 环境。
+`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.5 完整规格的 Gymnasium 环境。
 
-**观测空间（48 维序列化向量）**：
+**观测空间（58 维序列化向量，多模式 59 维）**：
 
 遵循 MUPC AI 引擎设计文档 `to_input_vector()` 布局：
 
 ```
 索引      内容                      来源类别
-[0..9]    D1 实时数据 (9标量)       SMART-DS + 环境仿真
-[9..24]   D2 pv_forecast (15维)    LSTM 输出
-[24..39]  D2 load_forecast (15维)  LSTM 输出
-[39..42]  D3 电价 (3字段)          TOU 合成
-[42..45]  D4 需量 (3字段)          合成
-[45..47]  D5 气象 (2字段)          SMART-DS
-[47]      D6 dispatch_p_set (1维)  合成 (None→0.0)
+[0..9]    D1 实时数据 (10标量)      SMART-DS + 环境仿真（含 q_realtime_margin）
+[10..24]  D2 pv_forecast (15维)     LSTM 输出
+[25..39]  D2 load_forecast (15维)   LSTM 输出
+[41..43]  D3 电价 (3字段)           TOU 合成
+[44..46]  D4 需量 (3字段)           合成
+[47..48]  D5 气象 (2字段)           SMART-DS
+[49]      D6 dispatch_p_set (1维)      合成 (None→0.0)
+[50]      D7 q_realtime_margin       实时控制模块计算
+[51..56]  D7 season_encoding (6维)   合成（季节 one-hot）
+[57]      D7 time_period_encoding    合成（时段 one-hot，白天/夜间）
 ```
 
-多模式训练时追加 mode_id 为第 49 维。
+多模式训练时追加 mode_id 为第 59 维。
 
-**动作空间（4 维）**：
+**动作空间（2 维）**：
 
 | 维度 | 字段名 | 训练值域 | 单位 | 说明 |
 |------|--------|----------|------|------|
-| 0 | p_batt_set | [-1, 1] → [-500, 500] kW | kW | 电池有功功率设定值 |
-| 1 | q_batt_set | [-1, 1] → [-300, 300] kVar | kVar | 无功功率设定值 |
-| 2 | load_shedding | [0, 1] → [0, 500] kW | kW | 可中断负荷切除量 |
-| 3 | pv_limit | [0, 1] → [0, 1] 比例 | - | 光伏限功率比例 |
+| 0 | p_batt_set | [-1, 1] → [-500, 500] kW | kW | 电池有功功率设定值（RL 控制） |
+| 1 | load_shedding | [0, 1] → [0, 500] kW | kW | 可中断负荷切除量（RL 控制） |
 
-> 训练时动作归一化到 [-1,1] 或 [0,1]，环境内部映射到物理值。这与部署端 ActionOutput 物理值一一对应。
+> **v2.4 分层控制架构：** Q 控制（q_batt_set）和 pv_limit 由 MUPC 实时控制核心模块根据电压闭环调节，不经过 RL。RL 专注能量管理（P_batt + Load_shedding），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
 
 **核心物理方程**：
 
 ```
 P_batt = p_batt_set_norm * 500  (kW)
-Q_batt = q_batt_set_norm * 300  (kVar)
 P_load_eff = P_load - load_shedding  (kW, 切除后有效负荷)
-P_pv_eff = P_pv * pv_limit  (kW, 限功率后有效光伏)
+P_pv_eff = P_pv  (光伏不限功率，由 Q 调节替代)
 
 SOC_raw = SOC_t + (-P_batt * dt) / BATTERY_CAPACITY_KWH
 SOC_{t+1} = clamp(SOC_raw, 0.10, 0.90)  // SAFETY: 硬约束
 
 grid_power = P_load_eff - P_pv_eff + P_batt
 Q_load = P_load_eff * tan(acos(0.90))  (功率因数 0.90)
+Q_batt 由实时控制核心闭环调节（电压死区 ±5%）
 S_transformer = sqrt(grid_power² + (Q_load - Q_batt)²)
 load_rate = S_transformer / TRANSFORMER_KVA (500)
 
@@ -244,13 +249,13 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F2-01 | `mupc_env.py` 可独立运行随机动作循环 100 步 | `python mupc_env.py` 无错误 |
-| F2-02 | `observation_space.shape = (48,)` | 单元测试 |
-| F2-03 | `action_space.shape = (4,)` | 单元测试 |
+| F2-02 | `observation_space.shape = (58,)` | 单元测试 |
+| F2-03 | `action_space.shape = (2,)` | 单元测试 |
 | F2-04 | SOC 硬约束不可突破 | 单元测试：连续充电 1000 步，验证 SOC ≤ 0.90 |
 | F2-05 | info dict 包含全部奖励分量原始值 + SOC + load_rate | 单元测试 |
 | F2-06 | 电压仿真三相电压在 [0.85, 1.15] 内 | 单元测试 |
 | F2-07 | 兼容 gymnasium.Env 和 _gym_stub 双重接口 | 集成测试 |
-| F2-08 | terminal_observation 包含完整 48 维观测 | 单元测试 |
+| F2-08 | terminal_observation 包含完整 59 维观测 | 单元测试 |
 
 ---
 
@@ -308,7 +313,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 
 | 场景 ID | 命令行 | 优化目标 | 公式 |
 |---------|--------|----------|------|
-| MODE-01 | `MODE-01` | 农网灌溉：最大化光伏消纳 + 防止过载 | `R = w1·R_pv_consumption - w2·P_battery_degradation - w3·P_transformer_overload` |
+| MODE-01 | `MODE-01` | 农网灌溉：最大化光伏消纳 + 防止过载 + 电压质量 + 功率变化率 | `R = w1·R_pv_consumption - w2·P_battery_degradation - w3·P_transformer_overload - w4·P_voltage_deviation - w5·R_ramp` |
 | MODE-02 | `MODE-02` | 自主套利：最大化峰谷价差 + 最小化电池损耗 | `R = w1·R_price_spread - w2·P_battery_degradation` |
 | MODE-03 | `MODE-03` | 需量控制：减免需量罚金 | `R = w1·R_demand_penalty_avoidance - w2·P_comfort_loss` |
 | MODE-04 | `MODE-04` | 虚拟电厂：辅助服务收益 + 响应精度 | `R = w1·R_ancillary_service + w2·R_response_accuracy - w3·P_deadline_deviation` |
@@ -317,14 +322,14 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 > 各场景奖励公式的完整定义见 MUPC AI 引擎 PRD 第 6.2~6.6 节。本环境在 `mupc_env.py` 中逐项实现。
 
 **多模式训练策略**：
-- `--mode all`（默认）：每个 episode 随机选择一种场景，mode_id 编码追加到观测向量（49 维），训练单一模型覆盖全部 5 种场景
-- `--mode MODE-01`：单场景训练，观测为 48 维
+- `--mode all`（默认）：每个 episode 随机选择一种场景，mode_id 编码追加到观测向量（59 维），训练单一模型覆盖全部 5 种场景
+- `--mode MODE-01`：单场景训练，观测为 58 维
 
 **PPO 网络结构**：
 
 ```
-Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
-                       ├── actor:  Linear(4)  → Tanh (A1,A2) / Sigmoid (A3,A4)
+Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
+                       ├── actor:  Linear(2)  → Tanh (A1) / Sigmoid (A2)
                        └── critic: Linear(1)
 ```
 
@@ -340,7 +345,7 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 | F4-04 | `--mode MODE-01` 时所有 episode 使用同一种奖励函数 | 检查 CSV 日志 |
 | F4-05 | SB3 不可用时自动切换 `_ppo_core.py` | 卸载 SB3 后测试 |
 | F4-06 | Ctrl+C 中断保存 checkpoint 不丢失进度 | 手动测试 |
-| F4-07 | TensorBoard 中可监控所有奖励分量 + 4 个动作维度的均值 | 手动检查 |
+| F4-07 | TensorBoard 中可监控所有奖励分量 + 2 个动作维度的均值 | 手动检查 |
 
 ---
 
@@ -348,23 +353,23 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 
 #### 功能描述
 
-遵循 MUPC AI 引擎 PRD 第 5.4 节的 5 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+遵循 MUPC AI 引擎 PRD 第 5.4 节的 3 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+
+> **v2.4 变更：** ACT-02（Δq_batt ≤ 30 kVar/步）和 ACT-04（pv_limit ≥ 0.1）已移除。Q 控制和光伏限功率由实时控制核心闭环调节，不经过 RL。
 
 | 规则 ID | 约束条件 | 训练环境实现 |
 |---------|----------|-------------|
 | ACT-01 | Δp_batt ≤ 50 kW/步 | 计算变化率，超标则 clamp |
-| ACT-02 | Δq_batt ≤ 30 kVar/步 | 计算变化率，超标则 clamp |
-| ACT-03 | √(p_batt²+q_batt²) ≤ 500 kVA | 超标则等比例缩放回功率圆内 |
-| ACT-04 | pv_limit ≥ 0.1（防逆流时除外） | clamp 到 [0.1, 1.0] |
+| ACT-03 | √(p_batt²+q_batt²) ≤ 500 kVA（q 取实时值） | 超标则等比例缩放 P |
 | ACT-05 | dispatch_p 有效时 \|p_batt\| ≤ \|dispatch_p\| | 有调度时 clamp |
 
-> 部署端 ActionValidator 在 Rust 端同样实现这 5 条规则。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
+> 部署端 ActionValidator 在 Rust 端同样实现这 3 条规则（ACT-02/04 由实时控制处理）。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
 
 #### 验收标准
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
-| F5-01 | 5 条约束均实现 | 单元测试：逐条触发违规并验证 clamp 结果 |
+| F5-01 | 3 条约束均实现 | 单元测试：逐条触发违规并验证 clamp 结果 |
 | F5-02 | 约束违反时 info dict 中记录 `constraint_violated=True` | 单元测试 |
 | F5-03 | 约束校验耗时 < 0.5ms | 性能测试 |
 
@@ -377,7 +382,7 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 `export_onnx.py` 导出两种模型为 ONNX：
 
 1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features)，输出 (1, 30)
-2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 48) 或 (1, 49)，输出 (1, 4)
+2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 58) 或 (1, 59)，输出 (1, 2)
 
 导出流程：
 1. 加载 PyTorch checkpoint / NumPy PPO weights
@@ -390,7 +395,7 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
-| F6-01 | RL 策略 ONNX 输入 (1, 48) 输出 (1, 4) | 检查 ONNX spec |
+| F6-01 | RL 策略 ONNX 输入 (1, 58) 输出 (1, 2) | 检查 ONNX spec |
 | F6-02 | LSTM ONNX 输入 (1, 4, 6) 输出 (1, 30) | 检查 ONNX spec |
 | F6-03 | ONNX 推理与 PyTorch 推理误差 < 1e-5 | 单元测试 |
 | F6-04 | 导出文件名含时间戳 | 检查文件名 |
@@ -403,7 +408,7 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 | 指标 | 输出位置 |
 |------|----------|
 | episode 奖励（总和 + 各分量） | TensorBoard + CSV |
-| 4 个动作维度的均值/最大值 | TensorBoard |
+| 2 个动作维度的均值/最大值 | TensorBoard |
 | SOC 均值、负载率均值、过载次数 | TensorBoard + 控制台 |
 | 当前场景 ID | CSV |
 | 训练 loss（actor/critic） | TensorBoard |
@@ -494,7 +499,7 @@ Input(48 or 49) → Linear(128) → ReLU → Linear(128) → ReLU
 ```
 MUPC-AI2/
 ├── data_loader.py              # F1: 数据加载 + 状态合成
-├── mupc_env.py                 # F2: Gymnasium 环境 (48/49 维, 4 维动作)
+├── mupc_env.py                 # F2: Gymnasium 环境 (58/59 维, 2 维动作)
 ├── lstm_model.py               # F3: LSTM 训练
 ├── train.py                    # F4: RL 训练主入口
 ├── action_validator.py         # F5: 动作约束校验
@@ -520,3 +525,26 @@ MUPC-AI2/
 | 3 | 负荷预测区分基荷/可调负荷/冲击负荷三类，训练数据如何标注？SMART-DS 不含此分类 | 高 | 影响 LSTM 训练数据准备 |
 
 ---
+
+## v2.2 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 状态空间 48/49 维→56/57 维 | 1.1/3.3/3.5 | 新增 D7 字段: q_realtime_margin (1维) + season_encoding (6维) + time_period_encoding (2维) |
+| 2 | SCENE-01 奖励函数重写 | 3.5 | 新增 α(s) 自适应损耗系数、条件触发电压惩罚、弃光电压前置条件 |
+| 3 | 更新部署端 PRD 版本引用 | 文档头部 | v2.4 → v2.5 |
+| 4 | 观测空间维度更新 | 3.3 | 单模式 56 维，多模式 57 维 |
+
+**修订依据：** MUPC AI 引擎 PRD v2.5 状态空间扩展 + SCENE-01 奖励函数重写
+
+## v2.1 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 动作空间 4 维→2 维 | 1.1/3.3/3.5/3.6/3.7/6 | 分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding |
+| 2 | SCENE-01 奖励函数更新 | 3.5 | 新增 w4（电压质量惩罚）、w5（功率变化率惩罚 R_ramp）、电压死区（±5%，越限连续 2 步触发） |
+| 3 | ACT-02/ACT-04 约束移除 | 3.6 | Q 变化率和光伏限功率由实时控制处理，训练环境移除对应约束 |
+| 4 | 更新部署端 PRD 版本引用 | 文档头部 | v2.2 → v2.4 |
+| 5 | SceneWeights 表更新 | 隐含 | MODE-01 权重数量从 3 增至 5 |
+
+**修订依据：** MUPC AI 引擎 PRD v2.4 分层控制架构 + 电压死区 + 变化率惩罚

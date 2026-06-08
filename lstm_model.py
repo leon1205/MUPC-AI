@@ -29,7 +29,10 @@ def _ensure_torch():
             _nn = nn
             _TORCH_AVAILABLE = True
         except ImportError:
-            raise ImportError("PyTorch 未安装。训练 LSTM 或导出 ONNX 需要 PyTorch。")
+            _TORCH_AVAILABLE = False
+
+# ── 初始化 PyTorch（立即尝试加载，确保 _TORCH_AVAILABLE 正确） ──
+_ensure_torch()
 
 # ── 模型定义 ──────────────────────────────────────────────────
 
@@ -88,6 +91,20 @@ class LSTMForecast:
         self.lstm.load_state_dict(d["lstm"])
         self.head_pv.load_state_dict(d["head_pv"])
         self.head_load.load_state_dict(d["head_load"])
+
+    def eval(self) -> "LSTMForecast":
+        """切换到评估模式。"""
+        self.lstm.eval()
+        self.head_pv.eval()
+        self.head_load.eval()
+        return self
+
+    def train(mode: bool = True) -> "LSTMForecast":
+        """切换到训练/评估模式。"""
+        self.lstm.train(mode)
+        self.head_pv.train(mode)
+        self.head_load.train(mode)
+        return self
 
     def forward(self, x) -> "torch.Tensor":
         """

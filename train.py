@@ -118,8 +118,6 @@ def main():
           f"Gymnasium={'可用' if has_gym else '不可用(使用_gym_stub)'}, "
           f"PyTorch={'可用' if has_torch else '不可用'}")
 
-    has_torch = _check_torch()
-
     # ── 数据加载 ────────────────────────────────────────
     print("\n── 数据加载 ──")
     from data_loader import SmartDSLoader
@@ -165,7 +163,7 @@ def main():
 
     obs_dim = env.observation_space.shape[0]
     print(f"  观测空间: Box({obs_dim},)")
-    print(f"  动作空间: Box(4,), 模式: {args.mode}, 算法: {args.algo}")
+    print(f"  动作空间: Box(2,), 模式: {args.mode}, 算法: {args.algo}")
 
     # ── 训练 ────────────────────────────────────────────
     os.makedirs(args.checkpoint_path, exist_ok=True)

@@ -33,12 +33,12 @@ class MLPPolicy:
 
     网络结构:
       Input(obs_dim) → Linear(128) → ReLU → Linear(128) → ReLU
-                        ├── actor:  Linear(4) → [Tanh(:2), Sigmoid(2:)]
+                        ├── actor:  Linear(2) → [Tanh(:1), Sigmoid(1:)]
                         └── critic: Linear(1)
     """
 
-    def __init__(self, obs_dim: int = 48, hidden: list[int] | None = None,
-                 act_dim: int = 4):
+    def __init__(self, obs_dim: int = 58, hidden: list[int] | None = None,
+                 act_dim: int = 2):
         if hidden is None:
             hidden = [128, 128]
         self.obs_dim = obs_dim
@@ -79,10 +79,10 @@ class MLPPolicy:
         """前向传播 → (action_mean, value)。"""
         latent = self._forward_shared(obs)  # (batch, 128)
         action_mean = latent @ self.weights["actor_w"] + self.weights["actor_b"]
-        # A1,A2: Tanh; A3,A4: Sigmoid
-        a1a2 = np.tanh(action_mean[:, :2])
-        a3a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:]))  # sigmoid
-        action = np.concatenate([a1a2, a3a4], axis=-1)
+        # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
+        a1 = np.tanh(action_mean[:, :1])
+        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))  # sigmoid
+        action = np.concatenate([a1, a2], axis=-1)
         value = latent @ self.weights["critic_w"] + self.weights["critic_b"]
         return action, value.ravel()
 
@@ -91,21 +91,22 @@ class MLPPolicy:
         """采样动作。
 
         Returns:
-            (action_4d, value_scalar, log_prob_scalar)
+            (action_2d, value_scalar, log_prob_scalar)
         """
         latent = self._forward_shared(obs[np.newaxis, :])  # (1, 128)
         action_mean = (latent @ self.weights["actor_w"] + self.weights["actor_b"]).ravel()
 
         std = np.exp(self.log_std)
         if deterministic:
-            noise = 0.0
+            noise = np.zeros(self.act_dim)
         else:
             noise = np.random.randn(self.act_dim) * std
 
-        # 混合激活
-        a1a2 = np.tanh(action_mean[:2] + noise[:2])
-        a3a4 = 1.0 / (1.0 + np.exp(-(action_mean[2:] + noise[2:])))
-        action = np.concatenate([a1a2, a3a4])
+        # 混合激活: A1=Tanh(p_batt), A2=Sigmoid(load_shedding)
+        am = action_mean  # (act_dim,)
+        a1 = np.tanh(am[:1] + noise[:1])  # both (1,)
+        a2 = 1.0 / (1.0 + np.exp(-(am[1:] + noise[1:])))  # both (1,)
+        action = np.concatenate([a1, a2])
 
         # 对数概率 (忽略 Tanh/Sigmoid 内部的 Jacobian 修正, 简化版)
         log_prob = -0.5 * np.sum((noise / std) ** 2 + 2.0 * np.log(std) + np.log(2 * np.pi))
@@ -331,9 +332,9 @@ class NumPyPPO:
         # 前向
         latent = self.policy._forward_shared(obs)
         action_mean = latent @ self.policy.weights["actor_w"] + self.policy.weights["actor_b"]
-        a1a2 = np.tanh(action_mean[:, :2])
-        a3a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:]))
-        new_actions = np.concatenate([a1a2, a3a4], axis=-1)
+        a1 = np.tanh(action_mean[:, :1])
+        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))
+        new_actions = np.concatenate([a1, a2], axis=-1)
         new_values = (latent @ self.policy.weights["critic_w"]
                       + self.policy.weights["critic_b"]).ravel()
 
@@ -370,12 +371,11 @@ class NumPyPPO:
 
         # Invert activation to get old pre-activation action
         a_raw_old = np.zeros_like(old_actions)
-        # A1,A2: tanh → atanh
+        # A1: tanh → atanh, A2: sigmoid → logit
         eps = 0.999999
-        a_raw_old[:, :2] = np.arctanh(np.clip(old_actions[:, :2], -eps, eps))
-        # A3,A4: sigmoid → logit
-        a_raw_old[:, 2:] = np.log(np.clip(old_actions[:, 2:], 1e-7, 1-1e-7) /
-                                   (1.0 - np.clip(old_actions[:, 2:], 1e-7, 1-1e-7)))
+        a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
+        a_raw_old[:, 1:] = np.log(np.clip(old_actions[:, 1:], 1e-7, 1-1e-7) /
+                                   (1.0 - np.clip(old_actions[:, 1:], 1e-7, 1-1e-7)))
 
         # Gradient of log_prob w.r.t. action_mean = (a_raw - μ) / σ²
         dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean) / sigma2
@@ -458,3 +458,75 @@ class NumPyPPO:
         data = np.load(path)
         weights = dict(data)
         self.policy.set_weights(weights)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 自测入口
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    from data_loader import SmartDSLoader
+    from mupc_env import MupcEnv
+
+    print("=" * 52)
+    print("  NumPy PPO 自测")
+    print("=" * 52)
+
+    # 1. MLPPolicy 2D 输出验证
+    print("\n[1] MLPPolicy 2D 输出...")
+    policy = MLPPolicy(obs_dim=48, act_dim=2)
+    obs = np.random.randn(48).astype(np.float32)
+    action, value = policy.forward(obs[np.newaxis, :])
+    assert action.shape == (1, 2), f"action shape {action.shape} != (1,2)"
+    assert -1.0 <= action[0, 0] <= 1.0, f"p_batt {action[0,0]} out of [-1,1]"
+    assert 0.0 <= action[0, 1] <= 1.0, f"load_shed {action[0,1]} out of [0,1]"
+    print(f"  p_batt={action[0,0]:.3f}, load_shed={action[0,1]:.3f} [OK]")
+
+    # 2. get_action 确定性/随机
+    print("[2] get_action 采样...")
+    act_det, _, _ = policy.get_action(obs, deterministic=True)
+    assert act_det.shape == (2,), f"det shape {act_det.shape}"
+    act_stoch, _, _ = policy.get_action(obs, deterministic=False)
+    assert act_stoch.shape == (2,), f"stoch shape {act_stoch.shape}"
+    print(f"  deterministic: p={act_det[0]:.3f}, l={act_det[1]:.3f} [OK]")
+    print(f"  stochastic:   p={act_stoch[0]:.3f}, l={act_stoch[1]:.3f} [OK]")
+
+    # 3. ActionValidator 3 条约束规则
+    print("[3] ActionValidator 约束规则...")
+    from action_validator import ActionValidator
+    v = ActionValidator()
+    # ACT-01: 小变化不触发
+    v.validate(np.array([0.0, 0.0]), dispatch_p=None)
+    _, violated, _ = v.validate(np.array([0.05, 0.0]), dispatch_p=None)
+    assert not violated, "small delta should not trigger ACT-01"
+    # ACT-01: 大变化触发
+    _, violated, violations = v.validate(np.array([0.3, 0.0]), dispatch_p=None)
+    assert violated and "ACT-01" in violations, f"ACT-01 not triggered: {violations}"
+    # ACT-03: 功率圆越限
+    v.reset()
+    v.validate(np.array([0.0, 0.0]), dispatch_p=None)
+    v.prev_p_batt = 310.0
+    _, violated, violations = v.validate(np.array([0.7, 0.0]), dispatch_p=None, q_batt_real=400.0)
+    assert violated and "ACT-03" in violations, f"ACT-03 not triggered: {violations}"
+    # ACT-05: 调度约束
+    v.reset()
+    v.validate(np.array([0.0, 0.0]), dispatch_p=None)
+    v.prev_p_batt = 260.0
+    _, violated, violations = v.validate(np.array([0.6, 0.0]), dispatch_p=200.0)
+    assert violated and "ACT-05" in violations, f"ACT-05 not triggered: {violations}"
+    print("  ACT-01 (delta P <= 50kW) [OK]")
+    print("  ACT-03 (sqrt(P^2+Q^2) <= 500kVA) [OK]")
+    print("  ACT-05 (|P| <= |dispatch|) [OK]")
+
+    # 4. NumPyPPO 训练一步
+    print("[4] NumPyPPO 训练一步...")
+    loader = SmartDSLoader()
+    data = loader.load_all()
+    train, _ = loader.split(data)
+    env = MupcEnv(train, mode="MODE-01")
+    config = {"n_steps": 96, "batch_size": 32, "n_epochs": 2, "lr": 3e-4}
+    ppo = NumPyPPO(env, config=config)
+    ppo.learn(96)  # 1 episode
+    print("  训练一步完成 [OK]")
+
+    print(f"\n[PASS] _ppo_core.py 自测通过")

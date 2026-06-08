@@ -39,7 +39,7 @@ def _ensure_export_deps():
 
 # ── RL 策略导出模型 ────────────────────────────────────────────
 
-def _build_rl_export_model(obs_dim: int = 48, act_dim: int = 4,
+def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 2,
                            hidden: list[int] | None = None):
     """构建仅用于 ONNX 导出的策略网络壳。"""
     import torch
@@ -62,9 +62,10 @@ def _build_rl_export_model(obs_dim: int = 48, act_dim: int = 4,
         def forward(self, x):
             latent = self.shared(x)
             action = self.actor(latent)
-            a1a2 = torch.tanh(action[:, :2])
-            a3a4 = torch.sigmoid(action[:, 2:])
-            return torch.cat([a1a2, a3a4], dim=-1)
+            # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
+            a1 = torch.tanh(action[:, :1])
+            a2 = torch.sigmoid(action[:, 1:])
+            return torch.cat([a1, a2], dim=-1)
 
     return RLExportModel()
 
@@ -99,7 +100,7 @@ def _load_npz_weights(npz_path: str, obs_dim: int) -> dict:
 def export_rl_policy(
     checkpoint_dir: str = "./checkpoints/",
     output_dir: str = "./exported_models/",
-    obs_dim: int = 48,
+    obs_dim: int = 58,
     checkpoint_path: str | None = None,
 ) -> str:
     """导出 RL 策略网络为 ONNX。
@@ -236,14 +237,42 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/") ->
     Output: (batch=1, 30) = [pv_forecast(15), load_forecast(15)]
     """
     import torch
+    import torch.nn as nn
     import onnx
 
     _ensure_export_deps()
 
     from lstm_model import LSTMForecast
-    model = LSTMForecast()
+    lstm_model = LSTMForecast()
     state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    lstm_model.load_state_dict(state_dict)
+    lstm_model.eval()
+
+    # Wrap in nn.Module for ONNX export
+    class LSTMWrapper(nn.Module):
+        def __init__(self, lstm_model):
+            super().__init__()
+            # Use LSTMForecast's actual submodules (already initialized with correct dropout)
+            self.lstm = lstm_model.lstm
+            self.head_pv = lstm_model.head_pv
+            self.head_load = lstm_model.head_load
+            # LSTMForecast.state_dict() returns nested dict, load into nn.Module directly
+            # by flattening it
+            nested_sd = lstm_model.state_dict()
+            flat_sd = {}
+            for submod, params in nested_sd.items():
+                for k, v in params.items():
+                    flat_sd[f"{submod}.{k}"] = v
+            self.load_state_dict(flat_sd)
+
+        def forward(self, x):
+            _, (h_n, _) = self.lstm(x)
+            last_hidden = h_n[-1]
+            pv_pred = self.head_pv(last_hidden)
+            load_pred = self.head_load(last_hidden)
+            return torch.cat([pv_pred, load_pred], dim=-1)
+
+    model = LSTMWrapper(lstm_model)
     model.eval()
 
     os.makedirs(output_dir, exist_ok=True)

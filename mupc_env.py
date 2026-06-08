@@ -1,12 +1,14 @@
 """
-MUPC 全状态强化学习环境 — 48/49 维观测, 4 维动作, 5 种场景奖励。
+MUPC 全状态强化学习环境 — 48/49 维观测, 2 维动作, 5 种场景奖励。
 
-对齐 MUPC AI 引擎 PRD v2.2:
+对齐 MUPC AI 引擎 PRD v2.4:
   - 状态空间: 21 字段序列化为 48/49 维向量
-  - 动作空间: [p_batt, q_batt, load_shedding, pv_limit] (4 维)
+  - 动作空间: [p_batt, load_shedding] (2 维) — Q 控制交由实时电压调节器闭环
   - 5 种预设场景 MODE-01~05 各独立奖励函数
-  - 三相电压简化仿真 (Q-V 耦合)
-  - 5 条动作约束规则 (ActionValidator)
+  - 三相电压简化仿真 (Q-V 耦合，Q 由实时模块根据电压闭环给出)
+  - 电压死区 (±5%) + 功率变化率惩罚，保护电池免受高频微循环损耗
+  - 3 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
+    ACT-05(调度约束) — Q/功率圆/pv_limit 相关约束由实时控制处理
 """
 
 import math
@@ -50,17 +52,27 @@ CONTRACT_DEMAND_KW = 300.0      # 合同需量 (kW)
 GRID_EMISSION_FACTOR = 0.581   # kg CO2/kWh
 EPISODE_LENGTH = 96             # 1 天 = 96 步 × 15 分钟
 
+# ── v2.5 奖励阈值配置 ─────────────────────────────────────────
+# 对齐 MUPC AI 引擎 PRD v2.5 RewardThresholdConfig
+
+VOLTAGE_DEADBAND = 0.05         # ±5% 死区
+Q_MARGIN_THRESHOLD = 0.10      # 实时模块无功耗尽阈值 (10%)
+VOLTAGE_HIGH_LIMIT = 1.05       # 弃光前置电压阈值 (p.u.)
+SOC_CRITICAL = 0.10             # SOC 极低保护阈值
+VOLTAGE_PENALTY_HIGH = 2.0     # 高电压侧惩罚系数 (光伏超发)
+VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 奖励权重映射
 # ═══════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS: dict[str, list[float]] = {
-    "MODE-01": [1.0, 0.5, 2.0],     # w1(光伏消纳), w2(电池), w3(过载)
-    "MODE-02": [1.0, 1.0, 2.0],      # w1(价差), w2(电池), w3(过载)
-    "MODE-03": [1.0, 0.5],           # w1(需量减免), w2(舒适度)
-    "MODE-04": [1.0, 2.0, 1.0],      # w1(辅助收益), w2(响应精度), w3(延迟)
-    "MODE-05": [1.0, 1.0],           # w1(绿电), w2(碳减排)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w1(光伏消纳), w2(电池), w3(过载), w4(电压质量), w5(变化率)
+    "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
+    "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
+    "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
+    "MODE-05": [1.0, 1.0],            # w1(绿电), w2(碳减排)
 }
 
 MODE_ID_MAP: dict[str, float] = {
@@ -115,11 +127,11 @@ class VoltageSimulator:
 # ═══════════════════════════════════════════════════════════════
 
 class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
-    """MUPC 全状态 RL 环境。
+    """MUPC 全状态 RL 环境 (v2.5 分层控制架构).
 
-    Anys:
-        - 观测空间: Box(48,) 或 Box(49,) (多模式)
-        - 动作空间: Box(4,) ∈ [-1,1] 前2维, [0,1] 后2维
+    动作空间 2 维: [p_batt, load_shedding]
+    Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
+    观测空间: Box(56,) 或 Box(57,) (多模式)
     """
 
     metadata = {"render_modes": []}
@@ -154,15 +166,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 电压仿真器
         self._voltage_sim = VoltageSimulator()
 
-        # 观测/动作空间
-        obs_dim = 48 if mode != "all" else 49
+        # 观测/动作空间 (v2.5: 58维单模式, 59维多模式)
+        obs_dim = 58 if mode != "all" else 59
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # 动作: [p_batt_norm, q_batt_norm, load_shed_norm, pv_limit_norm]
-        low_act = np.array([-1.0, -1.0, 0.0, 0.0], dtype=np.float32)
-        high_act = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        # 动作: [p_batt_norm, load_shed_norm] (2维)
+        # Q_batt 由实时电压调节器闭环控制，不经过 RL
+        low_act = np.array([-1.0, 0.0], dtype=np.float32)
+        high_act = np.array([1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # 内部状态
@@ -180,6 +193,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._current_mode: str = "MODE-01"
         self._prev_p_batt: float = 0.0
         self._prev_q_batt: float = 0.0
+        # v2.5 新增字段
+        self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
+        self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
+        self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
 
     # ── 模式管理 ────────────────────────────────────────
 
@@ -232,37 +249,57 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 重置校验器
         self._validator.reset()
 
+        # 电压越限计数器（用于死区触发）
+        self._voltage_violation_count: int = 0
+
+        # v2.5 新增: 计算季节和时段编码
+        self._update_season_time_encoding()
+
         obs = self._build_observation()
         info = {"mode": self._current_mode}
         return obs, info
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        """执行一步仿真。
+        """执行一步仿真 (v2.4 分层控制: Q_batt 由实时电压环给出).
 
         Returns:
             (obs, reward, terminated, truncated, info)
         """
         action = np.asarray(action, dtype=np.float32)
 
-        # 1. 动作约束校验
+        # 1. 计算 Q_batt (由实时电压环给出，基于前一步电压)
+        v_prev = (self._va + self._vb + self._vc) / 3.0
+        v_error = v_prev - 1.0
+        K_Q_V = 200.0
+        q_batt = float(np.clip(-K_Q_V * v_error, -Q_BATT_MAX_KVAR, Q_BATT_MAX_KVAR))
+
+        # v2.5: 计算 q_realtime_margin = 1 - |q_batt| / Q_BATT_MAX
+        # 0=打满(无裕度), 1=空闲(最大裕度)
+        self._q_realtime_margin = 1.0 - (abs(q_batt) / Q_BATT_MAX_KVAR)
+
+        # v2.5: 更新季节时段编码 (每小时更新一次即可，这里每步更新)
+        self._update_season_time_encoding()
+
+        # 2. 动作约束校验 (ACT-01/03/05)
         dispatch_p = self._data["dispatch_p_set"][self._step_idx]
         if abs(dispatch_p) < 1e-6:
             dispatch_p_use = None
         else:
             dispatch_p_use = float(dispatch_p)
-        clamped, violated, violations = self._validator.validate(action, dispatch_p_use)
+        clamped, violated, violations = self._validator.validate(
+            action, dispatch_p_use, q_batt_real=q_batt)
 
-        # 2. 反归一化动作到物理值
+        # 3. 反归一化动作到物理值 (2维: P_batt + Load_shedding)
         p_batt = clamped[0] * P_BATT_MAX_KW
-        q_batt = clamped[1] * Q_BATT_MAX_KVAR
-        load_shed = clamped[2] * LOAD_SHED_MAX_KW
-        pv_limit = clamped[3]            # 已在 [0,1]
+        load_shed = clamped[1] * LOAD_SHED_MAX_KW
+        # Q_batt 已在上方计算，由实时电压调节器闭环给出
+        # pv_limit 不再作为动作维度，光伏限功率由 Q 调节替代
 
-        # 3. 有效负荷与光伏
+        # 3. 有效负荷与光伏 (pv_limit=1.0 恒定)
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
-        p_pv_eff = p_pv_raw * pv_limit
+        p_pv_eff = p_pv_raw  # 无 pv_limit，全部光伏出力
 
         # 4. SOC 更新 (SAFETY: hard clamp)
         soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH
@@ -272,40 +309,34 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 5. 电网交换功率
         grid_power = p_load_eff - p_pv_eff + p_batt
 
-        # 6. 变压器负载率 + 过载硬约束 (SAFETY)
+        # 6. 变压器负载率
         q_load = p_load_eff * math.tan(math.acos(LOAD_PF))
         s_transformer = math.sqrt(grid_power ** 2 + (q_load - q_batt) ** 2)
         load_rate = s_transformer / TRANSFORMER_KVA
+        load_rate_unclamped = load_rate  # 用于奖励计算
 
-        # SAFETY: 变压器过载硬约束, 类似 SOC clamp
-        # 当 load_rate > 1.0 时, 自动限制 p_batt 使负载率不超过 100%
-        if load_rate > 1.0:
-            q_net = q_load - q_batt
-            s_max = TRANSFORMER_KVA
-            # 计算目标有功功率 (保持符号不变)
-            p_target = math.sqrt(max(0, s_max**2 - q_net**2))
-            if grid_power < 0:
-                p_target = -p_target
-            p_batt_clamped = p_target - (p_load_eff - p_pv_eff)
-            p_batt = float(np.clip(p_batt_clamped, -P_BATT_MAX_KW, P_BATT_MAX_KW))
-            grid_power = p_load_eff - p_pv_eff + p_batt
-            s_transformer = math.sqrt(grid_power**2 + q_net**2)
-            load_rate = s_transformer / TRANSFORMER_KVA
-
-        # 7. 电压更新
+        # 7. 电压更新 (使用实时电压环给出的 q_batt)
         p_net = p_pv_eff - p_load_eff + p_batt
         va, vb, vc = self._voltage_sim.step(
-            p_net, q_batt, self._va, self._vb, self._vc,
+            p_net, float(q_batt), self._va, self._vb, self._vc,
         )
+        v_avg = (va + vb + vc) / 3.0
 
-        # 8. 需量更新 (1 小时滑动窗口)
+        # 8. 电压越限计数器 (死区: ±5%, [0.95, 1.05])
+        V_DEAD = 0.05
+        if abs(v_avg - 1.0) > V_DEAD:
+            self._voltage_violation_count += 1
+        else:
+            self._voltage_violation_count = 0  # 恢复正常则重置
+
+        # 9. 需量更新 (1 小时滑动窗口)
         window = 4
         demand_start = max(0, self._step_idx - window + 1)
         demand_slice = self._data["load_power"][demand_start:self._step_idx + 1]
         current_demand = max(float(np.mean(demand_slice)), CONTRACT_DEMAND_KW * 0.3)
         peak_demand = max(self._peak_demand, current_demand)
 
-        # 9. 更新内部状态
+        # 10. 更新内部状态
         self._soc = soc_new
         self._va = va
         self._vb = vb
@@ -315,38 +346,45 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._load_rate = load_rate
         self._current_demand = current_demand
         self._peak_demand = peak_demand
+        prev_p_batt_for_reward = self._prev_p_batt
         self._prev_p_batt = p_batt
-        self._prev_q_batt = q_batt
+        self._prev_q_batt = float(q_batt)
 
-        # 10. 奖励计算
+        # 11. 奖励计算
         reward, reward_info = self._compute_reward(
-            p_batt=p_batt, q_batt=q_batt, load_shed=load_shed,
-            pv_limit=pv_limit, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
+            p_batt=p_batt, q_batt=float(q_batt), load_shed=load_shed,
+            pv_limit=1.0, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
             p_load_eff=p_load_eff, grid_power=grid_power,
-            load_rate=load_rate, soc_new=soc_new, soc_clipped=soc_clipped,
+            load_rate=load_rate, load_rate_unclamped=load_rate_unclamped,
+            soc_new=soc_new, soc_clipped=soc_clipped,
+            va=va, vb=vb, vc=vc,
+            prev_p_batt=prev_p_batt_for_reward,
+            voltage_violation_count=self._voltage_violation_count,
         )
 
-        # 11. 推进时间
+        # 12. 推进时间
         self._step_idx += 1
         terminated = (self._step_idx - self._episode_start) >= EPISODE_LENGTH
         truncated = self._step_idx >= self._data_len - 16
 
-        # 12. 构建 info
+        # 13. 构建 info
         info = {
             "mode": self._current_mode,
             "soc": self._soc,
             "load_rate": self._load_rate,
             "p_batt": p_batt,
-            "q_batt": q_batt,
+            "q_batt": float(q_batt),
             "load_shedding": load_shed,
-            "pv_limit": pv_limit,
+            "pv_limit": 1.0,
             "grid_power": grid_power,
             "va": va, "vb": vb, "vc": vc,
+            "v_avg": float(v_avg),
             "current_demand": current_demand,
             "peak_demand": peak_demand,
             "soc_clipped": soc_clipped,
             "constraint_violated": violated,
             "violations": str(violations) if violations else "",
+            "voltage_violation_count": self._voltage_violation_count,
             **reward_info,
         }
         if terminated or truncated:
@@ -355,23 +393,61 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         obs = self._build_observation()
         return obs, float(reward), terminated, truncated, info
 
+    # ── v2.5 季节时段编码 ────────────────────────────────
+
+    def _update_season_time_encoding(self) -> None:
+        """根据当前时间步计算季节和时段 one-hot 编码。
+
+        季节编码 (6维): [灌溉季, 炒茶季, 空调季, 常规季, 保留, 保留]
+        时段编码 (2维): [白天, 夜间]
+        """
+        hour = float(self._data["hours"][self._step_idx])
+        month = float(self._data.get("months", np.ones(self._data_len) * 7)[self._step_idx])
+
+        # 季节编码 (互斥月份分组，防止 one-hot 冲突)
+        # 灌溉: 3-4月; 炒茶: 5月; 空调: 6-8月; 常规: 其余
+        season = np.zeros(6, dtype=np.float32)
+        if 3 <= month < 5:  # 3-4月
+            season[0] = 1.0  # 灌溉季
+        elif 5 <= month < 6:  # 5月
+            season[1] = 1.0  # 炒茶季
+        elif 6 <= month <= 8:  # 6-8月
+            season[2] = 1.0  # 空调季
+        else:
+            season[3] = 1.0  # 常规季
+        self._season_encoding = season
+
+        # 时段编码: 白天=6-18, 夜间=18-6
+        time_period = np.zeros(2, dtype=np.float32)
+        if 6 <= hour < 18:
+            time_period[0] = 1.0  # 白天
+        else:
+            time_period[1] = 1.0  # 夜间
+        self._time_period_encoding = time_period
+
     # ── 观测构建 ────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
-        """构建 48 维观测向量 (多模式追加 mode_id 为 49 维)。
+        """构建 58 维观测向量 (多模式追加 mode_id 为 59 维)。
 
-        布局 (对齐 MUPC AI 引擎设计文档 to_input_vector):
-          [0..9]   D1: 9 标量 (battery_soc, pv, load, grid, trans_load,
-                              battery_pwr, va, vb, vc)
-          [9..24]  D2: pv_forecast (15 维)
-          [24..39] D2: load_forecast (15 维)
-          [39..42] D3: current_price, next_price, tariff_id
-          [42..45] D4: current_demand, contract_demand, peak_demand
-          [45..47] D5: solar_irradiance, temperature
-          [47]     D6: dispatch_p_set (None → 0.0)
-          [48]     (可选) mode_id
+        对齐下游 MUPC AI 引擎设计文档 v2.5 to_input_vector:
+
+        索引   内容                      字段数
+        [0..9]  D1: 10 标量              (含 q_realtime_margin)
+        [10..24] D2 pv_forecast          15维
+        [25..39] D2 load_forecast         15维
+        [41..43] D3 电价                  3字段
+        [44..46] D4 需量                  3字段
+        [47..48] D5 气象                  2字段
+        [49]     D6 dispatch_p_set        1字段
+        [50]     D7 q_realtime_margin     1字段
+        [51..56] D7 season_encoding       6字段
+        [57]     D7 time_period_encoding  1字段
+        [58]     (可选) mode_id           1字段
+
+        总维度: 10+15+15+3+3+2+1+1+6+1 = 58 (单模式)
         """
-        obs_dim = 48 if self._mode != "all" else 49
+        obs_dim = 58 if self._mode != "all" else 59
         obs = np.zeros(obs_dim, dtype=np.float32)
         params = self._data.get("norm_params", {})
 
@@ -385,42 +461,54 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         obs[6] = self._va
         obs[7] = self._vb
         obs[8] = self._vc
+        obs[9] = self._q_realtime_margin  # v2.5 新增: q 实时裕度
 
-        # ── D2 [9..39] 预测 ──
+        # ── D2 [10..24] pv_forecast (15维) ──
         forecast = self._predictor.predict(self._step_idx)  # (30,)
-        obs[9:24] = forecast[:15]      # pv_forecast
-        obs[24:39] = forecast[15:30]   # load_forecast
+        obs[10:25] = forecast[:15]
 
-        # ── D3 [39..42] 电价 ──
-        obs[39] = self._data["current_electricity_price"][self._step_idx]
-        obs[40] = self._data["next_period_price"][self._step_idx]
-        obs[41] = self._data["price_tariff_id"][self._step_idx]
+        # ── D2 [25..39] load_forecast (15维) ──
+        obs[25:40] = forecast[15:30]
 
-        # ── D4 [42..45] 需量 ──
-        obs[42] = self._current_demand
-        obs[43] = CONTRACT_DEMAND_KW
-        obs[44] = self._peak_demand
+        # ── D3 [41..43] 电价 ──
+        obs[41] = self._data["current_electricity_price"][self._step_idx]
+        obs[42] = self._data["next_period_price"][self._step_idx]
+        obs[43] = self._data["price_tariff_id"][self._step_idx]
 
-        # ── D5 [45..47] 气象 ──
-        obs[45] = self._data["solar_irradiance"][self._step_idx]
-        obs[46] = self._data["temperature"][self._step_idx]
+        # ── D4 [44..46] 需量 ──
+        obs[44] = self._current_demand
+        obs[45] = CONTRACT_DEMAND_KW
+        obs[46] = self._peak_demand
 
-        # ── D6 [47] 调度 ──
+        # ── D5 [47..48] 气象 ──
+        obs[47] = self._data["solar_irradiance"][self._step_idx]
+        obs[48] = self._data["temperature"][self._step_idx]
+
+        # ── D6 [49] 调度 ──
         dp = self._data["dispatch_p_set"][self._step_idx]
-        obs[47] = dp if abs(dp) > 1e-6 else 0.0
+        obs[49] = dp if abs(dp) > 1e-6 else 0.0
 
-        # ── mode_id [48] (可选) ──
+        # ── D7 [50] q_realtime_margin ──
+        obs[50] = self._q_realtime_margin
+
+        # ── D7 [51..56] season_encoding (6维) ──
+        obs[51:57] = self._season_encoding
+
+        # ── D7 [57] time_period_encoding (1维) ──
+        obs[57] = self._time_period_encoding[0]  # 0=夜间, 1=白天 (二进制编码)
+
+        # ── mode_id [58] (可选) ──
         if self._mode == "all":
-            obs[48] = MODE_ID_MAP[self._current_mode]
+            obs[58] = MODE_ID_MAP[self._current_mode]
 
         # ── 归一化 ──
         obs = self._normalize_obs(obs, params)
         return obs.astype(np.float32)
 
     def _normalize_obs(self, obs: np.ndarray, params: dict) -> np.ndarray:
-        """应用 MinMax 归一化。"""
+        """应用 MinMax 归一化 (v2.5: 56维)。"""
         out = obs.copy()
-        # D1
+        # D1 [0..9]
         out[0] = obs[0]  # SOC: identity
         out[1] = self._minmax(obs[1], 0.0, PV_ARRAY_KW)
         out[2] = self._minmax(obs[2], 0.0, LOAD_PEAK_KW)
@@ -430,23 +518,29 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         out[6] = self._minmax(obs[6], 0.85, 1.15)
         out[7] = self._minmax(obs[7], 0.85, 1.15)
         out[8] = self._minmax(obs[8], 0.85, 1.15)
-        # D2: forecast
-        out[9:24] = self._minmax(obs[9:24], 0.0, PV_ARRAY_KW)
-        out[24:39] = self._minmax(obs[24:39], 0.0, LOAD_PEAK_KW)
-        # D3
-        out[39] = self._minmax(obs[39], 0.0, 1.5)
-        out[40] = self._minmax(obs[40], 0.0, 1.5)
-        out[41] = self._minmax(obs[41], 0.0, 3.0)
-        # D4
-        out[42] = self._minmax(obs[42], 0.0, 500.0)
-        out[43] = self._minmax(obs[43], 0.0, 500.0)
+        out[9] = obs[9]  # q_realtime_margin: identity [0,1]
+        # D2 pv [10..24]
+        out[10:25] = self._minmax(obs[10:25], 0.0, PV_ARRAY_KW)
+        # D2 load [26..40]
+        out[26:41] = self._minmax(obs[26:41], 0.0, LOAD_PEAK_KW)
+        # D3 [41..43]
+        out[41] = self._minmax(obs[41], 0.0, 1.5)
+        out[42] = self._minmax(obs[42], 0.0, 1.5)
+        out[43] = self._minmax(obs[43], 0.0, 3.0)
+        # D4 [44..46]
         out[44] = self._minmax(obs[44], 0.0, 500.0)
-        # D5
-        out[45] = self._minmax(obs[45], 0.0, 1500.0)
-        out[46] = self._minmax(obs[46], -20.0, 60.0)
-        # D6
-        out[47] = self._minmax(obs[47], -500.0, 500.0)
-        # mode_id: identity
+        out[45] = self._minmax(obs[45], 0.0, 500.0)
+        out[46] = self._minmax(obs[46], 0.0, 500.0)
+        # D5 [47..48]
+        out[47] = self._minmax(obs[47], 0.0, 1500.0)
+        out[48] = self._minmax(obs[48], -20.0, 60.0)
+        # D6 [49]
+        out[49] = self._minmax(obs[49], -500.0, 500.0)
+        # D7 [50] q_realtime_margin: identity
+        out[50] = obs[50]
+        # D7 [51..56] season_encoding: one-hot, identity
+        # D7 [57] time_period: binary, identity
+        # mode_id [58]: identity
         return out
 
     @staticmethod
@@ -489,24 +583,76 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """R = w1*R_pv - w2*P_batt_deg - w3*P_overload"""
-        # 光伏消纳率
+        """R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload - w4*P_voltage - w5*R_ramp
+
+        v2.5 变更:
+          - 弃光奖励电压前置条件: v_avg >= VOLTAGE_HIGH_LIMIT (1.05) → R_pv = 0
+          - 自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}: SOC极低保护 / 电压支撑 / 常规
+          - 电压惩罚条件触发: q_realtime_margin <= Q_MARGIN_THRESHOLD (10%) 且越限 >= 2 步
+        """
+        v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
+
+        # ── 光伏消纳率 (含电压前置条件) ──
         pv_total = max(r["p_pv_raw"], 1e-6)
         pv_self = min(r["p_pv_raw"], r["p_load_raw"]) + max(0.0, -r["p_batt"])
         r_pv = min(pv_self / pv_total, 1.0)
+        # v2.5: 电压偏高时弃光奖励不计入
+        if v_avg >= VOLTAGE_HIGH_LIMIT:
+            r_pv = 0.0
 
-        # 电池衰减: |ΔSOC|
-        delta_soc = abs(self._soc - r["soc_new"])
-        p_batt_deg = delta_soc
+        # ── 自适应损耗系数 α(s) ──
+        soc_new = r.get("soc_new", self._soc)
+        if soc_new < SOC_CRITICAL:
+            alpha = 3.0  # SOC 极低保护
+        elif self._q_realtime_margin <= Q_MARGIN_THRESHOLD and r.get("voltage_violation_count", 0) >= 2:
+            alpha = 0.2  # 电压支撑模式
+        else:
+            alpha = 1.0  # 常规调度
 
-        # 过载惩罚
-        p_overload = max(0.0, r["load_rate"] - 1.0)
+        # ── 过载惩罚: 梯度从 75% 开始（Quadratic + Linear）──
+        lr_unc = r.get("load_rate_unclamped", r["load_rate"])
+        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
+        p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
 
-        total = w[0] * r_pv - w[1] * p_batt_deg - w[2] * p_overload
+        # ── 电池衰减: C-rate² × α(s)（v2.5 自适应系数）──
+        c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
+        p_batt_deg = alpha * (c_rate ** 2)
+
+        # ── 电压质量惩罚 (v2.5: 条件触发式) ──
+        p_voltage = 0.0
+        violation_count = r.get("voltage_violation_count", 0)
+        dev = abs(v_avg - 1.0)
+
+        if dev > VOLTAGE_DEADBAND and violation_count >= 2 and self._q_realtime_margin <= Q_MARGIN_THRESHOLD:
+            dev_excess = dev - VOLTAGE_DEADBAND
+            if v_avg < 1.0:
+                p_voltage = VOLTAGE_PENALTY_LOW * (dev_excess / 0.10) ** 2
+            else:
+                p_voltage = VOLTAGE_PENALTY_HIGH * (dev_excess / 0.10) ** 2
+
+        w4 = w[3] if len(w) > 3 else 0.0
+
+        # ── 功率变化率惩罚 ──
+        prev_p = r.get("prev_p_batt", 0.0)
+        delta_p = abs(r["p_batt"] - prev_p)
+        w5 = w[4] if len(w) > 4 else 0.0
+        p_ramp_penalty = w5 * delta_p / BATTERY_CAPACITY_KWH
+
+        total = (w[0] * r_pv
+                 - w[1] * p_batt_deg
+                 - w[2] * p_overload
+                 - w4 * p_voltage
+                 - p_ramp_penalty)
+
         info = {
             "r_pv_consumption": float(r_pv),
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload),
+            "p_voltage_deviation": float(-p_voltage),
+            "p_ramp_penalty": float(-p_ramp_penalty),
+            "v_avg": float(v_avg),
+            "alpha": float(alpha),  # v2.5
+            "q_realtime_margin": float(self._q_realtime_margin),  # v2.5
         }
         return float(total), info
 
@@ -519,10 +665,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         r_spread = r["p_batt"] * (price - avg_price) / (P_BATT_MAX_KW * 0.4)
         r_spread = float(np.clip(r_spread, -1.0, 1.0))
 
-        delta_soc = abs(self._soc - r["soc_new"])
-        p_batt_deg = delta_soc
+        # 电池衰减: C-rate²（非线性）
+        c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
+        p_batt_deg = c_rate ** 2
 
-        p_overload = max(0.0, r["load_rate"] - 1.0)  # w3: 过载惩罚
+        # 过载惩罚: 梯度从 75% 开始（Quadratic + Linear，匹配设计文档）
+        lr_unc = r.get("load_rate_unclamped", r["load_rate"])
+        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
+        p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
         w3 = w[2] if len(w) > 2 else 0.0
 
         total = w[0] * r_spread - w[1] * p_batt_deg - w3 * p_overload
@@ -656,7 +806,7 @@ if __name__ == "__main__":
     print("\n── 多模式测试 (all) ──")
     env2 = MupcEnv(train, mode="all")
     obs2, info2 = env2.reset()
-    print(f"  观测形状: {obs2.shape}  (应为 49 维)")
+    print(f"  观测形状: {obs2.shape}  (应为 59 维)")
     print(f"  初始模式: {info2['mode']}")
 
     modes_seen = set()
