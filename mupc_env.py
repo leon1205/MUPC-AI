@@ -140,13 +140,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
     def __init__(self, data: dict, mode: str = "all",
                  lstm_predictor: Any = None,
-                 reward_weights: dict[str, list[float]] | None = None):
+                 reward_weights: dict[str, list[float]] | None = None,
+                 use_grid2op: bool = True,
+                 grid2op_backend: str = "lightsim"):
         """
         Args:
             data: SmartDSLoader 返回的 data dict
             mode: "all" (多模式) 或 "MODE-01"~"MODE-05" (单模式)
             lstm_predictor: LSTM 模型 (有 predict(step_idx)→(30,) 接口) 或 None→Oracle
             reward_weights: 自定义权重, e.g. {"MODE-01": [1.5, 0.3, 3.0]}
+            use_grid2op: True=使用 Grid2Op 电压仿真, False=降级到 VoltageSimulator
+            grid2op_backend: "lightsim" (C++ 加速) 或 "pandapower" (Python)
         """
         self._data = data
         self._mode = mode
@@ -163,11 +167,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 动作校验器
         self._validator = ActionValidator()
 
-        # 电压仿真器
+        # 电压仿真器（Grid2Op 不可用时降级使用）
         self._voltage_sim = VoltageSimulator()
 
+        # ── Grid2Op 电压仿真（可开关切换）───────────────────────
+        self._use_grid2op = use_grid2op
+        self._grid2op_backend = grid2op_backend
+        self._grid2op_power_flow: "Grid2OpPowerFlow | None" = None
+        self._grid2op_init_failed = False
+
         # 观测/动作空间 (v2.5: 58维单模式, 59维多模式)
-        obs_dim = 58 if mode != "all" else 59
+        obs_dim = 58 if self._mode != "all" else 59
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
@@ -197,6 +207,29 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
+
+    def _init_grid2op(self) -> None:
+        """延迟初始化 Grid2Op（首次 reset 前不创建）。
+
+        在 use_grid2op=True 时调用，尝试创建 Grid2OpPowerFlow 实例。
+        如果 Grid2Op 不可用，标记为失败并降级到 VoltageSimulator。
+        """
+        if not self._use_grid2op or self._grid2op_init_failed:
+            return
+
+        try:
+            from grid2op_env import Grid2OpPowerFlow, NumpyChronics, create_mupc_network
+
+            net = create_mupc_network()
+            chronics = NumpyChronics(self._data)
+            self._grid2op_power_flow = Grid2OpPowerFlow(
+                net, chronics, storage_soc_init=self._soc
+            )
+        except Exception:
+            # Grid2Op 不可用：降级到 VoltageSimulator
+            self._grid2op_init_failed = True
+            self._use_grid2op = False
+            self._grid2op_power_flow = None
 
     # ── 模式管理 ────────────────────────────────────────
 
@@ -249,6 +282,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 重置校验器
         self._validator.reset()
 
+        # ── Grid2Op 初始化/重置 ────────────────────────────────
+        if self._use_grid2op:
+            if self._grid2op_power_flow is None:
+                self._init_grid2op()
+            if self._grid2op_power_flow is not None:
+                self._grid2op_power_flow.reset(initial_storage_soc=self._soc)
+
         # 电压越限计数器（用于死区触发）
         self._voltage_violation_count: int = 0
 
@@ -266,6 +306,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             (obs, reward, terminated, truncated, info)
         """
         action = np.asarray(action, dtype=np.float32)
+
+        # ── Grid2Op SOC 同步（step 入口：Grid2Op → MupcEnv）─────
+        if self._use_grid2op and self._grid2op_power_flow is not None:
+            grid_soc = self._grid2op_power_flow.get_storage_soc()
+            self._soc = float(grid_soc)
 
         # 1. 计算 Q_batt (由实时电压环给出，基于前一步电压)
         v_prev = (self._va + self._vb + self._vc) / 3.0
@@ -295,7 +340,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # Q_batt 已在上方计算，由实时电压调节器闭环给出
         # pv_limit 不再作为动作维度，光伏限功率由 Q 调节替代
 
-        # 3. 有效负荷与光伏 (pv_limit=1.0 恒定)
+        # 4. 有效负荷与光伏 (pv_limit=1.0 恒定)
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
@@ -315,11 +360,23 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         load_rate = s_transformer / TRANSFORMER_KVA
         load_rate_unclamped = load_rate  # 用于奖励计算
 
-        # 7. 电压更新 (使用实时电压环给出的 q_batt)
-        p_net = p_pv_eff - p_load_eff + p_batt
-        va, vb, vc = self._voltage_sim.step(
-            p_net, float(q_batt), self._va, self._vb, self._vc,
-        )
+        # 7. 电压更新 (Grid2Op 潮流计算 或 VoltageSimulator 降级)
+        has_illegal = False
+        if self._use_grid2op and self._grid2op_power_flow is not None:
+            # 转换为 Grid2Op 单位: kW → MW
+            storage_p_mw = p_batt / 1000.0
+            storage_q_mvar = q_batt / 1000.0  # kVar → MVar
+
+            va, vb, vc, has_illegal = self._grid2op_power_flow.step(
+                storage_p_mw, storage_q_mvar)
+
+            # 同步 SOC 到 Grid2Op（step 出口：MupcEnv → Grid2Op）
+            self._grid2op_power_flow.set_storage_soc(soc_new)
+        else:
+            # 降级到原 VoltageSimulator
+            p_net = p_pv_eff - p_load_eff + p_batt
+            va, vb, vc = self._voltage_sim.step(
+                p_net, float(q_batt), self._va, self._vb, self._vc)
         v_avg = (va + vb + vc) / 3.0
 
         # 8. 电压越限计数器 (死区: ±5%, [0.95, 1.05])
@@ -385,6 +442,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "constraint_violated": violated,
             "violations": str(violations) if violations else "",
             "voltage_violation_count": self._voltage_violation_count,
+            "has_illegal": has_illegal,  # Grid2Op 潮流不收敛标记
             **reward_info,
         }
         if terminated or truncated:

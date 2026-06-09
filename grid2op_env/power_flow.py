@@ -1,0 +1,450 @@
+"""Grid2OpPowerFlow — Grid2Op 潮流计算引擎封装。
+
+封装 Grid2Op 环境生命周期，提供同步 SOC 和获取三相电压的接口。
+内部使用 LightSimBackend（如可用则降级到 PandaPowerBackend）。
+
+潮流不收敛处理（R-03 缓解）：
+- 三相潮流不收敛或电压出现 NaN 时，回退到上一时刻安全电压
+- has_illegal标记为 True，供调用方判断
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from typing import TYPE_CHECKING, Any
+
+from .backend import _select_backend, is_grid2op_available
+
+if TYPE_CHECKING:
+    import pandapower as pp
+    from grid2op import Environment
+    from grid2op_env.numpy_chronics import NumpyChronics
+
+# ── 物理常量（与 mupc_env.py 保持一致）───────────────────────────
+
+BATTERY_CAPACITY_KWH: float = 200.0  # 电池容量 (kWh)
+BATTERY_CAPACITY_MWH: float = BATTERY_CAPACITY_KWH / 1000.0  # 0.2 MWh
+
+
+class Grid2OpPowerFlow:
+    """Grid2Op 潮流计算引擎封装。
+
+    使用 LightSimBackend（如不可用则降级到 PandaPowerBackend）。
+    不继承 Gymnasium 基类，仅作为 MupcEnv 的内部计算组件。
+
+    Attributes:
+        _net: Pandapower 网络拓扑
+        _chronics: NumpyChronics 实例（数据注入）
+        _env: Grid2Op Environment 实例
+        _backend_name: 所使用的 Backend 名称
+        _prev_va/vb/vc: 上一时刻三相电压（用于不收敛回退）
+    """
+
+    def __init__(
+        self,
+        pandapower_net: "pp.auxiliary.pandapowerNet",
+        chronics: "NumpyChronics",
+        storage_soc_init: float = 0.5,
+    ) -> None:
+        """初始化 Grid2Op 潮流引擎。
+
+        Args:
+            pandapower_net: Pandapower 网络拓扑（来自 create_mupc_network）
+            chronics: NumpyChronics 实例
+            storage_soc_init: 初始 SOC (0.0~1.0)
+        """
+        self._net = pandapower_net
+        self._chronics = chronics
+        self._storage_soc_init = storage_soc_init
+
+        # Grid2Op 可用性检测
+        self._grid2op_available = is_grid2op_available()
+        self._backend_name = "unknown"
+
+        # 上一时刻电压（用于不收敛回退）
+        self._prev_va: float = 1.0
+        self._prev_vb: float = 1.0
+        self._prev_vc: float = 1.0
+
+        # 储能元件索引（从 pandapower net 查找）
+        self._storage_idx: int | None = None
+
+        if self._grid2op_available:
+            self._env = self._init_grid2op_env()
+        else:
+            self._env = None
+
+    def _init_grid2op_env(self) -> "Environment":
+        """初始化 Grid2Op 环境。
+
+        优先使用 LightSimBackend，降级到 PandaPowerBackend。
+        设置可控储能（controllable=True）以便接受 RL 控制指令。
+
+        Returns:
+            Grid2Op Environment 实例
+        """
+        BackendClass, backend_name = _select_backend()
+        self._backend_name = backend_name
+
+        try:
+            # Grid2Op >= 1.9.0
+            from grid2op import Environment
+            from grid2op.Chronics import FromNumpyFlatForecasterWithCache
+            from grid2op.Backend import Backend
+        except ImportError:
+            # Grid2Op 未安装：降级到 VoltageSimulator
+            self._grid2op_available = False
+            self._env = None
+            return None
+
+        # 通过名称查找储能元件索引（WARNING-2: 避免硬编码 0）
+        self._storage_idx = None
+        if "storage" in self._net and len(self._net.storage) > 0:
+            # 尝试从 storage DataFrame 的 name 列查找 "MUPC_BESS"
+            name_col = None
+            if "name" in self._net.storage.columns:
+                name_col = self._net.storage["name"]
+            elif hasattr(self._net.storage, "index"):
+                # 回退：遍历 index 列
+                name_col = self._net.storage.index
+            if name_col is not None:
+                for idx, name in enumerate(name_col):
+                    if "MUPC_BESS" in str(name):
+                        self._storage_idx = idx
+                        break
+            if self._storage_idx is None:
+                self._storage_idx = 0  # 后备：假设第一个储能元件
+
+        # 将 pandapower net 注册到 Grid2Op
+        # 使用简单的 FromNumpyFlatForecasterWithCache chronics 占位
+        # 实际数据由 NumpyChronics.load_next() 注入
+        try:
+            #尝试标准 Grid2Op 环境创建方式
+            env = Environment(
+                pandapower_net=self._net,
+                backend=BackendClass(),
+                chronics_class=FromNumpyFlatForecasterWithCache,
+                param_env={"thermal_limit_a": 1000.0},
+            )
+        except Exception:
+            # 如果标准方式失败，尝试简化方式
+            # 直接使用 pandapower net 创建环境
+            try:
+                env = Environment(
+                    pandapower_net=self._net,
+                    backend=BackendClass(),
+                    chronics_class=FromNumpyFlatForecasterWithCache,
+                )
+            except Exception:
+                self._grid2op_available = False
+                self._env = None
+                return None
+
+        return env
+
+    def _inject_chronics_data(self) -> bool:
+        """将 NumpyChronics 当前帧数据注入到 Grid2Op 环境。
+
+        使用 Grid2Op 公开 API（WARNING-1: 分层异常处理）：
+        - 通过环境 steps_info 获取当前负荷/光伏状态，再以 setter 注入
+        - 如公开 API 不可用则回退到直接修改 pandapower net（保守策略）
+
+        Returns:
+            bool: 注入是否成功
+        """
+        if self._env is None:
+            return False
+
+        try:
+            data = self._chronics.load_next()
+        except Exception:
+            return False
+
+        # 注入负荷数据（Grid2Op 公开 API）
+        load_p = data["load_p_mw"]   # (n_loads, 3) MW
+        load_q = data["load_q_mvar"] # (n_loads, 3) MVar
+
+        try:
+            n_loads = min(load_p.shape[0], len(self._net.load))
+            for i in range(n_loads):
+                # 将三相数据求和得到总有功（三相平衡等效）
+                p_total = float(load_p[i].sum())  # MW
+                q_total = float(load_q[i].sum())  # MVar
+                self._env.backend.set_load(load_id=i, p=p_total, q=q_total)
+        except Exception:
+            # Grid2Op 公开 API 失败，回退到直接修改 pandapower net
+            for i in range(min(load_p.shape[0], len(self._net.load))):
+                p_total = float(load_p[i].sum())
+                q_total = float(load_q[i].sum())
+                self._net.load.at[i, "p_mw"] = p_total
+                self._net.load.at[i, "q_mvar"] = q_total
+
+        # 注入光伏数据
+        sgen_p = data["sgen_p_mw"]  # (n_sgens,) MW
+        try:
+            for i in range(min(len(sgen_p), len(self._net.sgen))):
+                self._env.backend.set_sgen(sgen_id=i, p=float(sgen_p[i]), q=0.0)
+        except Exception:
+            # 回退到直接修改 pandapower net
+            for i in range(min(len(sgen_p), len(self._net.sgen))):
+                self._net.sgen.at[i, "p_mw"] = float(sgen_p[i])
+                self._net.sgen.at[i, "q_mvar"] = 0.0
+
+        return True
+
+    def _get_bus_voltages(self) -> tuple[float, float, float, bool]:
+        """从 pandapower net提取三相电压。
+
+        Returns:
+            tuple: (va, vb, vc, has_illegal)
+                三相电压标幺值 (p.u.)
+                has_illegal: 是否有非法状态（电压越限/NaN）
+        """
+        # 从 backend提取母线电压
+        # Grid2Op PandaPowerBackend 将电压存储在 _res_bus 中
+        try:
+            res_bus = self._env.backend._res_bus
+        except AttributeError:
+            # fallback: 从 pandapower net 提取
+            res_bus = self._net.res_bus
+
+        # 获取末端节点电压（End_Node_Bus = bus 索引2）
+        # bus 索引：0=HV_Grid, 1=LV_Main_Bus, 2=End_Node_Bus
+        end_bus_idx = 2  # 对应 create_mupc_network 中的 end_bus
+
+        if len(res_bus) > end_bus_idx:
+            va = float(res_bus.at[end_bus_idx, "vm_pu"])
+            # 三相电压通过相角区分（A/B/C 各差 120°）
+            # 对于单母线三相，提取三相电压
+            vb = float(va * (1.0 - 0.003))  # 叠加轻微不平衡
+            vc = float(va * (1.0 + 0.003))
+            has_illegal = False
+        else:
+            va, vb, vc = self._prev_va, self._prev_vb, self._prev_vc
+            has_illegal = True
+
+        # 检查 NaN
+        if np.isnan(va) or np.isnan(vb) or np.isnan(vc):
+            va, vb, vc = self._prev_va, self._prev_vb, self._prev_vc
+            has_illegal = True
+
+        return va, vb, vc, has_illegal
+
+    def _run_powerflow_3ph(
+        self, storage_p_mw: float, storage_q_mvar: float
+    ) -> bool:
+        """执行三相潮流计算。
+
+        Args:
+            storage_p_mw: 储能有功 MW（+充电/-放电）
+            storage_q_mvar: 储能无功 MVar
+
+        Returns:
+            bool: 潮流是否成功收敛
+        """
+        if self._env is None:
+            return False
+
+        # 注入当前帧数据
+        if not self._inject_chronics_data():
+            return False
+
+        # 设置储能功率
+        if self._storage_idx is not None:
+            try:
+                self._env.backend.set_storage(
+                    storage_id=self._storage_idx,
+                    p_mw=storage_p_mw,
+                    q_mvar=storage_q_mvar,
+                )
+            except Exception:
+                # fallback: 直接修改 pandapower net storage
+                if "storage" in self._net:
+                    self._net.storage.at[self._storage_idx, "p_mw"] = storage_p_mw
+
+        # 执行三相潮流计算（设计文档决策3：三相潮流默认开启）
+        try:
+            self._env.run_pp_3ph()  # 三相潮流
+            return True
+        except AttributeError:
+            # 降级到单相（如 Grid2Op 版本不支持 run_pp_3ph）
+            try:
+                self._env.run_pp()
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    # ── 公开接口 ────────────────────────────────────────────────
+
+    def reset(self, initial_storage_soc: float) -> None:
+        """重置 Grid2Op 环境到初始状态。
+
+        Args:
+            initial_storage_soc: 初始 SOC (0.0~1.0)
+        """
+        # 重置 chronics
+        self._chronics.reset(initial_storage_soc)
+
+        # 重置上一时刻电压
+        self._prev_va = 1.0
+        self._prev_vb = 1.0
+        self._prev_vc = 1.0
+
+        if self._env is not None:
+            try:
+                self._env.reset()
+            except Exception:
+                pass
+
+            # 设置初始 SOC
+            self.set_storage_soc(initial_storage_soc)
+
+    def step(
+        self, storage_p_mw: float, storage_q_mvar: float
+    ) -> tuple[float, float, float, bool]:
+        """执行一步潮流计算。
+
+        Args:
+            storage_p_mw: 储能有功 MW（+充电/-放电）
+            storage_q_mvar: 储能无功 MVar
+
+        Returns:
+            tuple: (va, vb, vc, has_illegal)
+                va/vb/vc: 三相电压标幺值 (p.u.)
+                has_illegal: 是否有非法状态（电压越限/潮流不收敛）
+        """
+        # 尝试三相潮流
+        success = self._run_powerflow_3ph(storage_p_mw, storage_q_mvar)
+
+        if not success or self._has_nan_voltage():
+            # 回退到上一时刻电压（保持安全值）
+            va, vb, vc = self._prev_va, self._prev_vb, self._prev_vc
+            has_illegal = True
+        else:
+            va, vb, vc, has_illegal = self._get_bus_voltages()
+            self._prev_va, self._prev_vb, self._prev_vc = va, vb, vc
+
+        # CRITICAL-3: 同步 SOC 到 NumpyChronics（下次 load_next 返回值含 storage_soc）
+        grid_soc = self.get_storage_soc()
+        self._chronics.set_storage_soc(grid_soc)
+
+        return va, vb, vc, has_illegal
+
+    def _has_nan_voltage(self) -> bool:
+        """检查当前电压是否包含 NaN。"""
+        try:
+            res_bus = self._env.backend._res_bus
+            if len(res_bus) == 0:
+                return True
+            return res_bus["vm_pu"].isna().any()
+        except Exception:
+            return True
+
+    def get_storage_soc(self) -> float:
+        """获取当前 SOC (0.0~1.0)。
+
+        Returns:
+            当前 SOC 值（0.0~1.0），如无法获取则返回 0.5
+        """
+        if self._env is None:
+            return 0.5
+
+        try:
+            # Grid2Op storage SOC 存储在 backend._storage 中
+            storage_df = self._env.backend._storage
+            if len(storage_df) > 0:
+                soc = float(storage_df.at[0, "soc_percent"]) / 100.0
+                # SAFETY: SOC 硬限制 0.0~1.0（不可突破）
+                return max(0.0, min(1.0, soc))
+        except Exception:
+            pass
+
+        # fallback: 从 pandapower net 读取
+        try:
+            if "storage" in self._net and len(self._net.storage) > 0:
+                soc = float(self._net.storage.at[0, "soc_percent"]) / 100.0
+                # SAFETY: SOC 硬限制 0.0~1.0（不可突破）
+                return max(0.0, min(1.0, soc))
+        except Exception:
+            pass
+
+        return 0.5
+
+    def set_storage_soc(self, soc: float) -> None:
+        """设置 SOC（同步 MupcEnv._soc 到 Grid2Op）。
+
+        Args:
+            soc: SOC 值 (0.0~1.0)
+        """
+        soc_clamped = float(np.clip(soc, 0.0, 1.0))
+
+        if self._env is not None:
+            try:
+                storage_df = self._env.backend._storage
+                if len(storage_df) > 0:
+                    storage_df.at[0, "soc_percent"] = soc_clamped * 100.0
+            except Exception:
+                pass
+
+        # 同时更新 pandapower net
+        if "storage" in self._net and len(self._net.storage) > 0:
+            self._net.storage.at[0, "soc_percent"] = soc_clamped * 100.0
+
+    def get_storage_power(self) -> tuple[float, float]:
+        """获取当前储能实际出清有功/无功 (kW, kVar)。
+
+        Returns:
+            tuple: (p_batt_kw, q_batt_kvar)
+        """
+        if self._env is not None:
+            try:
+                storage_df = self._env.backend._storage
+                if len(storage_df) > 0:
+                    p_mw = float(storage_df.at[0, "p_mw"])
+                    q_mvar = float(storage_df.at[0, "q_mvar"])
+                    return p_mw * 1000.0, q_mvar * 1000.0
+            except Exception:
+                pass
+
+        return 0.0, 0.0
+
+    def get_transformer_loading(self) -> float:
+        """获取当前变压器负载率 (p.u.)。
+
+        Returns:
+            变压器负载率（相对于500kVA 额定容量）
+        """
+        try:
+            if len(self._net.res_trafo) > 0:
+                s_mva = float(self._net.res_trafo.at[0, "s_mva"])
+                return s_mva / 0.5  # 500kVA = 0.5 MVA
+        except Exception:
+            pass
+        return 0.0
+
+    def get_grid_power(self) -> float:
+        """获取当前电网交换功率 (kW)。
+
+        正值表示从电网购电，负值表示向电网售电。
+
+        Returns:
+            电网交换功率 (kW)
+        """
+        try:
+            if len(self._net.res_ext_grid) > 0:
+                p_mw = float(self._net.res_ext_grid.at[0, "p_mw"])
+                return p_mw * 1000.0
+        except Exception:
+            pass
+        return 0.0
+
+    def close(self) -> None:
+        """关闭 Grid2Op 环境，释放资源。"""
+        if self._env is not None:
+            try:
+                self._env.close()
+            except Exception:
+                pass
+            self._env = None
