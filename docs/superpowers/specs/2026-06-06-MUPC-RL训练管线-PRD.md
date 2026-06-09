@@ -2,17 +2,17 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
-| v2.2 | 2026-06-08 | 需求分析师 | **[REVIEWED: PASS]** |
+| v2.3 | 2026-06-10 | 需求分析师 | **[REVIEWED: PASS]** |
 
 **对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.5 (`[REVIEWED: PASS]`)
 
 ---
 
+> **v2.3 变更说明：**集成 Grid2Op + Pandapower电压仿真替换（2026-06-09）。将 VoltageSimulator 替换为 Grid2Op 物理仿真引擎，三相电压基于真实潮流计算。原有 PRD v2.2 规格（58/59维观测、2维动作、5场景奖励）全部保留，新增电压仿真引擎切换开关 `use_grid2op`。性能目标：每步仿真 ≤ 50ms（lightsim2grid 加速）。
+>
 > **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
 >
 > **v2.1 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
->
-> **v2.0 变更说明：** 本版本完全对齐 MUPC AI 引擎 PRD v2.2 的完整规格。状态空间从 6 维扩展为 48/49 维（21 字段序列化），动作空间从 2 维扩展为 4 维，奖励函数从简化版升级为 5 种场景的完整公式。新增 LSTM 预测模型训练和动作约束校验功能。旧版 v1.0 基于 CLAUDE.md 的简化方案已废弃。
 
 ---
 
@@ -32,7 +32,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  本训练管线 (x86 PC, Python)                                       │
-│                                                                    │
+│ │
 │  SMART-DS 数据 → 环境仿真(21字段) → PPO/SAC训练 → ONNX导出        │
 │                  + LSTM训练                                       │
 │  输出: lstm_forecast.onnx + rl_policy.onnx                       │
@@ -58,8 +58,9 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | LSTM 预测 | 训练环境生成（作为状态输入给 RL） | RKNN Runtime 实时推理 |
 | 推理框架 | 不涉及 | RKNN Runtime (NPU) |
 | 动作校验 | 环境内部 clamp | ActionValidator (5条规则) |
+| 电压仿真 | Grid2Op + Pandapower 三相潮流（可切换简化模型） | 实时数据 |
 
-> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.4。差异仅在于数据获取方式。
+> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.5。差异仅在于数据获取方式和电压仿真的实现方式。
 
 ### 1.3 目标平台
 
@@ -73,6 +74,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 深度学习框架 | PyTorch（LSTM + ONNX 导出） |
 | 模型格式 | ONNX（训练产出）→ .rknn（部署端 INT8 量化） |
 | 数据源 | SMART-DS 数据集（光伏 CSV + 负荷 per-unit + Parquet） |
+| 电压仿真 | Grid2Op + Pandapower 三相潮流（可切换 VoltageSimulator） |
 
 ### 1.4 核心价值
 
@@ -82,6 +84,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 多场景单一策略 | 一个 RL 模型覆盖 5 种预设运行场景 (MODE-01~05) | 场景切换无需换模型 |
 | 安全优先 | 安全惩罚梯度 + SOC 硬约束 + 动作约束校验 | 过载事件减少 > 90%（相比固定策略） |
 | 端到端链路 | 数据加载 → LSTM训练 → RL训练 → ONNX导出，单条命令 | 无中间手动步骤 |
+| 精确电压仿真 | Grid2Op + Pandapower 三相潮流计算 | 三相电压误差 ≤ 2%，每步 ≤ 50ms |
 
 ---
 
@@ -108,10 +111,11 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | F5 | 动作约束校验 | P0 | 3 条约束规则（ACT-01/03/05），环境内 clamp |
 | F6 | 模型导出 | P0 | LSTM + RL 策略网络 → ONNX，含 onnxruntime 验证 |
 | F7 | 训练监控 | P1 | TensorBoard + CSV 日志，21 字段各自可追踪 |
+| F8 | Grid2Op 电压仿真 | P0 | 三相潮流计算（可切换简化 VoltageSimulator） |
 
 ---
 
-### 3.2 F1：数据加载与状态合成
+### 3.1 F1：数据加载与状态合成
 
 #### 功能描述
 
@@ -134,7 +138,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | grid_power | 计算: `P_load - P_pv + P_batt` | D1 |
 | transformer_load | 计算: `S_transformer / 500` | D1 |
 | battery_power | 上一周期动作 A1 的值 | D1 |
-| voltage_phase_a/b/c | **电压仿真模型**（见下方） | D1，v2.2 新增 |
+| voltage_phase_a/b/c | **Grid2Op 潮流计算** 或 VoltageSimulator | D1，v2.3 Grid2Op 新增 |
 | pv_forecast_15min | **LSTM 模型预测输出**（或 Oracle 后备） | D2 |
 | load_forecast_15min | **LSTM 模型预测输出**（或 Oracle 后备） | D2 |
 | current_electricity_price | **TOU 电价生成器** | D3 |
@@ -146,21 +150,24 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | dispatch_p_set | 大部分时间 None；虚拟电厂模式合成 | D6 |
 | dispatch_q_set | 大部分时间 None；虚拟电厂模式合成 | D6 |
 
-**电压仿真模型**：
+**电压仿真模型（v2.3 新增）**：
 
-训练环境无法获取真实三相电压。采用简化线路模型模拟电压随功率变化：
+训练环境支持两种电压仿真引擎：
+
+1. **Grid2Op + Pandapower**（默认）：基于真实三相潮流计算，三相电压由 Pandapower `runpp_3ph` 计算
+2. **VoltageSimulator**（降级）：简化 Q-V 耦合灵敏度系数模型，当 Grid2Op 不可用或用户指定时启用
 
 ```
-V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
+Grid2Op 模式:
+  V_phase = f(P_pv, P_load, P_batt, Q_batt)  ← Pandapower runpp_3ph 三相潮流
+ 精度: 三相独立计算，不平衡度自然呈现
+  误差: ≤ 2%（与 Pandapower 标准对比）
+
+VoltageSimulator 模式（降级）:
+  V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
                - k_q * Q_batt / S_base
                + noise(σ=0.005)
-
-其中:
-  k_p = 0.05   (有功对电压的灵敏度)
-  k_q = 0.03   (无功对电压的灵敏度，反映 Q-V 耦合)
-  S_base = 500  (kVA)
-  noise 模拟测量噪声
-  clamp(V_phase, 0.85, 1.15)
+  k_p = 0.05, k_q = 0.03, S_base = 500 kVA
 ```
 
 #### 验收标准
@@ -170,16 +177,17 @@ V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
 | F1-01 | 加载全部 SMART-DS 光伏和负荷数据，打印统计摘要 | `python data_loader.py` 无错误 |
 | F1-02 | TOU 电价按时段输出：谷 0.4/平 0.8/峰 1.2/尖峰 1.5 元/kWh | 单元测试 |
 | F1-03 | 训练/验证集按时间 8:2 切分（不打乱顺序） | 单元测试 |
-| F1-04 | 电压仿真值域在 [0.85, 1.15] p.u. 内 | 单元测试 |
-| F1-05 | 合成数据覆盖全部 21 个状态字段 | 单元测试 |
+| F1-04 | Grid2Op 模式下三相电压在 [0.85, 1.15] p.u. 内 | 单元测试 |
+| F1-05 | VoltageSimulator 降级模式下三相电压在 [0.85, 1.15] p.u. 内 | 单元测试 |
+| F1-06 | 合成数据覆盖全部 21 个状态字段 | 单元测试 |
 
 ---
 
-### 3.3 F2：全状态环境仿真
+### 3.2 F2：全状态环境仿真
 
 #### 功能描述
 
-`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.5 完整规格的 Gymnasium 环境。
+`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.5 完整规格的 Gymnasium 环境，支持 Grid2Op 电压仿真引擎。
 
 **观测空间（58 维序列化向量，多模式 59 维）**：
 
@@ -226,7 +234,8 @@ Q_batt 由实时控制核心闭环调节（电压死区 ±5%）
 S_transformer = sqrt(grid_power² + (Q_load - Q_batt)²)
 load_rate = S_transformer / TRANSFORMER_KVA (500)
 
-电压仿真: voltage_phase_{a,b,c} = f(P, Q) 见 3.2 节
+电压仿真（Grid2Op 模式）: voltage_phase_{a,b,c} = Grid2Op runpp_3ph 三相潮流
+电压仿真（VoltageSimulator 模式）: voltage_phase_{a,b,c} = f(P, Q) 简化模型
 需量: current_demand = max(最近4步 P_load_eff 的滑动平均值, 前值)
 ```
 
@@ -253,13 +262,16 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 | F2-03 | `action_space.shape = (2,)` | 单元测试 |
 | F2-04 | SOC 硬约束不可突破 | 单元测试：连续充电 1000 步，验证 SOC ≤ 0.90 |
 | F2-05 | info dict 包含全部奖励分量原始值 + SOC + load_rate | 单元测试 |
-| F2-06 | 电压仿真三相电压在 [0.85, 1.15] 内 | 单元测试 |
-| F2-07 | 兼容 gymnasium.Env 和 _gym_stub 双重接口 | 集成测试 |
-| F2-08 | terminal_observation 包含完整 59 维观测 | 单元测试 |
+| F2-06 | Grid2Op 模式下三相电压在 [0.85, 1.15] 内 | 单元测试 |
+| F2-07 | VoltageSimulator 降级模式下三相电压在 [0.85, 1.15] 内 | 单元测试 |
+| F2-08 | 兼容 gymnasium.Env 和 _gym_stub 双重接口 | 集成测试 |
+| F2-09 | terminal_observation 包含完整 59 维观测 | 单元测试 |
+| F2-10 | `use_grid2op=True` 时使用 Grid2Op电压仿真 | 集成测试 |
+| F2-11 | `use_grid2op=False` 时降级到 VoltageSimulator | 集成测试 |
 
 ---
 
-### 3.4 F3：LSTM 时序预测模型
+### 3.3 F3：LSTM 时序预测模型
 
 #### 功能描述
 
@@ -291,7 +303,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 
 ---
 
-### 3.5 F4：多模式 RL 训练
+### 3.4 F4：多模式 RL 训练
 
 #### 功能描述
 
@@ -308,6 +320,11 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 | `--seed` | 42 | 随机种子 |
 | `--lstm-model` | `None` | 预训练 LSTM 模型路径（不指定则使用 Oracle 后备） |
 | `--no-lstm` | False | 使用 Oracle 预测（真实未来值 + 噪声）代替 LSTM |
+| `--use-grid2op` | True | 使用 Grid2Op 电压仿真（False降级到 VoltageSimulator） |
+| `--data-source` | `smartds` | 数据源：`smartds` / `china` / `merged` / `unified` |
+| `--train-lstm` | False | 独立训练 LSTM（不跑 RL） |
+| `--lstm-params` | `hidden_dim=64,num_layers=2,epochs=100,patience=15` | LSTM训练参数 |
+| `--export-onnx` | False | 训练结束后导出 ONNX |
 
 **5 种场景与奖励函数**（与 MUPC AI 引擎 PRD 第 6 章完全对齐）：
 
@@ -329,7 +346,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 
 ```
 Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
-                       ├── actor:  Linear(2)  → Tanh (A1) / Sigmoid (A2)
+                       ├── actor:  Linear(2) → Tanh (A1) / Sigmoid (A2)
                        └── critic: Linear(1)
 ```
 
@@ -346,10 +363,11 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 | F4-05 | SB3 不可用时自动切换 `_ppo_core.py` | 卸载 SB3 后测试 |
 | F4-06 | Ctrl+C 中断保存 checkpoint 不丢失进度 | 手动测试 |
 | F4-07 | TensorBoard 中可监控所有奖励分量 + 2 个动作维度的均值 | 手动检查 |
+| F4-08 | `--use-grid2op=False` 时降级到 VoltageSimulator | 集成测试 |
 
 ---
 
-### 3.6 F5：动作约束校验
+### 3.5 F5：动作约束校验
 
 #### 功能描述
 
@@ -375,7 +393,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 ---
 
-### 3.7 F6：模型导出
+### 3.6 F6：模型导出
 
 #### 功能描述
 
@@ -403,7 +421,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 ---
 
-### 3.8 F7：训练监控
+### 3.7 F7：训练监控
 
 | 指标 | 输出位置 |
 |------|----------|
@@ -418,14 +436,70 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 ---
 
+### 3.8 F8：Grid2Op 电压仿真引擎
+
+#### 功能描述
+
+Grid2Op + Pandapower 电压仿真引擎作为 `VoltageSimulator` 的替代方案，提供更精确的三相电压计算。
+
+**核心组件**：
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| `NumpyChronics` | `grid2op_env/numpy_chronics.py` | 将 SmartDSLoader 的 data dict 转换为 Grid2Op 三相格式 |
+| `Grid2OpPowerFlow` | `grid2op_env/power_flow.py` | Grid2Op 引擎封装，提供同步 SOC 和获取三相电压的接口 |
+| `create_mupc_network` | `grid2op_env/network.py` | Pandapower 网络拓扑（农网台区 3 总线模型） |
+
+**技术规格**：
+
+| 项目 | 规格 |
+|------|------|
+| 潮流计算 | Pandapower `runpp_3ph` 三相潮流 |
+| 后端优先级 | lightsim2grid（C++ 加速）> PandaPowerBackend（Python） |
+| 网络拓扑 | 3 总线：高压电网 → 配电变压器(500kVA) → 低压母线 → 末端节点 |
+| 元件 | 变压器、线路（LGJ-70, 1.5km）、居民负荷、农业冲击负荷、光伏(200kW)、储能(200kWh) |
+| SOC 同步 | 双向同步：step入口 Grid2Op→MupcEnv，step 出口 MupcEnv→Grid2Op |
+| 不收敛处理 | 回退到上一时刻安全电压，`has_illegal=True` 标记 |
+
+**电压仿真切换**：
+
+```bash
+# Grid2Op 模式（默认）
+python train.py --mode MODE-01 --total-timesteps 1000000
+
+# VoltageSimulator 降级模式
+python train.py --mode MODE-01 --total-timesteps 1000000 --no-grid2op
+```
+
+**性能目标**：
+
+| 指标 | 要求 |
+|------|------|
+| 每步仿真耗时 | ≤ 50ms（lightsim2grid 加速后端） |
+| 三相电压误差 | ≤ 2%（与 Pandapower `runpp_3ph` 标准对比） |
+| 训练吞吐量下降 | ≤ 20%（相比 VoltageSimulator） |
+
+#### 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| F8-01 | Grid2Op 初始化成功，三相电压输出正常 | `python mupc_env.py` |
+| F8-02 | `has_illegal=True` 时电压回退到上一时刻安全值 | 单元测试 |
+| F8-03 | SOC 双向同步误差 ≤ 0.1% | 连续 100 步测试 |
+| F8-04 | Grid2Op 不可用时自动降级到 VoltageSimulator | 卸载 grid2op 后测试 |
+| F8-05 | lightsim2grid 不可用时降级到 PandaPowerBackend | 卸载 lightsim2grid 后测试 |
+
+---
+
 ## 4. 非功能性需求
 
 ### 4.1 性能
 
 | 指标 | 要求 |
 |------|------|
-| 环境 step() 耗时（不含推理） | < 2ms |
-| 训练吞吐（SB3 PPO, CPU） | > 500 steps/s |
+| 环境 step() 耗时（不含推理，VoltageSimulator 模式） | < 2ms |
+| 环境 step() 耗时（Grid2Op 模式，lightsim2grid 后端） | ≤ 50ms |
+| 训练吞吐（SB3 PPO, CPU, VoltageSimulator 模式） | > 500 steps/s |
 | 峰值内存 | < 8GB |
 
 ### 4.2 模型规格
@@ -441,8 +515,9 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 | 指标 | 要求 |
 |------|------|
 | Python 最低版本 | 3.9 |
-| 第三方包上限 | 不超过 6 个 (SB3, gymnasium, torch, onnx, onnxruntime, numpy) |
-| 降级方案 | SB3 → NumPy PPO; Gymnasium → _gym_stub; torch → 仅 numpy 推理 |
+| 第三方包 | SB3, gymnasium, torch, onnx, onnxruntime, numpy, grid2op, pandapower |
+| 降级方案 | SB3 → NumPy PPO; Gymnasium → _gym_stub; Grid2Op → VoltageSimulator; lightsim2grid → PandaPowerBackend |
+| Checkpoint 兼容 | 替换前后 checkpoint 可互相加载 |
 
 ### 4.4 代码质量
 
@@ -470,6 +545,9 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 |------|------|
 | SB3 不可用 | 自动切换 `_ppo_core.py` NumPy PPO |
 | Gymnasium 不可用 | 自动切换 `_gym_stub.py` |
+| Grid2Op 不可用 | 自动降级到 VoltageSimulator（`use_grid2op=False`） |
+| lightsim2grid 不可用 | 降级到 PandaPowerBackend |
+| 潮流计算不收敛 | 回退到上一时刻安全电压，`has_illegal=True` |
 | GPU 不可用 | 自动回退 CPU |
 | LSTM 模型未提供且无 Oracle | 打印 ERROR，退出（D2 预测数据是必需的） |
 | Ctrl+C | 保存 checkpoint |
@@ -482,7 +560,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 | SOC 达 90% 仍收到充电指令 | p_batt clamp 为 0，info 标记 `soc_clipped` |
 | SOC 达 10% 仍收到放电指令 | p_batt clamp 为 0，info 标记 `soc_clipped` |
 | load_rate > 150% | 安全惩罚急剧增长，但仍允许 step |
-| 电压超出 [0.85, 1.15] | clamp 到边界值 |
+| 电压超出 [0.85, 1.15] | Grid2Op 模式：潮流不收敛标记；VoltageSimulator 模式：clamp 到边界值 |
 
 ### 5.4 导出异常
 
@@ -494,21 +572,52 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 ---
 
-## 6. 文件结构
+## 6. 风险评估
+
+### 6.1 Grid2Op 相关风险
+
+| 风险编号 | 风险描述 | 影响等级 | 应对策略 |
+|----------|----------|----------|----------|
+| R-01 | Grid2Op 与 Gymnasium 接口冲突（环境基类不兼容） | 高 | 采用组合模式：MupcEnv 内部持有 Grid2Op 实例 |
+| R-02 | 潮流计算耗时过高，导致训练速度下降 5~10 倍 | 高 | 优先使用 lightsim2grid C++ 后端；必要时降级为单相潮流 |
+| R-03 | 三相潮流收敛失败（孤岛/过载导致潮流不收敛） | 中 | 添加潮流收敛检测，不收敛时回退到上一时刻电压值 |
+| R-04 | Grid2Op Chronics 数据格式与现有 `data` dict 不兼容 | 高 | 编写 `NumpyChronics` 自定义类，将 `data` dict 转换为 Grid2Op 三相格式 |
+| R-05 | 动作空间映射错误（2维动作未正确映射到 Grid2Op storage） | 高 | 添加单元测试，验证 `action → storage_p` 映射一致性 |
+| R-06 | SOC 状态在 Grid2Op 与 MupcEnv 之间不同步 | 高 | 在 `step()` 开始时同步 Grid2Op storage SOC 到 `self._soc`，结束时反向同步 |
+| R-07 | 现有奖励函数依赖的观测字段在 Grid2Op 中不可用 | 中 | Grid2Op 仅提供三相电压和变压器负载率，其他字段继续从 data dict 读取 |
+| R-08 | 依赖库版本冲突（pandapower vs grid2op） | 低 | 使用虚拟环境隔离；自动降级到 VoltageSimulator |
+
+### 6.2 一般训练风险
+
+| 风险编号 | 风险描述 | 影响等级 | 应对策略 |
+|----------|----------|----------|----------|
+| R-09 | LSTM训练收敛失败 | 中 | 使用现有 checkpoint 或 Oracle 后备 |
+| R-10 | RL 训练不收敛 | 中 | 检查奖励权重、超参数、网络结构 |
+| R-11 | ONNX 导出失败 | 低 | 检查模型结构和权重完整性 |
+
+---
+
+## 7. 文件结构
 
 ```
 MUPC-AI2/
 ├── data_loader.py              # F1: 数据加载 + 状态合成
-├── mupc_env.py                 # F2: Gymnasium 环境 (58/59 维, 2 维动作)
-├── lstm_model.py               # F3: LSTM 训练
-├── train.py                    # F4: RL 训练主入口
-├── action_validator.py         # F5: 动作约束校验
-├── export_onnx.py              # F6: ONNX 导出
-├── _ppo_core.py                # 纯 NumPy PPO 后备
-├── _gym_stub.py                # Gymnasium 最小替代
+├── mupc_env.py # F2: Gymnasium 环境 (58/59维, 2维动作, Grid2Op集成)
+├── lstm_model.py             # F3: LSTM 训练
+├── train.py                  # F4: RL 训练主入口
+├── action_validator.py       # F5: 动作约束校验
+├── export_onnx.py # F6: ONNX 导出
+├── _ppo_core.py              # 纯 NumPy PPO 后备
+├── _gym_stub.py # Gymnasium 最小替代
+├── grid2op_env/             # F8: Grid2Op 电压仿真引擎
+│   ├── __init__.py
+│   ├── numpy_chronics.py     # NumpyChronics: data dict → Grid2Op 格式
+│   ├── power_flow.py # Grid2OpPowerFlow: Grid2Op 引擎封装
+│   ├── network.py           # create_mupc_network(): Pandapower 拓扑
+│   └── backend.py           # Backend 选择 (lightsim vs pandapower)
 ├── data/
-│   ├── download_smart_ds.py    # 数据集下载 (已存在)
-│   └── smart_ds/               # SMART-DS 数据 (已下载)
+│   ├── download_smart_ds.py # 数据集下载
+│   └── smart_ds/ # SMART-DS 数据
 ├── checkpoints/
 ├── exported_models/
 └── tensorboard_logs/
@@ -526,11 +635,25 @@ MUPC-AI2/
 
 ---
 
+## v2.3 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 集成 Grid2Op 电压仿真替换 | 全文 | 将 VoltageSimulator 替换为 Grid2Op + Pandapower 三相潮流计算 |
+| 2 | 新增 F8 功能（Grid2Op 电压仿真引擎） | 3.8 | 新增 Grid2Op 核心组件和技术规格 |
+| 3 | 新增 R-01~R-08 风险评估 | 6.1 | Grid2Op相关的8 个风险及应对策略 |
+| 4 | 新增 `--use-grid2op` / `--no-grid2op` 参数 | 3.4 | 电压仿真引擎切换开关 |
+| 5 | 新增 F8 验收标准 | 3.8 | Grid2Op 初始化、SOC 同步、不收敛处理等 |
+| 6 | 更新文件结构 | 7 | 新增 grid2op_env/ 目录 |
+| 7 | 更新版本引用 | 文档头部 | v2.2 → v2.3 |
+
+**修订依据：** Grid2Op + Pandapower 电压仿真替换 PRD（2026-06-09）已通过 code review，集成到训练管线 PRD
+
 ## v2.2 修订记录
 
 | 序号 | 修订项 | 修订位置 | 说明 |
 |------|--------|----------|------|
-| 1 | 状态空间 48/49 维→56/57 维 | 1.1/3.3/3.5 | 新增 D7 字段: q_realtime_margin (1维) + season_encoding (6维) + time_period_encoding (2维) |
+| 1 | 状态空间 48/49 维→56/57 维 | 1.1/3.3/3.5 | 新增 D7 字段: q_realtime_margin (1维) + season_encoding (6维) + time_period_encoding |
 | 2 | SCENE-01 奖励函数重写 | 3.5 | 新增 α(s) 自适应损耗系数、条件触发电压惩罚、弃光电压前置条件 |
 | 3 | 更新部署端 PRD 版本引用 | 文档头部 | v2.4 → v2.5 |
 | 4 | 观测空间维度更新 | 3.3 | 单模式 56 维，多模式 57 维 |
