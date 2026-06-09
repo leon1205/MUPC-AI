@@ -41,10 +41,18 @@ python train.py --mode MODE-01 --total-timesteps 50000 --no-lstm
 python train.py --mode all --total-timesteps 175200
 
 # 5个独立模型训练（推荐生产方案）
-python train_single_modes.py
+python train.py --mode single --total-timesteps 200000
 
-# LSTM 模型训练
-python train_lstm.py
+# LSTM训练 + RL训练（合并数据，1M步）
+python train.py --mode MODE-01 --data-source merged --train-lstm \
+       --lstm-params hidden_dim=128,num_layers=3,epochs=200,patience=30 \
+       --total-timesteps 1000000 --export-onnx
+
+# 独立训练 LSTM（仅LSTM，不跑RL）
+python train.py --train-lstm --data-source merged --lstm-params epochs=100
+
+# 中国数据 + 低学习率衰减
+python train.py --mode all --data-source china --lr-decay --total-timesteps 500000
 
 # 环境自测
 python mupc_env.py
@@ -54,7 +62,7 @@ python data_loader.py
 
 # 导出 ONNX
 python export_onnx.py --checkpoint checkpoints/MODE-01_model.zip
-python export_onnx.py --lstm checkpoints/lstm_model.pt
+python export_onnx.py --lstm checkpoints/lstm_checkpoint.pt
 
 # 下载数据集
 python data/download_smart_ds.py
@@ -115,12 +123,11 @@ MUPC-AI2/
 ├── data_loader.py              # SMART-DS 数据加载 + 状态合成
 ├── mupc_env.py               # Gymnasium 环境 (58/59维, 2维动作)
 ├── lstm_model.py             # LSTM 预测模型 / Oracle 后备
-├── train.py                  # PPO/SAC 训练主入口
-├── action_validator.py        # 3条动作约束 (ACT-01/03/05)
+├── train.py                  # PPO/SAC 训练主入口（统一入口）
+├── action_validator.py        # 动作约束 (ACT-01~05)
 ├── export_onnx.py           # ONNX 导出
 ├── _ppo_core.py             # 纯 NumPy PPO 后备
 ├── _gym_stub.py            # Gymnasium 桩模块
-├── train_single_modes.py    # 5场景独立模型训练
 ├── data/
 │   ├── download_smart_ds.py # 数据集下载
 │   └── smart_ds/            # SMART-DS 数据

@@ -39,13 +39,13 @@ _ensure_torch()
 class LSTMForecast:
     """LSTM 时序预测模型 (PyTorch)。"""
 
-    def __init__(self, input_dim: int = 6, hidden_dim: int = 64,
+    def __init__(self, input_dim: int = 7, hidden_dim: int = 64,
                  num_layers: int = 2, forecast_steps: int = 15,
                  dropout: float = 0.1):
         """
         Args:
-            input_dim: 输入特征维度
-                [pv_power, load_power, ghi, temperature, sin_hour, cos_hour]
+            input_dim: 输入特征维度（默认 7）
+                [pv_power, load_power, ghi, temperature, sin_hour, cos_hour, yesterday_pv]
             hidden_dim: LSTM 隐藏层维度
             num_layers: LSTM 层数
             forecast_steps: 预测步数 (默认 15 = 15 分钟)
@@ -132,19 +132,68 @@ class LSTMForecast:
     def __call__(self, x):
         return self.forward(x)
 
+    def set_data(self, data: dict) -> None:
+        """存储 data 引用供 predict(step_idx) 使用。
+
+        Args:
+            data: {pv_power, load_power, solar_irradiance, temperature, hours, ...}
+        """
+        self._data = data
+
+    def predict(self, step_idx: int) -> np.ndarray:
+        """LSTM 预测接口 (30,) = [pv_15_forecast, load_15_forecast]。
+
+        从历史 4 步构建输入序列，调用 predict_numpy。
+        与 OraclePredictor.predict(step_idx) 接口兼容。
+
+        Args:
+            step_idx: 当前时间步索引
+
+        Returns:
+            (30,) ndarray, 前15维=pv预测, 后15维=load预测
+        """
+        seq_len = 8
+        # 构建 hour sin/cos
+        if "hours" in self._data:
+            hours = self._data["hours"]
+        else:
+            n = len(self._data["pv_power"])
+            hours = np.arange(n, dtype=np.float32) * 15 / 60 % 24
+
+        # 取最近 seq_len 步（含当前）
+        seq_indices = [step_idx - seq_len + 1 + k for k in range(seq_len)]
+        seq_indices = [max(0, min(i, len(self._data["pv_power"]) - 1)) for i in seq_indices]
+
+        # 构建 (seq_len, 7) 输入（含昨日同时段 PV）
+        x = np.zeros((seq_len, 7), dtype=np.float32)
+        for i, idx in enumerate(seq_indices):
+            x[i, 0] = self._data["pv_power"][idx]
+            x[i, 1] = self._data["load_power"][idx]
+            x[i, 2] = self._data["solar_irradiance"][idx]
+            x[i, 3] = self._data["temperature"][idx]
+            h = hours[idx]
+            x[i, 4] = np.sin(2 * np.pi * h / 24)
+            x[i, 5] = np.cos(2 * np.pi * h / 24)
+            # 第7维: 昨日同时段 PV（周期性特征）
+            x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
+
+        # predict_numpy 期望 (batch, seq_len, 6)
+        out = self.predict_numpy(x[np.newaxis, :, :])  # (1, 30)
+        return out[0]
+
 
 # ── 训练器 ─────────────────────────────────────────────────────
 
 LSTM_TRAIN_CONFIG = {
-    "input_seq_len": 4,          # 60 分钟 / 15 分钟
+    "input_seq_len": 8,          # 120 分钟 / 15 分钟（更长上下文）
     "forecast_steps": 15,        # 预测 15 步
     "hidden_dim": 64,
     "num_layers": 2,
     "dropout": 0.1,
     "batch_size": 64,
     "learning_rate": 1e-3,
-    "epochs": 100,
-    "patience": 15,              # 早停
+    "epochs": 200,               # 增加训练轮数
+    "patience": 20,              # 配合更多 epochs 调整早停
 }
 
 
@@ -178,16 +227,16 @@ class LSTMTrainer:
         day_idx = []
         night_idx = []
         for i in range(max_samples):
-            # 检查预测窗口内是否有有效光伏 (>10kW)
+            # 检查预测窗口内是否有有效光伏 (>5kW，降低阈值保留更多样本)
             pv_target_max = np.max(pv[i + seq_len : i + seq_len + forecast])
-            if pv_target_max > 10.0:
+            if pv_target_max > 5.0:
                 day_idx.append(i)
             else:
                 night_idx.append(i)
 
-        # 均衡: 白天全保留, 夜间下采样至白天数量的1倍
+        # 均衡: 白天全保留, 夜间下采样至白天数量的2倍（改善夜间预测）
         n_day = len(day_idx)
-        n_night = min(len(night_idx), n_day)
+        n_night = min(len(night_idx), n_day * 2)
         if n_night > 0 and len(night_idx) > n_night:
             np.random.seed(42)
             night_idx = sorted(np.random.choice(night_idx, n_night, replace=False).tolist())
@@ -196,7 +245,7 @@ class LSTMTrainer:
         n_samples = len(balanced)
         print(f"  样本平衡: 白天={n_day}, 夜间={n_night}, 总计={n_samples}")
 
-        X = np.zeros((n_samples, seq_len, 6), dtype=np.float32)
+        X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
         y = np.zeros((n_samples, forecast * 2), dtype=np.float32)
 
         for out_i, src_i in enumerate(balanced):
@@ -209,6 +258,8 @@ class LSTMTrainer:
                 X[out_i, j, 3] = temp[idx]
                 X[out_i, j, 4] = math.sin(h * 2 * math.pi / 24)
                 X[out_i, j, 5] = math.cos(h * 2 * math.pi / 24)
+                # 第7维: 昨日同时段 PV（周期性特征，96步=24小时前）
+                X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
 
             for k in range(forecast):
                 target_idx = src_i + seq_len + k
@@ -235,7 +286,7 @@ class LSTMTrainer:
             print(f"  验证样本: {len(X_val)}")
 
         self.model = LSTMForecast(
-            input_dim=6, hidden_dim=cfg["hidden_dim"],
+            input_dim=7, hidden_dim=cfg["hidden_dim"],
             num_layers=cfg["num_layers"], forecast_steps=cfg["forecast_steps"],
             dropout=cfg["dropout"],
         ).to(self.device)
