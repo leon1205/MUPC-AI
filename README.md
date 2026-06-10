@@ -70,11 +70,15 @@ python train.py --mode MODE-01 --data-source merged --train-lstm \
 # ============================================================
 # Grid2Op / VoltageSimulator 切换
 # ============================================================
-# Grid2Op 模式（默认，三相潮流计算）
-python train.py --mode MODE-01 --total-timesteps 100000
+# Grid2Op 模式（三相潮流计算）+ 中国合成数据
+# 重要：Grid2Op 模拟农网台区场景，应使用中国合成数据而非 SMART-DS
+python train.py --mode MODE-01 --data-source china --total-timesteps 100000
+
+# Grid2Op + 中国经纬度（上海）
+python train.py --mode MODE-01 --data-source china --lat 31.23 --lon 121.47 --total-timesteps 100000
 
 # VoltageSimulator 降级模式（简化 Q-V 耦合）
-python train.py --mode MODE-01 --total-timesteps 100000 --no-grid2op
+python train.py --mode MODE-01 --data-source china --total-timesteps 100000 --no-grid2op
 
 # ============================================================
 # 其他选项
@@ -181,13 +185,23 @@ Q_batt 由实时电压调节器闭环，不经过 RL。
 
 | 模式 | 参数 | 说明 |
 |------|------|------|
-| Grid2Op + Pandapower | `--no-grid2op` 不指定 | 三相潮流计算，精度高，默认启用 |
+| Grid2Op + Pandapower | 默认启用 | 三相潮流计算，精度高 |
 | VoltageSimulator | `--no-grid2op` | 简化 Q-V 耦合灵敏度系数，降级方案 |
 
 **Grid2Op 模式**：
 - 后端优先级：lightsim2grid（C++）> PandaPowerBackend（Python）
-- 三相电压由 Pandapower `runpp_3ph` 独立计算
+- 三相电压由 Pandapower `run_pp()` 计算
 - 每步仿真目标 ≤ 50ms（lightsim2grid 加速）
+
+**数据源要求**：
+- **重要**：Grid2Op 模拟农网台区场景，**必须使用中国合成数据**（`--data-source china`）
+- SMART-DS 数据来自美国加州，与中国农网场景不匹配
+- 如检测到 SMART-DS 数据，NumpyChronics 会输出 WARN 警告
+
+**农业冲击负荷（季节性）**：
+- 6-9月（灌溉季）：50% 概率触发，100~200kW，持续 2~4 小时
+- 其他月份：20% 概率触发，30~80kW，持续 1~2 小时
+- 居民负荷：叠加 ±10% 随机噪声模拟家用电器启停
 
 **VoltageSimulator 降级模式**：
 - 使用简化灵敏度系数：`V = 1.0 + k_p·P_net/S_base - k_q·Q/S_base + noise`

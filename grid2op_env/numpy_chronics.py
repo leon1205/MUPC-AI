@@ -38,7 +38,8 @@ class NumpyChronics:
 
     def __init__(self, data: dict,
                  residential_ratio: float = 0.4,
-                 agri_ratio: float = 0.6) -> None:
+                 agri_ratio: float = 0.6,
+                 force_china_data: bool = False) -> None:
         """初始化时序数据注入器。
 
         Args:
@@ -47,6 +48,7 @@ class NumpyChronics:
                 可选字段：months, hours
             residential_ratio: 居民负荷分配比例 (default 0.4)
             agri_ratio: 农业冲击负荷分配比例 (default 0.6)
+            force_china_data: 强制使用中国数据模式，忽略 SMART-DS 地理不匹配警告
         """
         self._data = data
         self._n_steps = data["n_steps"]
@@ -64,6 +66,18 @@ class NumpyChronics:
         # 负荷分配比例（可配置）
         self._residential_ratio = residential_ratio
         self._agri_ratio = agri_ratio
+
+        # ── 数据源检测 ──────────────────────────────────────────
+        # 检测数据是否具有季节性（中国合成数据特征）
+        # SMART-DS 数据（美国加州）与中国农网场景不匹配
+        months = data.get("months")
+        if months is not None:
+            unique_months = len(set(months))
+            if unique_months <= 1 and not force_china_data:
+                print("[WARN] 检测到数据可能来自 SMART-DS（美国加州），"
+                      "与中国农网台区场景不匹配！")
+                print("       建议使用 --data-source china 或 --data-source unified")
+                print("       或设置 force_china_data=True 忽略此警告")
 
         # ── 农业冲击负荷状态 ────────────────────────────────────────
         # 农业冲击负荷（灌溉泵/炒茶设备）模拟：

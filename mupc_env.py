@@ -226,7 +226,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             from grid2op_env import Grid2OpPowerFlow, NumpyChronics, create_mupc_network
 
             net = create_mupc_network()
-            chronics = NumpyChronics(self._data)
+            chronics = NumpyChronics(self._data, force_china_data=False)
             self._grid2op_power_flow = Grid2OpPowerFlow(
                 net, chronics, storage_soc_init=self._soc
             )
