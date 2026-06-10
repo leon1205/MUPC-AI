@@ -736,12 +736,12 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 
 | 维度 | 字段名 | 类型 | 取值范围 | 单位 | 说明 |
 |------|--------|------|----------|------|------|
-| A1 | p_batt_set | f64 | [-500.0, 500.0] | kW | 电池有功设定（负=充电，正=放电） |
-| A2 | load_shedding | f64 | [0.0, 500.0] | kW | 可中断负荷切除 |
+| A1 | p_batt_set | f64 | [-50.0, 50.0] | kW | 电池有功设定（负=充电，正=放电） |
+| A2 | load_shedding | f64 | [0.0, 60.0] | kW | 可中断负荷切除 |
 | A3 | pv_limit | f64 | [0.0, 1.0] | - | 光伏限功率比例（v2.6 恢复，0=全限，1=不限） |
 | - | confidence | f64 | [0.0, 1.0] | - | 决策置信度 |
 
-> 注：q_batt_set 由实时电压调节器闭环控制，不经过 RL 动作空间。
+> 注：q_batt_set 由实时电压调节器闭环控制，不经过 RL 动作空间。p_batt_set 范围匹配电池最大充放电功率 50kW，load_shedding 范围匹配负荷峰值 60kW。
 
 ### 4.5 ActionOutput 结构体
 
@@ -749,9 +749,9 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 /// 强化学习决策输出（3 维动作 + 置信度，v2.6）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionOutput {
-    /// A1: 电池有功功率设定值 (kW), [-500.0, 500.0], 负=充电, 正=放电
+    /// A1: 电池有功功率设定值 (kW), [-50.0, 50.0], 负=充电, 正=放电
     pub p_batt_set: f64,
-    /// A2: 可中断负荷切除量 (kW), [0.0, 500.0]
+    /// A2: 可中断负荷切除量 (kW), [0.0, 60.0]
     pub load_shedding: f64,
     /// A3: 光伏限功率比例, [0.0, 1.0], 0=完全限功率, 1=不限功率 (v2.6 恢复)
     pub pv_limit: f64,
@@ -803,8 +803,8 @@ pub fn parse_action_output(raw: &[f32]) -> Option<ActionOutput> {
         return None;
     }
     Some(ActionOutput {
-        p_batt_set:   (raw[0] as f64).clamp(-500.0, 500.0),
-        load_shedding:(raw[1] as f64).clamp(0.0, 500.0),
+        p_batt_set:   (raw[0] as f64).clamp(-50.0, 50.0),
+        load_shedding:(raw[1] as f64).clamp(0.0, 60.0),
         pv_limit:     (raw[2] as f64).clamp(0.0, 1.0),
         confidence:   (raw[3] as f64).clamp(0.0, 1.0),
     })

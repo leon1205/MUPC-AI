@@ -17,12 +17,12 @@ import numpy as np
 
 
 class ActionValidator:
-    """顺序执行 3 条约束规则 (ACT-01, ACT-03, ACT-05), 违反时 clamp 并记录。"""
+    """顺序执行 4 条约束规则 (ACT-01, ACT-03, ACT-04, ACT-05), 违反时 clamp 并记录。"""
 
-    P_BATT_MAX: float = 500.0     # kW
-    S_MAX: float = 500.0          # kVA (功率圆上限)
-    LOAD_SHED_MAX: float = 500.0  # kW
-    DELTA_P_MAX: float = 50.0     # kW/步
+    P_BATT_MAX: float = 50.0      # kW（匹配电池最大放电功率）
+    S_MAX: float = 200.0          # kVA (功率圆上限，匹配变压器 200kVA)
+    LOAD_SHED_MAX: float = 60.0   # kW（匹配负荷峰值）
+    DELTA_P_MAX: float = 50.0     # kW/步（电池变化率保护）
 
     def __init__(self):
         self.prev_p_batt: float = 0.0
@@ -33,8 +33,8 @@ class ActionValidator:
         """动作反归一化到物理值 (3维: P_batt + Load_shedding + Pv_limit).
 
         action_norm: [p_batt_norm, load_shed_norm, pv_limit_norm]
-        p_batt_norm ∈ [-1, 1] → [-500, 500] kW
-        load_shed_norm ∈ [0, 1] → [0, 500] kW
+        p_batt_norm ∈ [-1, 1] → [-50, 50] kW（匹配电池最大充放电功率）
+        load_shed_norm ∈ [0, 1] → [0, 60] kW（匹配负荷峰值）
         pv_limit_norm ∈ [0, 1] → [0, 1] (无量纲比例)
         """
         p = action_norm[0] * self.P_BATT_MAX
