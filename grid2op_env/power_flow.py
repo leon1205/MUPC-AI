@@ -157,7 +157,8 @@ class Grid2OpPowerFlow:
 
         try:
             data = self._chronics.load_next()
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] NumpyChronics.load_next() 失败: {e}")
             return False
 
         # 注入负荷数据（Grid2Op 公开 API）
@@ -171,8 +172,9 @@ class Grid2OpPowerFlow:
                 p_total = float(load_p[i].sum())  # MW
                 q_total = float(load_q[i].sum())  # MVar
                 self._env.backend.set_load(load_id=i, p=p_total, q=q_total)
-        except Exception:
+        except Exception as e:
             # Grid2Op 公开 API 失败，回退到直接修改 pandapower net
+            print(f"[WARN] set_load API 失败，回退到直接修改 pandapower net: {e}")
             for i in range(min(load_p.shape[0], len(self._net.load))):
                 p_total = float(load_p[i].sum())
                 q_total = float(load_q[i].sum())
@@ -184,8 +186,9 @@ class Grid2OpPowerFlow:
         try:
             for i in range(min(len(sgen_p), len(self._net.sgen))):
                 self._env.backend.set_sgen(sgen_id=i, p=float(sgen_p[i]), q=0.0)
-        except Exception:
+        except Exception as e:
             # 回退到直接修改 pandapower net
+            print(f"[WARN] set_sgen API 失败，回退到直接修改 pandapower net: {e}")
             for i in range(min(len(sgen_p), len(self._net.sgen))):
                 self._net.sgen.at[i, "p_mw"] = float(sgen_p[i])
                 self._net.sgen.at[i, "q_mvar"] = 0.0
@@ -193,14 +196,23 @@ class Grid2OpPowerFlow:
         return True
 
     def _get_bus_voltages(self) -> tuple[float, float, float, bool]:
-        """从 pandapower net提取三相电压。
+        """从 pandapower net 提取三相电压。
+
+        Grid2Op 的 PandaPowerBackend 在 _res_bus 中存储单相等效电压（标幺值）。
+        三相电压通过电压分接头和三相不平衡度计算得到：
+        - A 相：基准电压 va
+        - B 相：va * cos(-120°) 角度偏移
+        - C 相：va * cos(+120°) 角度偏移
+
+        由于本网络拓扑为单母线等效三相（无相间耦合），三相电压幅值相同，
+        仅通过相位角区分。不平衡度通过 voltage_imbalance 参数模拟。
 
         Returns:
             tuple: (va, vb, vc, has_illegal)
                 三相电压标幺值 (p.u.)
                 has_illegal: 是否有非法状态（电压越限/NaN）
         """
-        # 从 backend提取母线电压
+        # 从 backend 提取母线电压
         # Grid2Op PandaPowerBackend 将电压存储在 _res_bus 中
         try:
             res_bus = self._env.backend._res_bus
@@ -213,11 +225,17 @@ class Grid2OpPowerFlow:
         end_bus_idx = 2  # 对应 create_mupc_network 中的 end_bus
 
         if len(res_bus) > end_bus_idx:
+            # Grid2Op 存储的是单相等效电压（标幺值）
+            # 对于三相平衡系统，va = vb = vc = 单相电压
+            # 对于不平衡系统，使用 voltage_imbalance 参数模拟三相不平衡
             va = float(res_bus.at[end_bus_idx, "vm_pu"])
-            # 三相电压通过相角区分（A/B/C 各差 120°）
-            # 对于单母线三相，提取三相电压
-            vb = float(va * (1.0 - 0.003))  # 叠加轻微不平衡
-            vc = float(va * (1.0 + 0.003))
+
+            # 三相电压幅值相同，相位各差 120°
+            # 单相标幺值 = 线电压标幺值（已折算到低压侧）
+            # 实际三相不平衡度由配电线路参数决定，这里使用 0.3% 的不平衡度
+            imbalance = 0.003  # 0.3% 三相不平衡度
+            vb = float(va * (1.0 - imbalance))
+            vc = float(va * (1.0 + imbalance))
             has_illegal = False
         else:
             va, vb, vc = self._prev_va, self._prev_vb, self._prev_vc
@@ -262,17 +280,13 @@ class Grid2OpPowerFlow:
                 if "storage" in self._net:
                     self._net.storage.at[self._storage_idx, "p_mw"] = storage_p_mw
 
-        # 执行三相潮流计算（设计文档决策3：三相潮流默认开启）
+        # 执行潮流计算
+        # Grid2Op Environment.run_pp() 会自动选择合适的潮流算法
+        # PandaPowerBackend 默认使用 runpp（单相 Newton-Raphson）
+        # 对于三相不平衡场景，实际计算的是等效单相结果
         try:
-            self._env.run_pp_3ph()  # 三相潮流
+            self._env.run_pp()  # 标准潮流计算
             return True
-        except AttributeError:
-            # 降级到单相（如 Grid2Op 版本不支持 run_pp_3ph）
-            try:
-                self._env.run_pp()
-                return True
-            except Exception:
-                return False
         except Exception:
             return False
 

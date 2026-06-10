@@ -221,6 +221,17 @@ def main():
         # 仅训练 LSTM，不跑 RL
         _train_lstm_only(train_data, val_data, args)
         print("\nLSTM 训练完成（无 RL 训练）。")
+
+        # LSTM 训练后导出 ONNX（如果指定了 --export-onnx）
+        if args.export_onnx and has_torch:
+            print("\n── LSTM ONNX 导出 ──")
+            try:
+                import export_onnx
+                lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
+                onnx_path = export_onnx.export_lstm(lstm_path, "./exported_models/")
+                print(f"  LSTM ONNX 已导出: {onnx_path}")
+            except Exception as e:
+                print(f"  LSTM ONNX 导出失败: {e}")
         return
 
     if not args.no_lstm and args.lstm_checkpoint:

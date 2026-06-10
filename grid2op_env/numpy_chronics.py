@@ -36,13 +36,17 @@ class NumpyChronics:
     # 三相不平衡度 (p.u.)
     PHASE_IMBALANCE: float = 0.003
 
-    def __init__(self, data: dict) -> None:
+    def __init__(self, data: dict,
+                 residential_ratio: float = 0.4,
+                 agri_ratio: float = 0.6) -> None:
         """初始化时序数据注入器。
 
         Args:
             data: SmartDSLoader.load_all() 返回的 data dict
                必需字段：pv_power, load_power, solar_irradiance, temperature
                 可选字段：months, hours
+            residential_ratio: 居民负荷分配比例 (default 0.4)
+            agri_ratio: 农业冲击负荷分配比例 (default 0.6)
         """
         self._data = data
         self._n_steps = data["n_steps"]
@@ -56,6 +60,105 @@ class NumpyChronics:
 
         # 功率因数（用于计算无功负荷）
         self._load_pf: float = 0.90
+
+        # 负荷分配比例（可配置）
+        self._residential_ratio = residential_ratio
+        self._agri_ratio = agri_ratio
+
+        # ── 农业冲击负荷状态 ────────────────────────────────────────
+        # 农业冲击负荷（灌溉泵/炒茶设备）模拟：
+        # 每 96 步（约1天）有概率触发冲击负荷，持续 4~16 步（1~4 小时）
+        # 季节性：6-9月高概率高强度，其他月份低概率低强度
+        self._shock_active: bool = False
+        self._shock_magnitude: float = 0.0  # kW
+        self._shock_countdown: int = 0        # 剩余持续步数
+
+        # 冲击负荷参数（季节性）
+        # 灌溉季（6-9月）：高概率 50%，高强度 100~200kW
+        self._shock_trigger_prob_summer: float = 0.5   # 6-9月触发概率 50%
+        self._shock_min_magnitude_summer: float = 100.0  # 最小冲击量 kW
+        self._shock_max_magnitude_summer: float = 200.0  # 最大冲击量 kW
+        self._shock_min_duration_summer: int = 8         # 最短持续步数
+        self._shock_max_duration_summer: int = 16          # 最长持续步数
+        # 非灌溉季（其他月份）：低概率 20%，低强度 30~80kW
+        self._shock_trigger_prob_offseason: float = 0.2  # 其他月份触发概率 20%
+        self._shock_min_magnitude_offseason: float = 30.0  # 最小冲击量 kW
+        self._shock_max_magnitude_offseason: float = 80.0  # 最大冲击量 kW
+        self._shock_min_duration_offseason: int = 4         # 最短持续步数
+        self._shock_max_duration_offseason: int = 8         # 最长持续步数
+
+        # ── 居民负荷随机噪声参数 ────────────────────────────────
+        # 模拟家用电器启停产生的负荷波动（±5~15%）
+        self._res_noise_std: float = 0.10  # 噪声标准差 10%（相对于基础负荷）
+
+    # ── 农业冲击负荷模拟 ─────────────────────────────────────────
+
+    def _apply_agri_shock(self, base_load_kw: float, step_idx: int, month: int) -> float:
+        """在基础负荷上叠加农业冲击负荷随机性。
+
+        农业冲击负荷（灌溉泵、炒茶设备等）特性：
+        - 阶跃式变化：从正常运行突然跳到高功率
+        - 持续时间：1~4 小时（4~16 步 @ 15min）
+        - 触发规律：每 96 步（约1天）有概率出现冲击
+        - 季节性：6-9月（灌溉季）高概率高强度，其他月份低概率低强度
+
+        Args:
+            base_load_kw: 基础负荷 kW
+            step_idx: 当前时间步索引
+            month: 当前月份 (1-12)
+        Returns:
+            叠加冲击后的负荷 kW（农业冲击仅影响 agri 负荷）
+        """
+        # 判断当前是否为灌溉季（6-9月）
+        is_summer = 6 <= month <= 9
+
+        # 选择季节性参数
+        if is_summer:
+            trigger_prob = self._shock_trigger_prob_summer
+            min_mag = self._shock_min_magnitude_summer
+            max_mag = self._shock_max_magnitude_summer
+            min_dur = self._shock_min_duration_summer
+            max_dur = self._shock_max_duration_summer
+        else:
+            trigger_prob = self._shock_trigger_prob_offseason
+            min_mag = self._shock_min_magnitude_offseason
+            max_mag = self._shock_max_magnitude_offseason
+            min_dur = self._shock_min_duration_offseason
+            max_dur = self._shock_max_duration_offseason
+
+        # 每 96 步判断是否触发新的冲击（在步骤 0 触发）
+        if step_idx > 0 and step_idx % 96 == 0:
+            if np.random.random() < trigger_prob:
+                self._shock_active = True
+                self._shock_magnitude = np.random.uniform(min_mag, max_mag)
+                self._shock_countdown = np.random.randint(min_dur, max_dur + 1)
+
+        # 冲击激活中：叠加阶跃负荷
+        if self._shock_active:
+            self._shock_countdown -= 1
+            if self._shock_countdown <= 0:
+                self._shock_active = False
+            return base_load_kw + self._shock_magnitude
+
+        return base_load_kw
+
+    def _apply_residential_noise(self, base_load_kw: float) -> float:
+        """在居民负荷上叠加随机噪声模拟家用电器启停波动。
+
+        居民负荷波动特性：
+        - 小幅高频噪声：±5~15% 的随机波动
+        - 由空调、冰箱、照明等启停产生
+        - 每步独立采样
+
+        Args:
+            base_load_kw: 基础居民负荷 kW
+        Returns:
+            叠加噪声后的居民负荷 kW
+        """
+        if base_load_kw <= 0.0:
+            return base_load_kw
+        noise = np.random.normal(0.0, self._res_noise_std * base_load_kw)
+        return max(0.0, base_load_kw + noise)
 
     # ── 三相展开 ────────────────────────────────────────────────
 
@@ -109,16 +212,28 @@ class NumpyChronics:
 
         # ── 负荷有功 (单相标量 → 三相) ──
         load_p_scalar = float(self._data["load_power"][idx])  # kW
-        load_p_3ph = self._expand_single_to_three_phase(load_p_scalar)  # kW (3,)
-        load_p_mw = load_p_3ph / 1000.0  # → MW (n_loads=2, 3) 按比例分配
 
-        # 两个负荷按固定比例分配总负荷：
-        # Residential_Load: 40%, Agri_Shock_Load: 60%
-        res_p = load_p_mw * 0.4
-        agri_p = load_p_mw * 0.6
+        # 获取当前月份（用于季节性冲击负荷）
+        months = self._data.get("months")
+        month = int(months[idx]) if months is not None else 6  # 默认6月
+
+        # 农业冲击负荷仅影响 agri 负荷，residential 保持基础负荷
+        agri_load_kw = load_p_scalar * self._agri_ratio
+        agri_load_kw = self._apply_agri_shock(agri_load_kw, idx, month)  # 叠加冲击随机性（季节性）
+
+        load_p_scalar_for_res = load_p_scalar * self._residential_ratio
+        load_p_scalar_for_res = self._apply_residential_noise(load_p_scalar_for_res)  # 叠加居民负荷随机波动
+
+        # residential 负荷三相展开
+        res_p_3ph = self._expand_single_to_three_phase(load_p_scalar_for_res)  # kW (3,)
+        res_p_mw = res_p_3ph / 1000.0  # → MW (3,)
+
+        # agricultural 负荷三相展开（已叠加冲击）
+        agri_p_3ph = self._expand_single_to_three_phase(agri_load_kw)  # kW (3,)
+        agri_p_mw = agri_p_3ph / 1000.0  # → MW (3,)
 
         # 构建 (n_loads, 3) 数组
-        load_p_mw_arr = np.vstack([res_p, agri_p])  # (2, 3) MW
+        load_p_mw_arr = np.vstack([res_p_mw, agri_p_mw])  # (2, 3) MW
 
         # ── 负荷无功 (基于功率因数计算) ──
         # Q = P * tan(acos(PF))，假设相同 PF
@@ -126,8 +241,8 @@ class NumpyChronics:
         load_q_3ph = self._expand_single_to_three_phase(load_q_scalar)
         load_q_mvar = load_q_3ph / 1000.0  # → MVar
 
-        res_q = load_q_mvar * 0.4
-        agri_q = load_q_mvar * 0.6
+        res_q = load_q_mvar * self._residential_ratio
+        agri_q = load_q_mvar * self._agri_ratio
         load_q_mvar_arr = np.vstack([res_q, agri_q])  # (2, 3) MVar
 
         # ── 光伏有功 (单相标量 → 三相相同) ──
@@ -153,6 +268,10 @@ class NumpyChronics:
             initial_storage_soc: 初始 SOC (0.0~1.0)
         """
         self._current_idx = 0
+        # 重置农业冲击负荷状态
+        self._shock_active = False
+        self._shock_magnitude = 0.0
+        self._shock_countdown = 0
         self.initialize(initial_storage_soc)
 
     @property

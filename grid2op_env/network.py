@@ -78,15 +78,31 @@ def create_mupc_network() -> "pandapowerNet":
 
     # 4. 主干线路（农网高阻抗架空线，模拟长距离电压跌落）
     # 使用 NAYY 4x50 SE 电缆标准类型（参考 docs/MUPC/仿真环境.md）
+    # 如果标准类型不存在，使用参数化方式创建线路
     end_bus = pp.create_bus(net, vn_kv=0.4, name="End_Node_Bus")
-    pp.create_line(
-        net,
-        from_bus=lv_bus,
-        to_bus=end_bus,
-        length_km=LINE_LENGTH_KM,
-        std_type="NAYY 4x50 SE",
-        name="Main_Overhead_Line"
-    )
+    try:
+        # 尝试使用标准类型
+        pp.create_line(
+            net,
+            from_bus=lv_bus,
+            to_bus=end_bus,
+            length_km=LINE_LENGTH_KM,
+            std_type="NAYY 4x50 SE",
+            name="Main_Overhead_Line"
+        )
+    except Exception:
+        # 降级：使用参数化方式创建线路（r=0.534 ohm/km, x=0.08 ohm/km, c=0）
+        pp.create_line_from_parameters(
+            net,
+            from_bus=lv_bus,
+            to_bus=end_bus,
+            length_km=LINE_LENGTH_KM,
+            r_ohm_per_km=0.534,  # NAYY 4x50 SE 的电阻
+            x_ohm_per_km=0.08,    # NAYY 4x50 SE 的电抗
+            c_nf_per_km=0.0,      # 电缆电容
+            max_i_ka=0.3,          # 最大电流 300A
+            name="Main_Overhead_Line"
+        )
 
     # 5. 居民负荷（初始值 0，由 Chronics 动态注入）
     pp.create_load(

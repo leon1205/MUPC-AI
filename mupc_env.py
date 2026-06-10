@@ -62,6 +62,11 @@ SOC_CRITICAL = 0.10             # SOC 极低保护阈值
 VOLTAGE_PENALTY_HIGH = 2.0     # 高电压侧惩罚系数 (光伏超发)
 VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
 
+# ── Q_batt 电压环控制增益 (v2.4 分层控制) ────────────────────────
+# Q_batt 由实时电压调节器闭环控制，基于电压偏差计算
+# K_Q: 无功-电压灵敏度系数 (kVar/p.u.)
+K_Q = 200.0  # kVar per p.u. 电压偏差
+
 
 # ═══════════════════════════════════════════════════════════════
 # 奖励权重映射
@@ -225,8 +230,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             self._grid2op_power_flow = Grid2OpPowerFlow(
                 net, chronics, storage_soc_init=self._soc
             )
-        except Exception:
+        except Exception as e:
             # Grid2Op 不可用：降级到 VoltageSimulator
+            print(f"[WARN] Grid2Op 初始化失败，降级到 VoltageSimulator: {e}")
             self._grid2op_init_failed = True
             self._use_grid2op = False
             self._grid2op_power_flow = None
@@ -315,8 +321,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 1. 计算 Q_batt (由实时电压环给出，基于前一步电压)
         v_prev = (self._va + self._vb + self._vc) / 3.0
         v_error = v_prev - 1.0
-        K_Q_V = 200.0
-        q_batt = float(np.clip(-K_Q_V * v_error, -Q_BATT_MAX_KVAR, Q_BATT_MAX_KVAR))
+        q_batt = float(np.clip(-K_Q * v_error, -Q_BATT_MAX_KVAR, Q_BATT_MAX_KVAR))
 
         # v2.5: 计算 q_realtime_margin = 1 - |q_batt| / Q_BATT_MAX
         # 0=打满(无裕度), 1=空闲(最大裕度)
@@ -577,10 +582,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         out[7] = self._minmax(obs[7], 0.85, 1.15)
         out[8] = self._minmax(obs[8], 0.85, 1.15)
         out[9] = obs[9]  # q_realtime_margin: identity [0,1]
-        # D2 pv [10..24]
+        # D2 pv [10..24] (15维，索引 10-24，out[10:25] 包含 10-24)
         out[10:25] = self._minmax(obs[10:25], 0.0, PV_ARRAY_KW)
-        # D2 load [26..40]
-        out[26:41] = self._minmax(obs[26:41], 0.0, LOAD_PEAK_KW)
+        # D2 load [25..39] (15维，索引 25-39) — 修正：原为 [26:41] 错误偏移了1位
+        out[25:40] = self._minmax(obs[25:40], 0.0, LOAD_PEAK_KW)
         # D3 [41..43]
         out[41] = self._minmax(obs[41], 0.0, 1.5)
         out[42] = self._minmax(obs[42], 0.0, 1.5)
