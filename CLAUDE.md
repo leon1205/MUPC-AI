@@ -10,7 +10,11 @@ MUPC 强化学习模型训练管线，在 x86 PC 上训练 RL 模型，导出 ON
 
 - PRD：`docs/superpowers/specs/2026-06-06-MUPC-RL训练管线-PRD.md` v2.0
 - 设计文档：`docs/superpowers/specs/2026-06-06-MUPC-RL训练管线-设计文档.md` v2.0
-- 部署端规格：`docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.2
+
+下游项目文档（MUPC AI引擎）
+
+- 部署端规格：`docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.6
+- docs/MUPC/ 目录保存的是下游项目中文档，请不要随意改动！如果需要改动一定要经过确认同意！！！
 
 ## 常用命令
 
@@ -64,7 +68,7 @@ data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/�
         ↓
 lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
         ↓
-mupc_env.py          → Gymnasium 环境：58维观测 + 4维动作 + 5场景奖励
+mupc_env.py          → Gymnasium 环境：58维观测 + 3维动作 + 5场景奖励
         ↓
 train.py             → PPO/SAC 训练（或 NumPy PPO 后备）
         ↓
@@ -78,24 +82,26 @@ MUPC AI Engine (Rust, RK3588 NPU)
 **观测空间（58维单模式，59维多模式）**：
 
 ```
-[0..9]   D1 实时数据: SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压
-[9..24]  D2 光伏预测 (15维，LSTM或Oracle)
-[24..39] D2 负荷预测 (15维，LSTM或Oracle)
-[39..42] D3 电价: 当前价/下时段价/时段ID
-[42..45] D4 需量: 当前需量/合同值/本月峰值
-[45..47] D5 气象: 辐照/温度
-[47]     D6 调度指令
-[48..53] 扩展字段 (电压电流等)
-[54..57] 保留字段
+[0..9]   D1 实时数据: SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压/实时模块Q裕度
+[10..24] D2 光伏预测 (15维，LSTM或Oracle)
+[25..39] D2 负荷预测 (15维，LSTM或Oracle)
+[41..43] D3 电价: 当前价/下时段价/时段ID
+[44..46] D4 需量: 当前需量/合同值/本月峰值
+[47..48] D5 气象: 辐照/温度
+[49]     D6 调度指令
+[50]     D7 Q裕度
+[51..56] D7 季节one-hot: 灌溉季/炒茶季/空调季/常规季/保留/保留
+[57]     D7 时段: 白天/夜间
 [58]     mode_id (仅多模式训练)
 ```
 
-**动作空间（4维）**：`[p_batt, q_batt, load_shedding, pv_limit]`
+**动作空间（3维）**：`[p_batt, load_shedding, pv_limit]`
 
-- p_batt ∈ [-500, 500] kW（充电<0，放电>0）
-- q_batt ∈ [-300, 300] kVar
-- load_shedding ∈ [0, 500] kW
+- p_batt ∈ [-50, 50] kW（充电<0，放电>0）
+- load_shedding ∈ [0, 60] kW
 - pv_limit ∈ [0, 1]
+
+Q_batt 由实时电压调节器闭环控制，不经过 RL 动作空间。
 
 **5种场景模式**：
 
@@ -111,8 +117,8 @@ MUPC AI Engine (Rust, RK3588 NPU)
 **关键物理约束**：
 
 - SOC 硬限制：10%~90%（不可突破）
-- 变压器容量：500 kVA，过载阈值 85%
-- 动作约束 ACT-01~05（见 action_validator.py）
+- 变压器容量：200 kVA，过载阈值 85%
+- 动作约束 ACT-01/03/04/05（见 action_validator.py）
 
 ## 模块依赖
 
@@ -145,12 +151,14 @@ train.py
 
 | 参数           | 值      |
 | -------------- | ------- |
-| 变压器容量     | 500 kVA |
-| 电池容量       | 200 kWh |
-| 最大充放电功率 | 500 kW  |
+| 变压器容量     | 200 kVA |
+| 电池容量       | 100 kWh |
+| 最大充放电功率 | 50 kW   |
 | SOC 硬限制     | 10%~90% |
 | 过载阈值       | 85%     |
 | 时间步长       | 15分钟  |
+| 负荷峰值       | 60 kW   |
+| 光伏容量       | 150 kW  |
 
 ## 代码规范
 
@@ -158,7 +166,6 @@ train.py
 2. 动作 clamp 标注约束规则 ID (ACT-01~05)
 3. 所有函数包含 Type Hints 和 Docstrings
 4. `mupc_env.py` 不依赖 RL 框架，可独立运行
-
 
 ## 其他约束
 
