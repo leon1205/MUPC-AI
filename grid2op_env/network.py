@@ -1,13 +1,12 @@
 """create_mupc_network() — 构建农网台区 Pandapower 网络拓扑。
 
-参考 docs/MUPC/仿真环境.md 中的拓扑结构：
-- 外部电网 (10kV)
-- 配电变压器 (500kVA, 10/0.4kV)
-- 主干线路 (LGJ-70, 1.5km)
-- 居民负荷（晚高峰）
-- 农业冲击负荷（灌溉/炒茶）
-- 光伏 (200kW)
-- 储能 MUPC_BESS (200kWh)
+农网台区规格（2026-06-10 更新）：
+- 配电变压器: 200kVA, 10/0.4kV
+- 主干线路: NAYY 4x50 SE, 1.5km
+- 居民负荷: ~60kW
+- 农业冲击负荷: 最高120kW
+- 光伏: 150kW
+- 储能: 100kWh, 最大放电50kW
 
 Returns:
     Pandapower 网络对象（未执行潮流初始化）
@@ -24,10 +23,11 @@ if TYPE_CHECKING:
 
 # ── 网络拓扑常量 ────────────────────────────────────────────────
 
-TRANSFORMER_KVA: float = 500.0     # 配电变压器额定容量 (kVA)
-BATTERY_CAPACITY_KWH: float = 200.0  # 储能额定容量 (kWh)
-PV_ARRAY_KW: float = 200.0        # 光伏额定容量 (kW)
+TRANSFORMER_KVA: float = 200.0     # 配电变压器额定容量 (kVA)
+BATTERY_CAPACITY_KWH: float = 100.0  # 储能额定容量 (kWh)
+PV_ARRAY_KW: float = 150.0        # 光伏额定容量 (kW)
 LINE_LENGTH_KM: float = 1.5       # 主干线路长度 (km)
+MAX_BATTERY_DISCHARGE_KW: float = 50.0  # 储能最大放电功率 (kW)
 
 
 def create_mupc_network() -> "pandapowerNet":
@@ -35,14 +35,14 @@ def create_mupc_network() -> "pandapowerNet":
 
     拓扑结构：
         外部电网 (10kV)
-            └── 配电变压器 (500kVA, 10/0.4kV)
+            └── 配电变压器 (200kVA, 10/0.4kV)
                     └── 低压母线 (0.4kV)
                             ├── 主干线路 (NAYY 4x50 SE, 1.5km)
                             │       └── 末端节点（居民/农业负荷/光伏/储能）
-                            ├── 居民负荷（晚高峰）
-                            ├── 农业冲击负荷（灌溉/炒茶）
-                            ├──屋顶光伏（200kW，可控）
-                            └── 储能 MUPC_BESS（200kWh，可控）
+                            ├── 居民负荷（~60kW）
+                            ├── 农业冲击负荷（灌溉/炒茶，最高120kW）
+                            ├──屋顶光伏（150kW，可控）
+                            └── 储能 MUPC_BESS（100kWh，最大放电50kW，可控）
 
     Returns:
         Pandapower 网络对象（未执行潮流）
@@ -66,13 +66,13 @@ def create_mupc_network() -> "pandapowerNet":
         name="Grid_Connection"
     )
 
-    # 3. 配电变压器 (500kVA, 10/0.4kV)
+    # 3. 配电变压器 (200kVA, 10/0.4kV)
     lv_bus = pp.create_bus(net, vn_kv=0.4, name="LV_Main_Bus")
     pp.create_transformer(
         net,
         hv_bus=ext_bus,
         lv_bus=lv_bus,
-        std_type="0.4 MVA 10/0.4 kV",
+        std_type="0.25 MVA 10/0.4 kV",
         name="Dist_Transformer"
     )
 
@@ -135,12 +135,12 @@ def create_mupc_network() -> "pandapowerNet":
         # grid2op 默认使用 single values for sgen，这里用标量
     )
 
-    # 8. MUPC 储能装置（200kWh =0.2 MWh）
+    # 8. MUPC 储能装置（100kWh，最大放电50kW）
     pp.create_storage(
         net,
         bus=end_bus,
         p_mw=0.0,
-        max_e_mwh=BATTERY_CAPACITY_KWH / 1000.0,  # 200kWh → 0.2 MWh
+        max_e_mwh=BATTERY_CAPACITY_KWH / 1000.0,  # 100kWh → 0.1 MWh
         min_e_mwh=0.0,
         soc_percent=50.0,
         name="MUPC_BESS",

@@ -17,10 +17,10 @@ import numpy as np
 # ── 物理常量 ──────────────────────────────────────────────────
 
 PV_ARRAY_KW_REF = 1000.0        # CSV 中光伏阵列参考容量
-PV_ARRAY_KW_TARGET = 200.0      # MUPC 实际光伏容量 (缩放因子 = 0.2)
+PV_ARRAY_KW_TARGET = 150.0      # MUPC 实际光伏容量 (缩放因子 = 0.2)
 PV_SCALE = PV_ARRAY_KW_TARGET / PV_ARRAY_KW_REF  # 0.2
 
-LOAD_PEAK_KW = 400.0            # 负荷峰值 (kW)
+LOAD_PEAK_KW = 60.0            # 负荷峰值 (kW)
 CONTRACT_DEMAND_KW = 300.0      # 默认合同需量 (kW)
 GRID_EMISSION_FACTOR = 0.581    # kg CO2/kWh
 

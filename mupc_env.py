@@ -34,13 +34,13 @@ from action_validator import ActionValidator
 # 物理常量 (SAFETY: 以下常量涉及硬件安全边界, 修改前请评审)
 # ═══════════════════════════════════════════════════════════════
 
-TRANSFORMER_KVA = 500.0         # 变压器额定容量 (kVA)
-BATTERY_CAPACITY_KWH = 200.0   # 电池容量 (kWh)
-P_BATT_MAX_KW = 500.0           # 最大充放电功率 (kW)
+TRANSFORMER_KVA = 200.0         # 变压器额定容量 (kVA)
+BATTERY_CAPACITY_KWH = 100.0   # 电池容量 (kWh)
+P_BATT_MAX_KW = 50.0           # 最大充放电功率 (kW)
 Q_BATT_MAX_KVAR = 300.0         # 最大无功输出 (kVar)
 LOAD_SHED_MAX_KW = 500.0        # 最大切负荷 (kW)
-PV_ARRAY_KW = 200.0             # 光伏容量 (kW)
-LOAD_PEAK_KW = 400.0            # 负荷峰值 (kW)
+PV_ARRAY_KW = 150.0             # 光伏容量 (kW)
+LOAD_PEAK_KW = 60.0            # 负荷峰值 (kW)
 
 SOC_MIN = 0.10                  # SAFETY: SOC 下限硬约束
 SOC_MAX = 0.90                  # SAFETY: SOC 上限硬约束
