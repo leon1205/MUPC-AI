@@ -667,7 +667,8 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 **上层（RL决策）**
 - 有功设定值 P_batt：由 RL 策略网络输出
 - 可中断负荷 Load_shedding：由 RL 策略网络输出
-- 动作空间：2 维 ∈ [-1,1] × [0,1]
+- 光伏限功率比例 pv_limit：由 RL 策略网络输出（v2.6 恢复，用于主动弃光）
+- 动作空间：3 维 ∈ [-1,1] × [0,1] × [0,1]
 
 **分层优点：**
 - P 是 s/min 级慢变量，Q 是 ms 级快变量，单一网络同时学习两个时间尺度任务收敛困难且易振荡
@@ -676,12 +677,12 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 
 **动作空间对比：**
 
-| 维度 | v2.3（4维） | v2.4（2维） | 说明 |
-|------|------------|------------|------|
-| A1 | p_batt_set [-500,500]kW | p_batt_set [-500,500]kW | 电池有功（RL控制） |
-| A2 | q_batt_set [-300,300]kVar | 由实时模块闭环 | 无功（实时控制，不经AI） |
-| A3 | load_shedding [0,500]kW | load_shedding [0,500]kW | 可中断负荷（RL控制） |
-| A4 | pv_limit [0,1] | 由A2/Q替代 | 光伏限功率（由电压调节替代） |
+| 维度 | v2.3（4维） | v2.4~v2.5（2维） | v2.6（3维） | 说明 |
+|------|------------|-----------------|------------|------|
+| A1 | p_batt_set [-500,500]kW | p_batt_set [-500,500]kW | p_batt_set [-500,500]kW | 电池有功（RL控制） |
+| A2 | q_batt_set [-300,300]kVar | 由实时模块闭环 | 由实时模块闭环 | 无功（实时控制，不经AI） |
+| A3 | load_shedding [0,500]kW | load_shedding [0,500]kW | load_shedding [0,500]kW | 可中断负荷（RL控制） |
+| A4 | pv_limit [0,1] | 由A2/Q替代 | pv_limit [0,1] | 光伏限功率（v2.6 恢复主动弃光） |
 
 ### 4.2 算法选择
 
@@ -731,29 +732,28 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 | 台区季节性负荷 | 电压 < 0.95 p.u. | 放电 (正值) -- 释放有功 | 容性 (正值) -- 释放无功，补偿励磁 |
 | 末端低电压 | 电压 < 0.95 p.u. | 放电 (正值) -- 仅当无功不足时 | 容性 (正值) -- 优先手段，不消耗 SOC |
 
-### 4.4 完整动作空间表（4 维 + confidence）
+### 4.4 完整动作空间表（3 维 + confidence，v2.6）
 
 | 维度 | 字段名 | 类型 | 取值范围 | 单位 | 说明 |
 |------|--------|------|----------|------|------|
 | A1 | p_batt_set | f64 | [-500.0, 500.0] | kW | 电池有功设定（负=充电，正=放电） |
-| A2 | q_batt_set | f64 | [-300.0, 300.0] | kVar | 无功设定（负=感性/吸收，正=容性/释放） |
-| A3 | load_shedding | f64 | [0.0, 500.0] | kW | 可中断负荷切除 |
-| A4 | pv_limit | f64 | [0.0, 1.0] | - | 光伏限功率比例（0=全限，1=不限） |
+| A2 | load_shedding | f64 | [0.0, 500.0] | kW | 可中断负荷切除 |
+| A3 | pv_limit | f64 | [0.0, 1.0] | - | 光伏限功率比例（v2.6 恢复，0=全限，1=不限） |
 | - | confidence | f64 | [0.0, 1.0] | - | 决策置信度 |
+
+> 注：q_batt_set 由实时电压调节器闭环控制，不经过 RL 动作空间。
 
 ### 4.5 ActionOutput 结构体
 
 ```rust
-/// 强化学习决策输出（4 维动作 + 置信度）
+/// 强化学习决策输出（3 维动作 + 置信度，v2.6）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionOutput {
     /// A1: 电池有功功率设定值 (kW), [-500.0, 500.0], 负=充电, 正=放电
     pub p_batt_set: f64,
-    /// A2: 无功功率设定值 (kVar), [-300.0, 300.0], 负=感性/吸收, 正=容性/释放
-    pub q_batt_set: f64,
-    /// A3: 可中断负荷切除量 (kW), [0.0, 500.0]
+    /// A2: 可中断负荷切除量 (kW), [0.0, 500.0]
     pub load_shedding: f64,
-    /// A4: 光伏限功率比例, [0.0, 1.0], 0=完全限功率, 1=不限功率
+    /// A3: 光伏限功率比例, [0.0, 1.0], 0=完全限功率, 1=不限功率 (v2.6 恢复)
     pub pv_limit: f64,
     /// 决策置信度 [0.0, 1.0]
     pub confidence: f64,
@@ -778,8 +778,8 @@ impl RLModel {
 
     /// 执行决策
     ///
-    /// 输入：48 维融合状态向量
-    /// 输出：5 维动作 [(p_batt_set, q_batt_set, load_shedding, pv_limit, confidence)]
+    /// 输入：56 维融合状态向量（v2.5）
+    /// 输出：4 维动作 [(p_batt_set, load_shedding, pv_limit, confidence)]（v2.6）
     pub async fn decide(&self, input_vector: &[f32]) -> Result<ActionOutput, AiEngineError>;
 
     /// 获取模型类型
@@ -795,19 +795,18 @@ impl RLModel {
 从 RKNN Runtime 推理输出的 f32 向量解析为 ActionOutput 结构体，并在解析阶段执行 clamp 限幅。
 
 ```rust
-/// 解析 RL 模型输出向量为 ActionOutput
+/// 解析 RL 模型输出向量为 ActionOutput（v2.6，3 维动作）
 ///
-/// 输出格式: [p_batt_set, q_batt_set, load_shedding, pv_limit, confidence]
+/// 输出格式: [p_batt_set, load_shedding, pv_limit, confidence]
 pub fn parse_action_output(raw: &[f32]) -> Option<ActionOutput> {
-    if raw.len() < 5 {
+    if raw.len() < 4 {
         return None;
     }
     Some(ActionOutput {
         p_batt_set:   (raw[0] as f64).clamp(-500.0, 500.0),
-        q_batt_set:   (raw[1] as f64).clamp(-300.0, 300.0),
-        load_shedding:(raw[2] as f64).clamp(0.0, 500.0),
-        pv_limit:     (raw[3] as f64).clamp(0.0, 1.0),
-        confidence:   (raw[4] as f64).clamp(0.0, 1.0),
+        load_shedding:(raw[1] as f64).clamp(0.0, 500.0),
+        pv_limit:     (raw[2] as f64).clamp(0.0, 1.0),
+        confidence:   (raw[3] as f64).clamp(0.0, 1.0),
     })
 }
 ```
@@ -970,13 +969,14 @@ impl RewardCalculator {
 
 **优化目标：** 最大化光伏消纳 + 防止变压器过载 + 电池寿命保护 + 电压安全
 
-> **v2.5 说明（分层架构原则）：**
+> **v2.6 说明（分层架构原则）：**
 > - AI 仅在实时模块无功耗尽时才对电压偏差负责（q_realtime_margin <= 10% + 越限连续 2 步）
 > - 实时模块有裕度时，电压问题由实时模块自行处理，AI 不因"旁观"被惩罚
 > - 新增自适应损耗系数 α(s) ∈ {1.0, 0.2, 3.0} 区分"常规调度"与"应急处置"的电池损耗价值差异
 > - 弃光奖励增加电压前置条件：v_avg >= 1.05 p.u. 时置零
+> - **v2.6 新增**：电压变化斜率惩罚 R_voltage_slope = |ΔV|，迫使 AI 平滑调节，避免电压快速变化对电网造成冲击
 
-**v2.5 奖励公式：**
+**v2.6 奖励公式：**
 
 ```
 R_agri = w1 * R_pv_consumption          // 弃光奖励（含电压安全前置条件）
@@ -984,6 +984,7 @@ R_agri = w1 * R_pv_consumption          // 弃光奖励（含电压安全前置�
          - w3 * P_transformer_overload
          - w4 * P_voltage_deviation             // 条件触发式
          - w5 * R_ramp
+         - w6 * R_voltage_slope                 // 电压变化斜率惩罚（v2.6 新增）
 ```
 
 **子项定义：**
@@ -1003,11 +1004,12 @@ P_voltage_deviation    = 0.0                                          if |V_avg 
                           dev = |V_avg - 1.0| - 5%
 R_ramp                 = λ * |P_batt_t - P_batt_{t-1}| / BATTERY_CAPACITY_KWH
                           归一化到 C-rate 变化率
+R_voltage_slope        = |V_avg_t - V_avg_{t-1}|                       # v2.6 新增，迫使平滑调节
 
 其中 v_avg = (voltage_phase_a + voltage_phase_b + voltage_phase_c) / 3.0
 ```
 
-**权重表（v2.5）：**
+**权重表（v2.6）：**
 
 | 权重 | 默认值 | 说明 | 可配置范围 |
 |------|--------|------|------------|
@@ -1016,6 +1018,7 @@ R_ramp                 = λ * |P_batt_t - P_batt_{t-1}| / BATTERY_CAPACITY_KWH
 | w3 | 2.0 | 变压器过载惩罚 | [0.0, 5.0] |
 | w4 | 1.0 | 电压质量惩罚（条件触发式） | [0.0, 3.0] |
 | w5 | 0.5 | 功率变化率惩罚 | [0.0, 2.0] |
+| w6 | 0.5 | 电压变化斜率惩罚（v2.6 新增） | [0.0, 2.0] |
 
 **Rust 代码实现（v2.5）：**
 

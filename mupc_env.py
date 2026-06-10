@@ -1,14 +1,14 @@
 """
-MUPC 全状态强化学习环境 — 48/49 维观测, 2 维动作, 5 种场景奖励。
+MUPC 全状态强化学习环境 — 58/59 维观测, 3 维动作, 5 种场景奖励。
 
-对齐 MUPC AI 引擎 PRD v2.4:
-  - 状态空间: 21 字段序列化为 48/49 维向量
-  - 动作空间: [p_batt, load_shedding] (2 维) — Q 控制交由实时电压调节器闭环
+对齐 MUPC AI 引擎 PRD v2.6:
+  - 状态空间: 21 字段序列化为 58/59 维向量
+  - 动作空间: [p_batt, load_shedding, pv_limit] (3 维) — Q 控制交由实时电压调节器闭环
   - 5 种预设场景 MODE-01~05 各独立奖励函数
   - 三相电压简化仿真 (Q-V 耦合，Q 由实时模块根据电压闭环给出)
-  - 电压死区 (±5%) + 功率变化率惩罚，保护电池免受高频微循环损耗
-  - 3 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
-    ACT-05(调度约束) — Q/功率圆/pv_limit 相关约束由实时控制处理
+  - 电压死区 (±5%) + 功率变化率/电压斜率惩罚，保护电池免受高频微循环损耗
+  - 4 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
+    ACT-04(pv_limit), ACT-05(调度约束) — Q 相关约束由实时控制处理
 """
 
 import math
@@ -132,11 +132,11 @@ class VoltageSimulator:
 # ═══════════════════════════════════════════════════════════════
 
 class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
-    """MUPC 全状态 RL 环境 (v2.5 分层控制架构).
+    """MUPC 全状态 RL 环境 (v2.6 分层控制架构).
 
-    动作空间 2 维: [p_batt, load_shedding]
+    动作空间 3 维: [p_batt, load_shedding, pv_limit]
     Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
-    观测空间: Box(56,) 或 Box(57,) (多模式)
+    观测空间: Box(58,) 或 Box(59,) (多模式)
     """
 
     metadata = {"render_modes": []}
@@ -187,10 +187,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # 动作: [p_batt_norm, load_shed_norm] (2维)
+        # 动作: [p_batt_norm, load_shed_norm, pv_limit_norm] (3维)
         # Q_batt 由实时电压调节器闭环控制，不经过 RL
-        low_act = np.array([-1.0, 0.0], dtype=np.float32)
-        high_act = np.array([1.0, 1.0], dtype=np.float32)
+        # pv_limit: 光伏有功限值比例 (0.0=全部切除, 1.0=全部出力)
+        low_act = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+        high_act = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # 内部状态
@@ -212,6 +213,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
+        # v2.6 新增: 电压斜率追踪（用于 |ΔV| 惩罚）
+        self._prev_v_avg: float = 1.0
 
     def _init_grid2op(self) -> None:
         """延迟初始化 Grid2Op（首次 reset 前不创建）。
@@ -273,6 +276,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._peak_demand = 200.0
         self._prev_p_batt = 0.0
         self._prev_q_batt = 0.0
+        self._prev_v_avg = 1.0  # v2.6: 电压斜率追踪
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -339,17 +343,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         clamped, violated, violations = self._validator.validate(
             action, dispatch_p_use, q_batt_real=q_batt)
 
-        # 3. 反归一化动作到物理值 (2维: P_batt + Load_shedding)
+        # 3. 反归一化动作到物理值 (3维: P_batt + Load_shedding + Pv_limit)
         p_batt = clamped[0] * P_BATT_MAX_KW
         load_shed = clamped[1] * LOAD_SHED_MAX_KW
+        pv_limit = clamped[2] * 1.0  # [0.0, 1.0] 无量纲
         # Q_batt 已在上方计算，由实时电压调节器闭环给出
-        # pv_limit 不再作为动作维度，光伏限功率由 Q 调节替代
 
-        # 4. 有效负荷与光伏 (pv_limit=1.0 恒定)
+        # 4. 有效负荷与光伏 (pv_limit 可主动弃光)
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
-        p_pv_eff = p_pv_raw  # 无 pv_limit，全部光伏出力
+        p_pv_eff = p_pv_raw * pv_limit  # v2.6: 主动弃光
 
         # 4. SOC 更新 (SAFETY: hard clamp)
         soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH
@@ -384,6 +388,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                 p_net, float(q_batt), self._va, self._vb, self._vc)
         v_avg = (va + vb + vc) / 3.0
 
+        # v2.6: 电压斜率追踪（用于 |ΔV| 惩罚）
+        delta_v = abs(v_avg - self._prev_v_avg)
+
         # 8. 电压越限计数器 (死区: ±5%, [0.95, 1.05])
         V_DEAD = 0.05
         if abs(v_avg - 1.0) > V_DEAD:
@@ -411,17 +418,19 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         prev_p_batt_for_reward = self._prev_p_batt
         self._prev_p_batt = p_batt
         self._prev_q_batt = float(q_batt)
+        self._prev_v_avg = v_avg  # v2.6: 电压斜率追踪
 
         # 11. 奖励计算
         reward, reward_info = self._compute_reward(
             p_batt=p_batt, q_batt=float(q_batt), load_shed=load_shed,
-            pv_limit=1.0, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
+            pv_limit=pv_limit, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
             p_load_eff=p_load_eff, grid_power=grid_power,
             load_rate=load_rate, load_rate_unclamped=load_rate_unclamped,
             soc_new=soc_new, soc_clipped=soc_clipped,
             va=va, vb=vb, vc=vc,
             prev_p_batt=prev_p_batt_for_reward,
             voltage_violation_count=self._voltage_violation_count,
+            delta_v=delta_v,
         )
 
         # 12. 推进时间
@@ -437,7 +446,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_batt": p_batt,
             "q_batt": float(q_batt),
             "load_shedding": load_shed,
-            "pv_limit": 1.0,
+            "pv_limit": float(pv_limit), # v2.6: 主动弃光
             "grid_power": grid_power,
             "va": va, "vb": vb, "vc": vc,
             "v_avg": float(v_avg),
@@ -655,9 +664,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
 
-        # ── 光伏消纳率 (含电压前置条件) ──
-        pv_total = max(r["p_pv_raw"], 1e-6)
-        pv_self = min(r["p_pv_raw"], r["p_load_raw"]) + max(0.0, -r["p_batt"])
+        # ── 光伏消纳率 (含电压前置条件 + v2.6 主动弃光) ──
+        pv_total = max(r["p_pv_raw"], 1e-6)  # 原始光伏总出力
+        pv_limit = r.get("pv_limit", 1.0)    # v2.6: 主动弃光比例
+        pv_eff = r["p_pv_raw"] * pv_limit    # 限后光伏出力
+        pv_self = min(pv_eff, r["p_load_raw"]) + max(0.0, -r["p_batt"])
         r_pv = min(pv_self / pv_total, 1.0)
         # v2.5: 电压偏高时弃光奖励不计入
         if v_avg >= VOLTAGE_HIGH_LIMIT:
@@ -701,11 +712,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         w5 = w[4] if len(w) > 4 else 0.0
         p_ramp_penalty = w5 * delta_p / BATTERY_CAPACITY_KWH
 
+        # ── v2.6: 电压变化斜率惩罚（阻抗感知，迫使 AI 平滑调节）──
+        delta_v = r.get("delta_v", 0.0)
+        w6 = w[5] if len(w) > 5 else 0.0
+        p_voltage_slope = w6 * delta_v
+
         total = (w[0] * r_pv
                  - w[1] * p_batt_deg
                  - w[2] * p_overload
                  - w4 * p_voltage
-                 - p_ramp_penalty)
+                 - p_ramp_penalty
+                 - p_voltage_slope)
 
         info = {
             "r_pv_consumption": float(r_pv),
@@ -713,6 +730,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_transformer_overload": float(-p_overload),
             "p_voltage_deviation": float(-p_voltage),
             "p_ramp_penalty": float(-p_ramp_penalty),
+            "p_voltage_slope": float(-p_voltage_slope),  # v2.6
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5

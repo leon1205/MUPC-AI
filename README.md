@@ -22,7 +22,7 @@ data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/�
         ↓
 lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
         ↓
-mupc_env.py          → Gymnasium 环境：58维观测 + 2维动作 + 5场景奖励
+mupc_env.py          → Gymnasium 环境：58维观测 + 3维动作 + 5场景奖励
 │ └── grid2op_env/ → Grid2Op + Pandapower 三相潮流电压仿真（可选）
         ↓
 train.py → PPO/SAC 训练（或 NumPy PPO 后备）
@@ -66,6 +66,12 @@ python train.py --mode MODE-01 --data-source smartds \
 python train.py --mode MODE-01 --data-source merged --train-lstm \
        --lstm-params hidden_dim=128,num_layers=3,epochs=200,patience=30 \
        --total-timesteps 1000000 --export-onnx
+
+# ============================================================
+# 课程学习训练（v2.6 新增）
+# ============================================================
+# Phase 1: MODE-02 (基础) → Phase 2: MODE-01 (进阶) → Phase 3: 混合模式 (对抗)
+python train.py --curriculum --total-timesteps 175200
 
 # ============================================================
 # Grid2Op / VoltageSimulator 切换
@@ -153,12 +159,13 @@ python data_loader.py --unified --lat 31.23 --lon 121.47
 [58]     mode_id (仅多模式训练)
 ```
 
-## 动作空间（2维）
+## 动作空间（3维）
 
 | 维度 | 范围 | 说明 |
 |------|------|------|
 | p_batt | [-500, 500] kW | 电池有功（RL 控制） |
 | load_shedding | [0, 500] kW | 可中断负荷切除（RL 控制） |
+| pv_limit | [0, 1] | 光伏有功限值比例（v2.6 新增，主动弃光） |
 
 Q_batt 由实时电压调节器闭环，不经过 RL。
 
@@ -178,6 +185,7 @@ Q_batt 由实时电压调节器闭环，不经过 RL。
 - **条件触发电压惩罚**：q_realtime_margin ≤ 10% 且越限 ≥ 2 步才触发
 - **弃光电压前置**：v_avg ≥ 1.05 p.u. → R_pv = 0
 - **功率变化率惩罚**：R_ramp = w5 · |ΔP_batt| / BATTERY_CAPACITY_KWH
+- **电压变化斜率惩罚（v2.6 新增）**：R_slope = w6 · |ΔV|，迫使 AI 平滑调节
 
 ## 电压仿真引擎（v2.3 新增）
 
@@ -218,7 +226,7 @@ Q_batt 由实时电压调节器闭环，不经过 RL。
 ```
 MUPC-AI2/
 ├── data_loader.py              # SMART-DS 数据加载 + 状态合成
-├── mupc_env.py               # Gymnasium 环境 (58/59维, 2维动作, Grid2Op集成)
+├── mupc_env.py               # Gymnasium 环境 (58/59维, 3维动作, Grid2Op集成)
 ├── lstm_model.py             # LSTM 预测模型 / Oracle 后备
 ├── train.py                  # PPO/SAC 训练主入口（统一入口）
 ├── action_validator.py        # 动作约束 (ACT-01~05)

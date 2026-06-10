@@ -123,6 +123,8 @@ def parse_args():
                    help="训练完成后自动导出 ONNX")
     p.add_argument("--reward-weights", type=str, default="",
                    help="自定义权重, e.g. MODE-01=1.5,0.3,3.0 (逗号分隔)")
+    p.add_argument("--curriculum", action="store_true",
+                   help="启用课程学习：Phase1(MODE-02) → Phase2(MODE-01) → Phase3(混合)")
     return p.parse_args()
 
 
@@ -265,6 +267,84 @@ def main():
         print("\n── 使用 Oracle 预测 ──")
         predictor = OraclePredictor(train_data)
 
+    # ── 课程学习训练 (v2.6) ───────────────────────────────
+
+    def _run_curriculum_training(train_data: dict, val_data: dict,
+                                predictor, args) -> None:
+        """三阶段课程学习训练。
+
+        Phase 1: MODE-02 (基础) — 削峰填谷 + SOC 管理，175200 步
+        Phase 2: MODE-01 (进阶) — 加入电压约束 + 低惩罚权重，175200 步
+        Phase 3: 混合模式 (对抗) — 全惩罚权重，175200 步
+
+        总步数 = 3 × 175200 = 525600 步
+        """
+        from mupc_env import MupcEnv
+
+        #课程学习权重配置
+        # Phase 1: MODE-02 only (基础经济性)
+        phase1_weights = {
+            "MODE-02": [1.0, 1.0, 2.0], # w1(价差), w2(电池), w3(过载)
+        }
+        # Phase 2: MODE-01 (进阶电压安全)，降低 w4(电压惩罚)
+        phase2_weights = {
+            "MODE-01": [1.0, 0.5, 2.0, 0.3, 0.5],  # w4(电压) 从 1.0 降到 0.3
+        }
+        # Phase 3: MODE-01 全权重 + all 混合
+        phase3_weights = {
+            "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w4(电压) 恢复 1.0
+            "MODE-02": [1.0, 1.0, 2.0],
+            "MODE-03": [1.0, 0.5],
+            "MODE-04": [1.0, 2.0, 1.0],
+            "MODE-05": [1.0, 1.0],
+        }
+
+        phase_steps = args.total_timesteps # 每阶段步数
+        phases = [
+            ("Phase 1:基础 (MODE-02 削峰填谷)", "MODE-02", phase1_weights),
+            ("Phase 2: 进阶 (MODE-01 电压约束)", "MODE-01", phase2_weights),
+            ("Phase 3: 对抗 (混合模式)", "all", phase3_weights),
+        ]
+
+        has_sb3 = False
+        has_gym = False
+        try:
+            import stable_baselines3 as sb3
+            import gymnasium
+            has_sb3 = True
+            has_gym = True
+        except ImportError:
+            pass
+
+        for phase_name, mode, weights in phases:
+            print(f"\n{'─' * 56}")
+            print(f"  {phase_name}")
+            print(f"{'─' * 56}")
+
+            env = MupcEnv(train_data, mode=mode, lstm_predictor=predictor,
+                          reward_weights=weights)
+            eval_env = MupcEnv(val_data, mode=mode, lstm_predictor=predictor,
+                              reward_weights=weights)
+
+            obs_dim = env.observation_space.shape[0]
+            print(f"  观测空间: Box({obs_dim},), 动作空间: Box(3,), 算法: {args.algo}")
+            print(f"  训练步数: {phase_steps}")
+
+            #临时修改 args 的 total_timesteps
+            orig_steps = args.total_timesteps
+            args.total_timesteps = phase_steps
+
+            if has_sb3 and has_gym:
+                _train_sb3(env, eval_env, args, obs_dim, mode)
+            else:
+                _train_numpy_ppo(env, eval_env, args, obs_dim, mode)
+
+            args.total_timesteps = orig_steps
+
+        print(f"\n{'─' * 56}")
+        print("  课程学习训练完成")
+        print(f"{'─' * 56}")
+
     # ── 确定训练模式列表 ────────────────────────────────
     if args.mode == "single":
         modes = ["MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"]
@@ -279,38 +359,45 @@ def main():
 
     custom_weights = parse_custom_weights(args.reward_weights)
 
-    for mode in modes:
-        print(f"\n{'=' * 56}")
-        print(f"  训练模式: {mode}")
-        print(f"{'=' * 56}")
+    # v2.6: 课程学习模式
+    if args.curriculum:
+        print("\n" + "=" * 56)
+        print("  课程学习训练 (3 Phase)")
+        print("=" * 56)
+        _run_curriculum_training(train_data, val_data, predictor, args)
+    else:
+        for mode in modes:
+            print(f"\n{'=' * 56}")
+            print(f"  训练模式: {mode}")
+            print(f"{'=' * 56}")
 
-        from mupc_env import MupcEnv
-        env = MupcEnv(train_data, mode=mode, lstm_predictor=predictor,
-                      reward_weights=custom_weights if custom_weights else None)
-        eval_env = MupcEnv(val_data, mode=mode, lstm_predictor=predictor,
+            from mupc_env import MupcEnv
+            env = MupcEnv(train_data, mode=mode, lstm_predictor=predictor,
                           reward_weights=custom_weights if custom_weights else None)
+            eval_env = MupcEnv(val_data, mode=mode, lstm_predictor=predictor,
+                              reward_weights=custom_weights if custom_weights else None)
 
-        obs_dim = env.observation_space.shape[0]
-        print(f"  观测空间: Box({obs_dim},), 动作空间: Box(2,), 算法: {args.algo}")
+            obs_dim = env.observation_space.shape[0]
+            print(f"  观测空间: Box({obs_dim},), 动作空间: Box(3,), 算法: {args.algo}")
 
-        if has_sb3 and has_gym:
-            _train_sb3(env, eval_env, args, obs_dim, mode)
-        else:
-            _train_numpy_ppo(env, eval_env, args, obs_dim, mode)
+            if has_sb3 and has_gym:
+                _train_sb3(env, eval_env, args, obs_dim, mode)
+            else:
+                _train_numpy_ppo(env, eval_env, args, obs_dim, mode)
 
-        # ONNX 导出
-        if args.export_onnx and has_torch:
-            print("\n── ONNX 导出 ──")
-            try:
-                import export_onnx
-                onnx_path = export_onnx.export_rl_policy(
-                    checkpoint_dir=args.checkpoint_path,
-                    output_dir="./exported_models/",
-                    obs_dim=obs_dim,
-                )
-                print(f"  ONNX 模型已导出: {onnx_path}")
-            except Exception as e:
-                print(f"  ONNX 导出失败: {e}")
+            # ONNX 导出
+            if args.export_onnx and has_torch:
+                print("\n── ONNX 导出 ──")
+                try:
+                    import export_onnx
+                    onnx_path = export_onnx.export_rl_policy(
+                        checkpoint_dir=args.checkpoint_path,
+                        output_dir="./exported_models/",
+                        obs_dim=obs_dim,
+                    )
+                    print(f"  ONNX 模型已导出: {onnx_path}")
+                except Exception as e:
+                    print(f"  ONNX 导出失败: {e}")
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")

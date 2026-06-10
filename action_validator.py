@@ -1,18 +1,19 @@
 """
-动作约束校验器 — 3 条约束规则，对应 MUPC AI 引擎 PRD v2.4 分层控制架构。
+动作约束校验器 — 3 条约束规则，对应 MUPC AI 引擎 PRD v2.6 分层控制架构。
 
-约束规则 (来自 MUPC AI 引擎 PRD 5.4 节 v2.4):
+约束规则 (来自 MUPC AI 引擎 PRD 5.4 节 v2.6):
   ACT-01: |Δp_batt| ≤ 50 kW/步
   ACT-03: sqrt(p² + q_real²) ≤ 500 kVA（Q 由实时控制闭环，此约束主要限制 P）
+  ACT-04: |pv_limit| ≤ 1.0（光伏限功率比例，v2.6 恢复）
   ACT-05: |p_batt| ≤ |dispatch_p| (当调度指令有效时)
 
-已移除的约束(Q/pv_limit)由实时控制核心闭环处理:
+Q_batt 由实时控制核心闭环处理:
   - Q_batt: 由实时电压调节器闭环控制
-  - pv_limit: 不再作为 RL 动作维度，由电压调节替代
 """
 
 import math
 from typing import Any
+import numpy as np
 
 
 class ActionValidator:
@@ -28,40 +29,43 @@ class ActionValidator:
 
     # ── 反归一化 / 归一化 ────────────────────────────────────
 
-    def _denormalize(self, action_norm) -> tuple[float, float]:
-        """动作反归一化到物理值 (2维: P_batt + Load_shedding).
+    def _denormalize(self, action_norm) -> tuple[float, float, float]:
+        """动作反归一化到物理值 (3维: P_batt + Load_shedding + Pv_limit).
 
-        action_norm: [p_batt_norm, load_shed_norm]
+        action_norm: [p_batt_norm, load_shed_norm, pv_limit_norm]
         p_batt_norm ∈ [-1, 1] → [-500, 500] kW
         load_shed_norm ∈ [0, 1] → [0, 500] kW
+        pv_limit_norm ∈ [0, 1] → [0, 1] (无量纲比例)
         """
         p = action_norm[0] * self.P_BATT_MAX
         ls = action_norm[1] * self.LOAD_SHED_MAX
-        return p, ls
+        pv_limit = action_norm[2] * 1.0  # 已经是 [0, 1] 范围
+        return p, ls, pv_limit
 
-    def _renormalize(self, p: float, ls: float) -> tuple:
+    def _renormalize(self, p: float, ls: float, pv_limit: float) -> tuple:
         """物理值重新归一化到 action space。"""
         return (
             float(p / self.P_BATT_MAX),
             float(ls / self.LOAD_SHED_MAX),
+            float(pv_limit),  # 无量纲，直接返回
         )
 
     # ── 主校验入口 ─────────────────────────────────────────
 
     def validate(self, action_norm, dispatch_p: float | None = None,
                  q_batt_real: float = 0.0
-                 ) -> tuple[tuple[float, float], bool, dict[str, bool]]:
-        """执行 3 条约束校验。
+                 ) -> tuple[tuple[float, float, float], bool, dict[str, bool]]:
+        """执行 4 条约束校验。
 
         Args:
-            action_norm: 归一化动作 [p_batt_norm, load_shed_norm] (2维)
+            action_norm: 归一化动作 [p_batt_norm, load_shed_norm, pv_limit_norm] (3维)
             dispatch_p: 调度有功指令 (kW), None 表示无调度
             q_batt_real: 实时控制核心闭环的 Q 值 (kVar)，用于 ACT-03 功率圆校验
 
         Returns:
-            (clamped_action_norm_2d, violated: bool, violations: dict)
+            (clamped_action_norm_3d, violated: bool, violations: dict)
         """
-        p, ls = self._denormalize(action_norm)
+        p, ls, pv_limit = self._denormalize(action_norm)
         violations: dict[str, bool] = {}
 
         # ACT-01: Δp ≤ 50 kW/步 (电池变化率保护)
@@ -78,6 +82,11 @@ class ActionValidator:
             p *= scale
             violations["ACT-03"] = True
 
+        # ACT-04: pv_limit ∈ [0, 1] (光伏限功率比例约束)
+        pv_limit = float(np.clip(pv_limit, 0.0, 1.0))
+        if pv_limit != action_norm[2]:
+            violations["ACT-04"] = True
+
         # ACT-05: 调度指令约束
         if dispatch_p is not None and abs(dispatch_p) > 1e-6:
             limit = abs(dispatch_p)
@@ -88,7 +97,7 @@ class ActionValidator:
         # 更新历史
         self.prev_p_batt = p
 
-        clamped = self._renormalize(p, ls)
+        clamped = self._renormalize(p, ls, pv_limit)
         return clamped, bool(violations), violations
 
     def reset(self) -> None:
