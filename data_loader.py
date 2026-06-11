@@ -14,15 +14,25 @@ from pathlib import Path
 
 import numpy as np
 
+# ── 懒加载配置 ──────────────────────────────────────────────────
+
+
+def _cfg():
+    """懒加载配置（支持无 --config 时的硬编码回退）。"""
+    from config.config_manager import get_config
+    return get_config()
+
+
 # ── 物理常量 ──────────────────────────────────────────────────
 
-PV_ARRAY_KW_REF = 1000.0        # CSV 中光伏阵列参考容量
-PV_ARRAY_KW_TARGET = 150.0      # MUPC 实际光伏容量 (缩放因子 = 0.2)
-PV_SCALE = PV_ARRAY_KW_TARGET / PV_ARRAY_KW_REF  # 0.2
+_c = _cfg()
+PV_ARRAY_KW_REF = 1000.0        # CSV 中光伏阵列参考容量（通常不需修改）
+PV_ARRAY_KW_TARGET = _c.physical.pv_array_kw  # MUPC 实际光伏容量 (缩放因子)
+PV_SCALE = PV_ARRAY_KW_TARGET / PV_ARRAY_KW_REF  # 动态计算
 
-LOAD_PEAK_KW = 60.0            # 负荷峰值 (kW)
-CONTRACT_DEMAND_KW = 300.0      # 默认合同需量 (kW)
-GRID_EMISSION_FACTOR = 0.581    # kg CO2/kWh
+LOAD_PEAK_KW = _c.physical.load_peak_kw
+CONTRACT_DEMAND_KW = _c.contract.contract_demand_kw
+GRID_EMISSION_FACTOR = _c.contract.grid_emission_factor
 
 DATA_DIR = Path(__file__).parent / "data" / "smart_ds"
 SOLAR_DIR = DATA_DIR / "solar"

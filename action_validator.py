@@ -24,7 +24,20 @@ class ActionValidator:
     LOAD_SHED_MAX: float = 60.0   # kW（匹配负荷峰值）
     DELTA_P_MAX: float = 50.0     # kW/步（电池变化率保护）
 
-    def __init__(self):
+    def __init__(self, p_batt_max: float = 50.0, s_max: float = 200.0,
+                 load_shed_max: float = 60.0, delta_p_max: float = 50.0):
+        """初始化动作约束参数（支持配置文件注入）。
+
+        Args:
+            p_batt_max: 电池最大充放电功率 (kW)
+            s_max: 功率圆上限 (kVA)
+            load_shed_max: 最大切负荷 (kW)
+            delta_p_max: 电池变化率保护 (kW/步)
+        """
+        self.P_BATT_MAX = p_batt_max
+        self.S_MAX = s_max
+        self.LOAD_SHED_MAX = load_shed_max
+        self.DELTA_P_MAX = delta_p_max
         self.prev_p_batt: float = 0.0
 
     # ── 反归一化 / 归一化 ────────────────────────────────────

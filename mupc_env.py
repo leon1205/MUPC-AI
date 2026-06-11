@@ -30,55 +30,69 @@ except ImportError:
 from action_validator import ActionValidator
 
 
+def _cfg():
+    """懒加载配置（支持无 --config 时的硬编码回退）。"""
+    from config.config_manager import get_config
+    return get_config()
+
+
 # ═══════════════════════════════════════════════════════════════
 # 物理常量 (SAFETY: 以下常量涉及硬件安全边界, 修改前请评审)
+# 优先从配置文件读取，未配置则使用默认值（向后兼容）
 # ═══════════════════════════════════════════════════════════════
 
-TRANSFORMER_KVA = 200.0         # 变压器额定容量 (kVA)
-BATTERY_CAPACITY_KWH = 100.0   # 电池容量 (kWh)
-P_BATT_MAX_KW = 50.0           # 最大充放电功率 (kW)
-Q_BATT_MAX_KVAR = 300.0         # 最大无功输出 (kVar)
-LOAD_SHED_MAX_KW = 500.0        # 最大切负荷 (kW)
-PV_ARRAY_KW = 150.0             # 光伏容量 (kW)
-LOAD_PEAK_KW = 60.0            # 负荷峰值 (kW)
+_c = _cfg()
+TRANSFORMER_KVA = _c.physical.transformer_kva
+BATTERY_CAPACITY_KWH = _c.physical.battery_capacity_kwh
+P_BATT_MAX_KW = _c.physical.p_batt_max_kw
+Q_BATT_MAX_KVAR = _c.physical.q_batt_max_kvar
+LOAD_SHED_MAX_KW = _c.physical.load_shed_max_kw
+PV_ARRAY_KW = _c.physical.pv_array_kw
+LOAD_PEAK_KW = _c.physical.load_peak_kw
 
-SOC_MIN = 0.10                  # SAFETY: SOC 下限硬约束
-SOC_MAX = 0.90                  # SAFETY: SOC 上限硬约束
-OVERLOAD_THRESHOLD = 0.85       # 过载阈值
-DT_HOURS = 0.25                 # 时间步长 (15 分钟)
-LOAD_PF = 0.90                  # 负荷功率因数 cosφ
+SOC_MIN = _c.safety.soc_min
+SOC_MAX = _c.safety.soc_max
+OVERLOAD_THRESHOLD = _c.safety.overload_threshold
+DT_HOURS = _c.time.dt_hours
+LOAD_PF = _c.time.load_pf
 
-CONTRACT_DEMAND_KW = 300.0      # 合同需量 (kW)
-GRID_EMISSION_FACTOR = 0.581   # kg CO2/kWh
-EPISODE_LENGTH = 96             # 1 天 = 96 步 × 15 分钟
+CONTRACT_DEMAND_KW = _c.contract.contract_demand_kw
+GRID_EMISSION_FACTOR = _c.contract.grid_emission_factor
+EPISODE_LENGTH = _c.time.episode_length
 
 # ── v2.5 奖励阈值配置 ─────────────────────────────────────────
 # 对齐 MUPC AI 引擎 PRD v2.5 RewardThresholdConfig
 
-VOLTAGE_DEADBAND = 0.05         # ±5% 死区
-Q_MARGIN_THRESHOLD = 0.10      # 实时模块无功耗尽阈值 (10%)
-VOLTAGE_HIGH_LIMIT = 1.05       # 弃光前置电压阈值 (p.u.)
-SOC_CRITICAL = 0.10             # SOC 极低保护阈值
-VOLTAGE_PENALTY_HIGH = 2.0     # 高电压侧惩罚系数 (光伏超发)
-VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
+VOLTAGE_DEADBAND = _c.reward_thresholds.voltage_deadband
+Q_MARGIN_THRESHOLD = _c.reward_thresholds.q_margin_threshold
+VOLTAGE_HIGH_LIMIT = _c.reward_thresholds.voltage_high_limit
+SOC_CRITICAL = _c.reward_thresholds.soc_critical
+VOLTAGE_PENALTY_HIGH = _c.reward_thresholds.voltage_penalty_high
+VOLTAGE_PENALTY_LOW = _c.reward_thresholds.voltage_penalty_low
 
 # ── Q_batt 电压环控制增益 (v2.4 分层控制) ────────────────────────
 # Q_batt 由实时电压调节器闭环控制，基于电压偏差计算
 # K_Q: 无功-电压灵敏度系数 (kVar/p.u.)
-K_Q = 200.0  # kVar per p.u. 电压偏差
+K_Q = _c.q_control.k_q
 
 
 # ═══════════════════════════════════════════════════════════════
 # 奖励权重映射
 # ═══════════════════════════════════════════════════════════════
 
-DEFAULT_WEIGHTS: dict[str, list[float]] = {
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w1(光伏消纳), w2(电池), w3(过载), w4(电压质量), w5(变化率)
-    "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
-    "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
-    "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
-    "MODE-05": [1.0, 1.0],            # w1(绿电), w2(碳减排)
-}
+def _default_weights() -> dict[str, list[float]]:
+    """动态获取默认奖励权重（始终读取当前全局配置）。"""
+    c = _cfg()
+    return {
+        "MODE-01": c.reward_weights.MODE_01,
+        "MODE-02": c.reward_weights.MODE_02,
+        "MODE-03": c.reward_weights.MODE_03,
+        "MODE-04": c.reward_weights.MODE_04,
+        "MODE-05": c.reward_weights.MODE_05,
+    }
+
+
+DEFAULT_WEIGHTS: dict[str, list[float]] = _default_weights()
 
 MODE_ID_MAP: dict[str, float] = {
     "MODE-01": 0.0, "MODE-02": 0.25, "MODE-03": 0.5,
@@ -93,15 +107,18 @@ ALL_MODES = ["MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"]
 # ═══════════════════════════════════════════════════════════════
 
 class VoltageSimulator:
-    """三相电压简化线路模型 (Q-V 耦合)。"""
+    """三相电压简化线路模型 (Q-V 耦合)，参数由配置文件决定。"""
 
-    K_P = 0.05            # 有功灵敏度 (p.u. / 500kW)
-    K_Q = 0.03            # 无功灵敏度 (p.u. / 300kVar)
-    S_BASE = 500.0        # kVA
-    V_MIN = 0.85
-    V_MAX = 1.15
-    NOISE_STD = 0.005     # 测量噪声
-    IMBALANCE = 0.003     # 三相不平衡度
+    def __init__(self, k_p: float = 0.05, k_q: float = 0.03, s_base: float = 500.0,
+                 v_min: float = 0.85, v_max: float = 1.15,
+                 noise_std: float = 0.005, imbalance: float = 0.003):
+        self.K_P = k_p
+        self.K_Q = k_q
+        self.S_BASE = s_base
+        self.V_MIN = v_min
+        self.V_MAX = v_max
+        self.NOISE_STD = noise_std
+        self.IMBALANCE = imbalance
 
     def step(self, p_net: float, q_batt: float,
              prev_va: float, prev_vb: float, prev_vc: float
@@ -147,7 +164,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                  lstm_predictor: Any = None,
                  reward_weights: dict[str, list[float]] | None = None,
                  use_grid2op: bool = True,
-                 grid2op_backend: str = "lightsim"):
+                 grid2op_backend: str = "lightsim",
+                 config: "MupcConfig | None" = None):
         """
         Args:
             data: SmartDSLoader 返回的 data dict
@@ -156,11 +174,24 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             reward_weights: 自定义权重, e.g. {"MODE-01": [1.5, 0.3, 3.0]}
             use_grid2op: True=使用 Grid2Op 电压仿真, False=降级到 VoltageSimulator
             grid2op_backend: "lightsim" (C++ 加速) 或 "pandapower" (Python)
+            config: 配置对象，未指定时从全局配置读取
         """
+        from config.config_manager import get_config
+        self._cfg = config or get_config()
+
         self._data = data
         self._mode = mode
         self._data_len = data["n_steps"]
-        self._weights = {**DEFAULT_WEIGHTS, **(reward_weights or {})}
+
+        # 奖励权重：命令行自定义 > 配置文件 > 默认值
+        cfg_weights = {
+            "MODE-01": self._cfg.reward_weights.MODE_01,
+            "MODE-02": self._cfg.reward_weights.MODE_02,
+            "MODE-03": self._cfg.reward_weights.MODE_03,
+            "MODE-04": self._cfg.reward_weights.MODE_04,
+            "MODE-05": self._cfg.reward_weights.MODE_05,
+        }
+        self._weights = {**cfg_weights, **(reward_weights or {})}
 
         # LSTM 预测器 / Oracle
         if lstm_predictor is not None:
@@ -169,11 +200,22 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             from lstm_model import OraclePredictor
             self._predictor = OraclePredictor(data)
 
-        # 动作校验器
-        self._validator = ActionValidator()
+        # 动作校验器（传入配置的动作约束参数）
+        vs = self._cfg.action_constraints
+        self._validator = ActionValidator(
+            p_batt_max=vs.p_batt_max,
+            s_max=vs.s_max,
+            load_shed_max=vs.load_shed_max,
+            delta_p_max=vs.delta_p_max,
+        )
 
         # 电压仿真器（Grid2Op 不可用时降级使用）
-        self._voltage_sim = VoltageSimulator()
+        vc = self._cfg.voltage_simulator
+        self._voltage_sim = VoltageSimulator(
+            k_p=vc.k_p, k_q=vc.k_q, s_base=vc.s_base,
+            v_min=vc.v_min, v_max=vc.v_max,
+            noise_std=vc.noise_std, imbalance=vc.imbalance,
+        )
 
         # ── Grid2Op 电压仿真（可开关切换）───────────────────────
         self._use_grid2op = use_grid2op

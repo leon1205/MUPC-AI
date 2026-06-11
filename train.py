@@ -114,6 +114,9 @@ def parse_args():
                    help="评估频率 (default: 10000)")
 
     # ──通用 ──
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML 配置文件路径，如 config/mupc_env_config.yaml "
+                        "(未指定时使用代码中的硬编码默认值)")
     p.add_argument("--seed", type=int, default=42, help="随机种子 (default: 42)")
     p.add_argument("--tensorboard-log", type=str, default="./tensorboard_logs/",
                    help="TensorBoard 日志目录")
@@ -174,6 +177,10 @@ def parse_net_arch(raw: str) -> list[int]:
 
 def main():
     args = parse_args()
+
+    # ── 配置文件加载（优先于其他初始化）──────────────
+    from config.config_manager import load_config
+    load_config(args.config)
 
     # ── 兼容旧参数 ──────────────────────────────────────
     if args.merge:
