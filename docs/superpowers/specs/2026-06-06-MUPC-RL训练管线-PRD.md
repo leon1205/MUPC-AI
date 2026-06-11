@@ -2,12 +2,18 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
-| v2.3 | 2026-06-10 | 需求分析师 | **[REVIEWED: PASS]** |
+| v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.5 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.6 (`[REVIEWED: PASS]`)
 
 ---
 
+> **v2.6 变更说明：** 对齐部署端 PRD v2.6。动作空间从 2 维恢复为 3 维（新增 pv_limit 光伏限功率比例，由 RL 主动弃光）。物理参数全面修正：电池最大充放电功率 500kW→50kW，电池容量 200kWh→100kWh，变压器容量 500kVA→200kVA，ACT-03 功率圆上限 500kVA→200kVA，load_shedding 上限 500kW→60kW。SCENE-01 新增 w6 电压变化斜率惩罚 R_slope = w6·|ΔV|。ACT-04（pv_limit ∈ [0,1]）约束规则恢复。
+>
+> **v2.5 变更说明：** 对齐部署端 PRD v2.5。状态空间从 56/57 维扩展为 58/59 维（新增 D5 气象 2 维 + 修正 D2 光伏/负荷预测偏移）。观测空间索引修正 [24..39] → [25..39]。
+>
+> **v2.4 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
+>
 > **v2.3 变更说明：**集成 Grid2Op + Pandapower电压仿真替换（2026-06-09）。将 VoltageSimulator 替换为 Grid2Op 物理仿真引擎，三相电压基于真实潮流计算。原有 PRD v2.2 规格（58/59维观测、2维动作、5场景奖励）全部保留，新增电压仿真引擎切换开关 `use_grid2op`。性能目标：每步仿真 ≤ 50ms（lightsim2grid 加速）。
 >
 > **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
@@ -23,7 +29,7 @@
 MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python 工具链。它负责训练两个核心模型并通过 ONNX 交付给 MUPC AI 引擎（RK3588 NPU 部署）：
 
 1. **LSTM 时序预测模型** — 光伏出力 / 负荷功率时序预测
-2. **PPO/SAC 强化学习决策模型** — 2 维动作空间的多目标优化控制
+2. **PPO/SAC 强化学习决策模型** — 3 维动作空间的多目标优化控制
 
 本管线是 MUPC AI 引擎的**模型供给侧**。训练的模型经 ONNX 导出后，由部署端进行 INT8 量化（rknn-toolkit2）并在 RK3588 NPU 上执行推理。
 
@@ -43,8 +49,8 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 │  MUPC AI 引擎 (RK3588, Rust)                                      │
 │                                                                    │
 │  DataFusionEngine(5数据源) → FusedSystemState(21字段)             │
-│    → to_input_vector() [58维] → RKNN Runtime → ActionOutput(2维) │
-│    → ActionValidator(3条约束) → strategy-engine                  │
+│    → to_input_vector() [58维] → RKNN Runtime → ActionOutput(3维) │
+│    → ActionValidator(4条约束) → strategy-engine                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,7 +66,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 动作校验 | 环境内部 clamp | ActionValidator (5条规则) |
 | 电压仿真 | Grid2Op + Pandapower 三相潮流（可切换简化模型） | 实时数据 |
 
-> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.5。差异仅在于数据获取方式和电压仿真的实现方式。
+> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.6。差异仅在于数据获取方式和电压仿真的实现方式。
 
 ### 1.3 目标平台
 
@@ -167,7 +173,7 @@ VoltageSimulator 模式（降级）:
   V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
                - k_q * Q_batt / S_base
                + noise(σ=0.005)
-  k_p = 0.05, k_q = 0.03, S_base = 500 kVA
+  k_p = 0.05, k_q = 0.03, S_base = 200 kVA
 ```
 
 #### 验收标准
@@ -209,21 +215,22 @@ VoltageSimulator 模式（降级）:
 
 多模式训练时追加 mode_id 为第 59 维。
 
-**动作空间（2 维）**：
+**动作空间（3 维）**：
 
 | 维度 | 字段名 | 训练值域 | 单位 | 说明 |
 |------|--------|----------|------|------|
-| 0 | p_batt_set | [-1, 1] → [-500, 500] kW | kW | 电池有功功率设定值（RL 控制） |
-| 1 | load_shedding | [0, 1] → [0, 500] kW | kW | 可中断负荷切除量（RL 控制） |
+| 0 | p_batt_set | [-1, 1] → [-50, 50] kW | kW | 电池有功功率设定值（RL 控制） |
+| 1 | load_shedding | [0, 1] → [0, 60] kW | kW | 可中断负荷切除量（RL 控制） |
+| 2 | pv_limit | [0, 1] → [0, 1] | — | 光伏有功限功率比例（v2.6 新增，主动弃光） |
 
-> **v2.4 分层控制架构：** Q 控制（q_batt_set）和 pv_limit 由 MUPC 实时控制核心模块根据电压闭环调节，不经过 RL。RL 专注能量管理（P_batt + Load_shedding），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
+> **v2.6 分层控制架构：** Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。pv_limit 由 RL 主动控制（主动弃光），与 Q 调节互补。RL 专注能量管理（P_batt + Load_shedding + Pv_limit），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
 
 **核心物理方程**：
 
 ```
-P_batt = p_batt_set_norm * 500  (kW)
+P_batt = p_batt_set_norm * 50  (kW)
 P_load_eff = P_load - load_shedding  (kW, 切除后有效负荷)
-P_pv_eff = P_pv  (光伏不限功率，由 Q 调节替代)
+P_pv_eff = P_pv * pv_limit  (光伏限功率后出力，v2.6 新增 pv_limit)
 
 SOC_raw = SOC_t + (-P_batt * dt) / BATTERY_CAPACITY_KWH
 SOC_{t+1} = clamp(SOC_raw, 0.10, 0.90)  // SAFETY: 硬约束
@@ -232,7 +239,7 @@ grid_power = P_load_eff - P_pv_eff + P_batt
 Q_load = P_load_eff * tan(acos(0.90))  (功率因数 0.90)
 Q_batt 由实时控制核心闭环调节（电压死区 ±5%）
 S_transformer = sqrt(grid_power² + (Q_load - Q_batt)²)
-load_rate = S_transformer / TRANSFORMER_KVA (500)
+load_rate = S_transformer / TRANSFORMER_KVA (200)
 
 电压仿真（Grid2Op 模式）: voltage_phase_{a,b,c} = Grid2Op runpp_3ph 三相潮流
 电压仿真（VoltageSimulator 模式）: voltage_phase_{a,b,c} = f(P, Q) 简化模型
@@ -243,9 +250,9 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 
 | 参数 | 值 | 常量名 |
 |------|-----|--------|
-| 变压器容量 | 500 kVA | `TRANSFORMER_KVA` |
-| 电池容量 | 200 kWh | `BATTERY_CAPACITY_KWH` |
-| 最大充放电功率 | 500 kW (p_batt 范围上限) | `P_BATT_MAX` |
+| 变压器容量 | 200 kVA | `TRANSFORMER_KVA` |
+| 电池容量 | 100 kWh | `BATTERY_CAPACITY_KWH` |
+| 最大充放电功率 | 50 kW (p_batt 范围上限) | `P_BATT_MAX` |
 | 最大无功功率 | 300 kVar (q_batt 范围上限) | `Q_BATT_MAX` |
 | SOC 硬限制 | 10% ~ 90% | `SOC_MIN`, `SOC_MAX` |
 | 过载阈值 | 85% | `OVERLOAD_THRESHOLD` |
@@ -259,7 +266,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (500)
 |----|------|----------|
 | F2-01 | `mupc_env.py` 可独立运行随机动作循环 100 步 | `python mupc_env.py` 无错误 |
 | F2-02 | `observation_space.shape = (58,)` | 单元测试 |
-| F2-03 | `action_space.shape = (2,)` | 单元测试 |
+| F2-03 | `action_space.shape = (3,)` | 单元测试 |
 | F2-04 | SOC 硬约束不可突破 | 单元测试：连续充电 1000 步，验证 SOC ≤ 0.90 |
 | F2-05 | info dict 包含全部奖励分量原始值 + SOC + load_rate | 单元测试 |
 | F2-06 | Grid2Op 模式下三相电压在 [0.85, 1.15] 内 | 单元测试 |
@@ -362,7 +369,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 | F4-04 | `--mode MODE-01` 时所有 episode 使用同一种奖励函数 | 检查 CSV 日志 |
 | F4-05 | SB3 不可用时自动切换 `_ppo_core.py` | 卸载 SB3 后测试 |
 | F4-06 | Ctrl+C 中断保存 checkpoint 不丢失进度 | 手动测试 |
-| F4-07 | TensorBoard 中可监控所有奖励分量 + 2 个动作维度的均值 | 手动检查 |
+| F4-07 | TensorBoard 中可监控所有奖励分量 + 3 个动作维度的均值 | 手动检查 |
 | F4-08 | `--use-grid2op=False` 时降级到 VoltageSimulator | 集成测试 |
 
 ---
@@ -371,23 +378,24 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 #### 功能描述
 
-遵循 MUPC AI 引擎 PRD 第 5.4 节的 3 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+遵循 MUPC AI 引擎 PRD 第 5.4 节的 4 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
 
-> **v2.4 变更：** ACT-02（Δq_batt ≤ 30 kVar/步）和 ACT-04（pv_limit ≥ 0.1）已移除。Q 控制和光伏限功率由实时控制核心闭环调节，不经过 RL。
+> **v2.6 变更：** ACT-04（pv_limit ∈ [0,1]）约束规则恢复。pv_limit 由 RL 主动控制（主动弃光），不再由实时控制核心单独处理。Q 控制（q_batt_set）仍由实时电压调节器闭环调节，不经过 RL。
 
 | 规则 ID | 约束条件 | 训练环境实现 |
 |---------|----------|-------------|
 | ACT-01 | Δp_batt ≤ 50 kW/步 | 计算变化率，超标则 clamp |
-| ACT-03 | √(p_batt²+q_batt²) ≤ 500 kVA（q 取实时值） | 超标则等比例缩放 P |
+| ACT-03 | √(p_batt²+q_batt²) ≤ 200 kVA（q 取实时值） | 超标则等比例缩放 P |
+| ACT-04 | pv_limit ∈ [0, 1] | 超出边界则 clamp |
 | ACT-05 | dispatch_p 有效时 \|p_batt\| ≤ \|dispatch_p\| | 有调度时 clamp |
 
-> 部署端 ActionValidator 在 Rust 端同样实现这 3 条规则（ACT-02/04 由实时控制处理）。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
+> 部署端 ActionValidator 在 Rust 端同样实现这 4 条规则（ACT-02 由实时控制处理）。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
 
 #### 验收标准
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
-| F5-01 | 3 条约束均实现 | 单元测试：逐条触发违规并验证 clamp 结果 |
+| F5-01 | 4 条约束均实现 | 单元测试：逐条触发违规并验证 clamp 结果 |
 | F5-02 | 约束违反时 info dict 中记录 `constraint_violated=True` | 单元测试 |
 | F5-03 | 约束校验耗时 < 0.5ms | 性能测试 |
 
@@ -400,7 +408,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 `export_onnx.py` 导出两种模型为 ONNX：
 
 1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features)，输出 (1, 30)
-2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 58) 或 (1, 59)，输出 (1, 2)
+2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 58) 或 (1, 59)，输出 (1, 3)
 
 导出流程：
 1. 加载 PyTorch checkpoint / NumPy PPO weights
@@ -413,7 +421,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
-| F6-01 | RL 策略 ONNX 输入 (1, 58) 输出 (1, 2) | 检查 ONNX spec |
+| F6-01 | RL 策略 ONNX 输入 (1, 58) 输出 (1, 3) | 检查 ONNX spec |
 | F6-02 | LSTM ONNX 输入 (1, 4, 6) 输出 (1, 30) | 检查 ONNX spec |
 | F6-03 | ONNX 推理与 PyTorch 推理误差 < 1e-5 | 单元测试 |
 | F6-04 | 导出文件名含时间戳 | 检查文件名 |
@@ -426,7 +434,7 @@ Input(58 or 59) → Linear(128) → ReLU → Linear(128) → ReLU
 | 指标 | 输出位置 |
 |------|----------|
 | episode 奖励（总和 + 各分量） | TensorBoard + CSV |
-| 2 个动作维度的均值/最大值 | TensorBoard |
+| 3 个动作维度的均值/最大值 | TensorBoard |
 | SOC 均值、负载率均值、过载次数 | TensorBoard + 控制台 |
 | 当前场景 ID | CSV |
 | 训练 loss（actor/critic） | TensorBoard |
@@ -456,8 +464,8 @@ Grid2Op + Pandapower 电压仿真引擎作为 `VoltageSimulator` 的替代方案
 |------|------|
 | 潮流计算 | Pandapower `runpp_3ph` 三相潮流 |
 | 后端优先级 | lightsim2grid（C++ 加速）> PandaPowerBackend（Python） |
-| 网络拓扑 | 3 总线：高压电网 → 配电变压器(500kVA) → 低压母线 → 末端节点 |
-| 元件 | 变压器、线路（LGJ-70, 1.5km）、居民负荷、农业冲击负荷、光伏(200kW)、储能(200kWh) |
+| 网络拓扑 | 3 总线：高压电网 → 配电变压器(200kVA) → 低压母线 → 末端节点 |
+| 元件 | 变压器、线路（LGJ-70, 1.5km）、居民负荷、农业冲击负荷、光伏(150kW)、储能(100kWh) |
 | SOC 同步 | 双向同步：step入口 Grid2Op→MupcEnv，step 出口 MupcEnv→Grid2Op |
 | 不收敛处理 | 回退到上一时刻安全电压，`has_illegal=True` 标记 |
 
@@ -634,6 +642,41 @@ MUPC-AI2/
 | 3 | 负荷预测区分基荷/可调负荷/冲击负荷三类，训练数据如何标注？SMART-DS 不含此分类 | 高 | 影响 LSTM 训练数据准备 |
 
 ---
+
+## v2.6 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 动作空间 2 维→3 维（恢复 pv_limit） | 1.1/3.2/3.5/3.6/3.7/6 | RL 主动控制光伏限功率比例（主动弃光） |
+| 2 | 物理参数全面修正 | 3.2/环境常量表 | 电池最大充放电功率 500→50kW，电池容量 200→100kWh，变压器容量 500→200kVA |
+| 3 | ACT-03 功率圆上限修正 | 3.5/ACT-03 | S_MAX: 500kVA→200kVA（匹配变压器容量） |
+| 4 | ACT-04 约束规则恢复 | 3.5 | pv_limit ∈ [0,1] 约束规则重新加入 |
+| 5 | SCENE-01 新增 w6 电压斜率惩罚 | 3.5 | R_slope = w6·|ΔV|，迫使 AI 平滑调节 |
+| 6 | 更新部署端 PRD 版本引用 | 文档头部 | v2.5 → v2.6 |
+| 7 | 动作值域修正 | 3.2 | p_batt [-500,500]→[-50,50]，load_shedding [0,500]→[0,60] |
+
+**修订依据：** 对齐 MUPC AI 引擎 PRD v2.6，物理参数与实际设备规格一致
+
+## v2.5 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 状态空间 56/57 维→58/59 维 | 3.2 | 新增 D5 气象 2 维（辐照/温度） |
+| 2 | 观测空间索引修正 | 3.2 | D2 光伏预测 [10..24]，负荷预测 [25..39]（原 [24..39] 偏移1位） |
+| 3 | 更新部署端 PRD 版本引用 | 文档头部 | v2.4 → v2.5 |
+
+**修订依据：** MUPC AI 引擎 PRD v2.5 状态空间扩展
+
+## v2.4 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 动作空间 4 维→2 维 | 1.1/3.2/3.5/3.6/3.7/6 | 分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding |
+| 2 | SCENE-01 奖励函数更新 | 3.5 | 新增 w4（电压质量惩罚）、w5（功率变化率惩罚 R_ramp）、电压死区（±5%，越限连续 2 步触发） |
+| 3 | ACT-02/ACT-04 约束移除 | 3.6 | Q 变化率和光伏限功率由实时控制处理，训练环境移除对应约束 |
+| 4 | 更新部署端 PRD 版本引用 | 文档头部 | v2.3 → v2.4 |
+
+**修订依据：** 对齐部署端 PRD v2.4 分层控制架构
 
 ## v2.3 修订记录
 
