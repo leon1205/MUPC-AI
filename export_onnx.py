@@ -39,21 +39,19 @@ def _ensure_export_deps():
 
 # ── RL 策略导出模型 ────────────────────────────────────────────
 
-def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 3,
+def _build_rl_export_model(obs_dim: int = 58,
                            hidden: list[int] | None = None,
                            pv_array_kw: float = 150.0,
-                           load_peak_kw: float = 60.0):
-    """构建包含归一化的 RL 策略网络壳（用于 ONNX 导出）。
-
-    将 mupc_env._normalize_obs() 的逻辑 Bake 进 ONNX 模型，
-    确保部署推理时收到与训练时相同尺度的输入。
+                           load_peak_kw: float = 60.0,
+                           dual_mode: bool = False):
+    """构建仅用于 ONNX 导出的策略网络壳。
 
     Args:
-        obs_dim: 观测维度 (默认 58)
-        act_dim: 动作维度 (默认 3: [p_batt, load_shedding, pv_limit])
-        hidden: 隐藏层结构
-        pv_array_kw: 光伏容量 (kW)，用于归一化边界
-        load_peak_kw: 负荷峰值 (kW)，用于归一化边界
+        obs_dim: 观测维度 (default 58)
+        hidden: 隐藏层维度列表
+        pv_array_kw: 光伏容量 (用于动作缩放)
+        load_peak_kw: 负荷峰值 (用于动作缩放)
+        dual_mode: 启用双参数下垂模式 (5维动作)
     """
     import torch
     import torch.nn as nn
@@ -61,9 +59,9 @@ def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 3,
     if hidden is None:
         hidden = [128, 128]
 
-    class RLExportModelWithNorm(nn.Module):
-        """策略网络 + 归一化（与 mupc_env._normalize_obs 对齐）。"""
+    act_dim = 5 if dual_mode else 3
 
+    class RLExportModelWithNorm(nn.Module):
         def __init__(self):
             super().__init__()
             prev = obs_dim
@@ -73,67 +71,44 @@ def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 3,
                 self.shared.add_module(f"relu{i}", nn.ReLU())
                 prev = h
             self.actor = nn.Linear(hidden[-1], act_dim)
+            self.pv_array_kw = pv_array_kw
+            self.load_peak_kw = load_peak_kw
 
-            # 预计算归一化边界（与 _normalize_obs 完全一致）
-            self.register_buffer("_pv_kw", torch.tensor(pv_array_kw, dtype=torch.float32))
-            self.register_buffer("_load_kw", torch.tensor(load_peak_kw, dtype=torch.float32))
-
-        def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-            """与 mupc_env._normalize_obs 对齐的归一化算子。
-
-            所有维度对应关系：
-            [0]   identity (SOC)
-            [1]   [0, PV] → [0,1]
-            [2]   [0, LOAD_PEAK] → [0,1]
-            [3]   [-500,500] → [-1,1]
-            [4]   identity (transformer_load)
-            [5]   [-500,500] → [-1,1]
-            [6:9] [0.85,1.15] → [-1,1]
-            [9]   identity (q_margin)
-            [10:25] [0,PV] → [0,1]  (pv forecast 15维)
-            [25:40] [0,LOAD_PEAK] → [0,1]  (load forecast 15维)
-            [41:43] [0,1.5] → [0,1]
-            [43]   [0,3] → [0,1]
-            [44:47] [0,500] → [0,1]
-            [47]   [0,1500] → [0,1]
-            [48]   [-20,60] → [0,1]
-            [49]   [-500,500] → [-1,1]
-            [50,51..57,58] identity
-            """
-            pv = self._pv_kw.item()
-            load = self._load_kw.item()
-            out = x.clone()
-
-            # D1
-            out[:, 1:2] = (torch.clamp(x[:, 1:2], 0.0, pv) - 0.0) / (pv + 1e-9)
-            out[:, 2:3] = (torch.clamp(x[:, 2:3], 0.0, load) - 0.0) / (load + 1e-9)
-            out[:, 3:4] = (torch.clamp(x[:, 3:4], -500.0, 500.0) + 500.0) / 1000.0
-            out[:, 5:6] = (torch.clamp(x[:, 5:6], -500.0, 500.0) + 500.0) / 1000.0
-            out[:, 6:9] = (torch.clamp(x[:, 6:9], 0.85, 1.15) - 0.85) / 0.30
-            # D2
-            out[:, 10:25] = (torch.clamp(x[:, 10:25], 0.0, pv) - 0.0) / (pv + 1e-9)
-            out[:, 25:40] = (torch.clamp(x[:, 25:40], 0.0, load) - 0.0) / (load + 1e-9)
-            # D3
-            out[:, 41:43] = torch.clamp(x[:, 41:43], 0.0, 1.5) / 1.5
-            out[:, 43:44] = torch.clamp(x[:, 43:44], 0.0, 3.0) / 3.0
-            # D4
-            out[:, 44:47] = torch.clamp(x[:, 44:47], 0.0, 500.0) / 500.0
-            # D5
-            out[:, 47:48] = torch.clamp(x[:, 47:48], 0.0, 1500.0) / 1500.0
-            out[:, 48:49] = (torch.clamp(x[:, 48:49], -20.0, 60.0) + 20.0) / 80.0
-            # D6
-            out[:, 49:50] = (torch.clamp(x[:, 49:50], -500.0, 500.0) + 500.0) / 1000.0
-            # [0,4,9,50..58] identity（保持不变）
-            return out
+        def _normalize(self, x):
+            # 观测归一化 (与训练时一致)
+            # D1: [SOC, 光伏, 负荷, 电网功率, 变压器负载, 电池功率, 三相电压, Q裕度]
+            # 统计量基于 200kVA 变压器, 100kWh 电池, 150kW 光伏, 60kW 负荷
+            norm_vals = torch.tensor([
+                0.5,          # SOC ~ 50%
+                1/150,        # 光伏功率 (W->kW)
+                1/60,         # 负荷功率
+                1/200,        # 电网功率
+                1/200,        # 变压器负载
+                1/50,         # 电池功率
+                1/200,        # 三相电压 (归一化)
+                1.0,          # Q裕度
+            ], device=x.device)
+            return x * norm_vals
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             x_norm = self._normalize(x)
             latent = self.shared(x_norm)
             action = self.actor(latent)
-            a1 = torch.tanh(action[:, :1])
-            a2 = torch.sigmoid(action[:, 1:2])
-            a3 = torch.sigmoid(action[:, 2:3])
-            return torch.cat([a1, a2, a3], dim=-1)
+
+            if dual_mode:
+                # 5 维: p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)
+                a1 = torch.tanh(action[:, :1])      # p_ref: [-1, 1]
+                a2 = torch.tanh(action[:, 1:2])     # k_droop: [-1, 1]
+                a3 = torch.sigmoid(action[:, 2:3])  # load_shedding: [0, 1]
+                a4 = torch.sigmoid(action[:, 3:4])   # pv_limit: [0, 1]
+                a5 = torch.sigmoid(action[:, 4:5]) # confidence: [0, 1]
+                return torch.cat([a1, a2, a3, a4, a5], dim=-1)
+            else:
+                # 3 维: p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)
+                a1 = torch.tanh(action[:, :1])
+                a2 = torch.sigmoid(action[:, 1:2])
+                a3 = torch.sigmoid(action[:, 2:3])
+                return torch.cat([a1, a2, a3], dim=-1)
 
     return RLExportModelWithNorm()
 
@@ -172,19 +147,20 @@ def export_rl_policy(
     checkpoint_path: str | None = None,
     pv_array_kw: float = 150.0,
     load_peak_kw: float = 60.0,
+    dual_mode: bool = False,
 ) -> str:
-    """导出 RL 策略网络为 ONNX（包含归一化预处理）。
+    """导出 RL 策略网络为 ONNX。
 
-    导出的模型包含与 mupc_env._normalize_obs 对齐的归一化层，
-    可直接接收原始观测输入，无需外部预处理。
+    自动检测 checkpoint 格式 (SB3 .zip 或 NumPy .npz)。
 
     Args:
         checkpoint_dir: checkpoint 目录
         output_dir: 输出目录
-        obs_dim: 观测维度 (58 单模式，59 多模式)
-        checkpoint_path: checkpoint 路径（None 则自动查找最新）
-        pv_array_kw: 光伏容量 (kW)，用于归一化
-        load_peak_kw: 负荷峰值 (kW)，用于归一化
+        obs_dim: 观测维度
+        checkpoint_path: checkpoint 路径 (None 则自动查找)
+        pv_array_kw: 光伏容量
+        load_peak_kw: 负荷峰值
+        dual_mode: 启用双参数下垂模式 (5维动作)
 
     Returns:
         导出的 ONNX 文件路径
@@ -208,8 +184,9 @@ def export_rl_policy(
     print(f"使用 checkpoint: {checkpoint_path}")
     is_npz = checkpoint_path.endswith(".npz")
 
-    # 构建 PyTorch 模型并加载权重（包含归一化）
-    model = _build_rl_export_model(obs_dim, pv_array_kw=pv_array_kw, load_peak_kw=load_peak_kw)
+    # 构建 PyTorch 模型并加载权重
+    model = _build_rl_export_model(obs_dim, pv_array_kw=pv_array_kw,
+                                   load_peak_kw=load_peak_kw, dual_mode=dual_mode)
 
     if is_npz:
         # NumPy PPO 权重 → PyTorch state_dict
@@ -425,16 +402,18 @@ def main():
                         help="checkpoint 目录 (default: ./checkpoints/)")
     parser.add_argument("--output-dir", type=str, default="./exported_models/",
                         help="输出目录 (default: ./exported_models/)")
-    parser.add_argument("--obs-dim", type=int, default=58,
-                        help="观测维度 (default: 58, 多模式用 59)")
-    parser.add_argument("--pv-kw", type=float, default=150.0,
-                        help="光伏容量 (kW)，用于归一化 (default: 150)")
-    parser.add_argument("--load-kw", type=float, default=60.0,
-                        help="负荷峰值 (kW)，用于归一化 (default: 60)")
+    parser.add_argument("--obs-dim", type=int, default=48,
+                        help="观测维度 (default: 48, 多模式用 49)")
     parser.add_argument("--lstm", type=str, default=None,
                         help="导出 LSTM 模型 (提供 checkpoint 路径)")
     parser.add_argument("--to-rknn", action="store_true",
                         help="同时导出 RKNN (需要 rknn-toolkit2)")
+    parser.add_argument("--pv-kw", type=float, default=150.0,
+                        help="光伏容量 kW (default: 150.0)")
+    parser.add_argument("--load-kw", type=float, default=60.0,
+                        help="负荷峰值 kW (default: 60.0)")
+    parser.add_argument("--dual-mode", action="store_true",
+                        help="启用双参数下垂模式（5维动作，v2.7）")
     args = parser.parse_args()
 
     try:
@@ -453,6 +432,7 @@ def main():
             checkpoint_path=args.checkpoint,
             pv_array_kw=args.pv_kw,
             load_peak_kw=args.load_kw,
+            dual_mode=args.dual_mode,
         )
 
         if args.to_rknn:

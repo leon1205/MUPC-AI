@@ -1,14 +1,14 @@
 """
-MUPC 全状态强化学习环境 — 58/59 维观测, 3 维动作, 5 种场景奖励。
+MUPC 全状态强化学习环境 — 48/49 维观测, 2 维动作, 5 种场景奖励。
 
-对齐 MUPC AI 引擎 PRD v2.6:
-  - 状态空间: 21 字段序列化为 58/59 维向量
-  - 动作空间: [p_batt, load_shedding, pv_limit] (3 维) — Q 控制交由实时电压调节器闭环
+对齐 MUPC AI 引擎 PRD v2.4:
+  - 状态空间: 21 字段序列化为 48/49 维向量
+  - 动作空间: [p_batt, load_shedding] (2 维) — Q 控制交由实时电压调节器闭环
   - 5 种预设场景 MODE-01~05 各独立奖励函数
   - 三相电压简化仿真 (Q-V 耦合，Q 由实时模块根据电压闭环给出)
-  - 电压死区 (±5%) + 功率变化率/电压斜率惩罚，保护电池免受高频微循环损耗
-  - 4 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
-    ACT-04(pv_limit), ACT-05(调度约束) — Q 相关约束由实时控制处理
+  - 电压死区 (±5%) + 功率变化率惩罚，保护电池免受高频微循环损耗
+  - 3 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
+    ACT-05(调度约束) — Q/功率圆/pv_limit 相关约束由实时控制处理
 """
 
 import math
@@ -30,86 +30,50 @@ except ImportError:
 from action_validator import ActionValidator
 
 
-def _norm_slice(x: np.ndarray, lo: float | np.ndarray,
-               hi: float | np.ndarray) -> np.ndarray:
-    """向量化 MinMax 归一化，支持标量/数组广播。
-
-    Args:
-        x: 输入数组（任意 shape）
-        lo: 下界（标量或与 x shape 相同的数组）
-        hi: 上界（标量或与 x shape 相同的数组）
-    """
-    clipped = np.clip(x, lo, hi)
-    return ((clipped - lo) / (hi - lo + 1e-9)).astype(np.float32)
-
-
-def _cfg():
-    """懒加载配置（支持无 --config 时的硬编码回退）。"""
-    from config.config_manager import get_config
-    return get_config()
-
-
 # ═══════════════════════════════════════════════════════════════
 # 物理常量 (SAFETY: 以下常量涉及硬件安全边界, 修改前请评审)
-# 优先从配置文件读取，未配置则使用默认值（向后兼容）
 # ═══════════════════════════════════════════════════════════════
 
-_c = _cfg()
-TRANSFORMER_KVA = _c.physical.transformer_kva
-BATTERY_CAPACITY_KWH = _c.physical.battery_capacity_kwh
-P_BATT_MAX_KW = _c.physical.p_batt_max_kw
-Q_BATT_MAX_KVAR = _c.physical.q_batt_max_kvar
-LOAD_SHED_MAX_KW = _c.physical.load_shed_max_kw
-PV_ARRAY_KW = _c.physical.pv_array_kw
-LOAD_PEAK_KW = _c.physical.load_peak_kw
+TRANSFORMER_KVA = 500.0         # 变压器额定容量 (kVA)
+BATTERY_CAPACITY_KWH = 200.0   # 电池容量 (kWh)
+P_BATT_MAX_KW = 500.0           # 最大充放电功率 (kW)
+Q_BATT_MAX_KVAR = 300.0         # 最大无功输出 (kVar)
+LOAD_SHED_MAX_KW = 500.0        # 最大切负荷 (kW)
+PV_ARRAY_KW = 200.0             # 光伏容量 (kW)
+LOAD_PEAK_KW = 400.0            # 负荷峰值 (kW)
 
-SOC_MIN = _c.safety.soc_min
-SOC_MAX = _c.safety.soc_max
-BATTERY_CHARGE_EFF = _c.safety.battery_charge_efficiency
-BATTERY_DISCHARGE_EFF = _c.safety.battery_discharge_efficiency
-OVERLOAD_THRESHOLD = _c.safety.overload_threshold
-OVERLOAD_START_PCT = _c.safety.overload_start_pct
-DT_HOURS = _c.time.dt_hours
-LOAD_PF = _c.time.load_pf
+SOC_MIN = 0.10                  # SAFETY: SOC 下限硬约束
+SOC_MAX = 0.90                  # SAFETY: SOC 上限硬约束
+OVERLOAD_THRESHOLD = 0.85       # 过载阈值
+DT_HOURS = 0.25                 # 时间步长 (15 分钟)
+LOAD_PF = 0.90                  # 负荷功率因数 cosφ
 
-CONTRACT_DEMAND_KW = _c.contract.contract_demand_kw
-GRID_EMISSION_FACTOR = _c.contract.grid_emission_factor
-EPISODE_LENGTH = _c.time.episode_length
-DEMAND_WINDOW_STEPS = _c.time.demand_window_steps
+CONTRACT_DEMAND_KW = 300.0      # 合同需量 (kW)
+GRID_EMISSION_FACTOR = 0.581   # kg CO2/kWh
+EPISODE_LENGTH = 96             # 1 天 = 96 步 × 15 分钟
 
 # ── v2.5 奖励阈值配置 ─────────────────────────────────────────
 # 对齐 MUPC AI 引擎 PRD v2.5 RewardThresholdConfig
 
-VOLTAGE_DEADBAND = _c.reward_thresholds.voltage_deadband
-Q_MARGIN_THRESHOLD = _c.reward_thresholds.q_margin_threshold
-VOLTAGE_HIGH_LIMIT = _c.reward_thresholds.voltage_high_limit
-SOC_CRITICAL = _c.reward_thresholds.soc_critical
-VOLTAGE_PENALTY_HIGH = _c.reward_thresholds.voltage_penalty_high
-VOLTAGE_PENALTY_LOW = _c.reward_thresholds.voltage_penalty_low
-
-# ── Q_batt 电压环控制增益 (v2.4 分层控制) ────────────────────────
-# Q_batt 由实时电压调节器闭环控制，基于电压偏差计算
-# K_Q: 无功-电压灵敏度系数 (kVar/p.u.)
-K_Q = _c.q_control.k_q
+VOLTAGE_DEADBAND = 0.05         # ±5% 死区
+Q_MARGIN_THRESHOLD = 0.10      # 实时模块无功耗尽阈值 (10%)
+VOLTAGE_HIGH_LIMIT = 1.05       # 弃光前置电压阈值 (p.u.)
+SOC_CRITICAL = 0.10             # SOC 极低保护阈值
+VOLTAGE_PENALTY_HIGH = 2.0     # 高电压侧惩罚系数 (光伏超发)
+VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 奖励权重映射
 # ═══════════════════════════════════════════════════════════════
 
-def _default_weights() -> dict[str, list[float]]:
-    """动态获取默认奖励权重（始终读取当前全局配置）。"""
-    c = _cfg()
-    return {
-        "MODE-01": c.reward_weights.MODE_01,
-        "MODE-02": c.reward_weights.MODE_02,
-        "MODE-03": c.reward_weights.MODE_03,
-        "MODE-04": c.reward_weights.MODE_04,
-        "MODE-05": c.reward_weights.MODE_05,
-    }
-
-
-DEFAULT_WEIGHTS: dict[str, list[float]] = _default_weights()
+DEFAULT_WEIGHTS: dict[str, list[float]] = {
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w1(光伏消纳), w2(电池), w3(过载), w4(电压质量), w5(变化率)
+    "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
+    "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
+    "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
+    "MODE-05": [1.0, 1.0],            # w1(绿电), w2(碳减排)
+}
 
 MODE_ID_MAP: dict[str, float] = {
     "MODE-01": 0.0, "MODE-02": 0.25, "MODE-03": 0.5,
@@ -124,34 +88,20 @@ ALL_MODES = ["MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"]
 # ═══════════════════════════════════════════════════════════════
 
 class VoltageSimulator:
-    """三相电压简化线路模型 (Q-V 耦合)，含动态阻抗扰动和谐波注入。
+    """三相电压简化线路模型 (Q-V 耦合)。"""
 
-    每次 step 对 k_p/k_q 加随机扰动，模拟线路老化/温度变化导致的阻抗漂移。
-    同时叠加 3/5 次谐波，模拟农网配电侧谐波污染。
-    """
-
-    def __init__(self, k_p: float = 0.05, k_q: float = 0.03, s_base: float = 500.0,
-                 v_min: float = 0.85, v_max: float = 1.15,
-                 noise_std: float = 0.005, imbalance: float = 0.003,
-                 impedance_drift_pct: float = 0.10,
-                 harmonic_3rd_pct: float = 0.03,
-                 harmonic_5th_pct: float = 0.02):
-        self.base_K_P = k_p
-        self.base_K_Q = k_q
-        self.S_BASE = s_base
-        self.V_MIN = v_min
-        self.V_MAX = v_max
-        self.NOISE_STD = noise_std
-        self.IMBALANCE = imbalance
-        self.DRIFT_PCT = impedance_drift_pct
-        self.H3_PCT = harmonic_3rd_pct
-        self.H5_PCT = harmonic_5th_pct
-        self._step_count = 0  # 用于谐波相位计算
+    K_P = 0.05            # 有功灵敏度 (p.u. / 500kW)
+    K_Q = 0.03            # 无功灵敏度 (p.u. / 300kVar)
+    S_BASE = 500.0        # kVA
+    V_MIN = 0.85
+    V_MAX = 1.15
+    NOISE_STD = 0.005     # 测量噪声
+    IMBALANCE = 0.003     # 三相不平衡度
 
     def step(self, p_net: float, q_batt: float,
              prev_va: float, prev_vb: float, prev_vc: float
              ) -> tuple[float, float, float]:
-        """一步电压更新（含动态扰动）。
+        """一步电压更新。
 
         Args:
             p_net: 净有功 = P_pv_eff - P_load_eff + P_batt (kW)
@@ -161,26 +111,10 @@ class VoltageSimulator:
         Returns:
             (va, vb, vc) 三相电压 (p.u.)
         """
-        # 动态阻抗扰动：每步对 k_p/k_q 加 ±DRIFT_PCT 随机扰动
-        k_p = self.base_K_P * (1.0 + np.random.uniform(-self.DRIFT_PCT, self.DRIFT_PCT))
-        k_q = self.base_K_Q * (1.0 + np.random.uniform(-self.DRIFT_PCT, self.DRIFT_PCT))
-
-        dv = (k_p * p_net + k_q * q_batt) / self.S_BASE
-
-        # 谐波注入：基于步数计算相位（96步=24小时）
-        t = self._step_count
-        harm_3 = self.H3_PCT * np.sin(3 * 2 * np.pi * t / 96)
-        harm_5 = self.H5_PCT * np.sin(5 * 2 * np.pi * t / 96)
-        self._step_count += 1
-
-        noise_a = np.random.normal(0, self.NOISE_STD)
-        noise_b = np.random.normal(0, self.NOISE_STD)
-        noise_c = np.random.normal(0, self.NOISE_STD)
-
-        va = prev_va + dv + noise_a + harm_3 + harm_5
-        vb = prev_vb + dv + noise_b + harm_3 + harm_5 + self.IMBALANCE
-        vc = prev_vc + dv + noise_c + harm_3 + harm_5 - self.IMBALANCE
-
+        dv = (self.K_P * p_net + self.K_Q * q_batt) / self.S_BASE
+        va = prev_va + dv + np.random.normal(0, self.NOISE_STD)
+        vb = prev_vb + dv + np.random.normal(0, self.NOISE_STD) + self.IMBALANCE
+        vc = prev_vc + dv + np.random.normal(0, self.NOISE_STD) - self.IMBALANCE
         return (
             float(np.clip(va, self.V_MIN, self.V_MAX)),
             float(np.clip(vb, self.V_MIN, self.V_MAX)),
@@ -193,11 +127,11 @@ class VoltageSimulator:
 # ═══════════════════════════════════════════════════════════════
 
 class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
-    """MUPC 全状态 RL 环境 (v2.6 分层控制架构).
+    """MUPC 全状态 RL 环境 (v2.5 分层控制架构).
 
-    动作空间 3 维: [p_batt, load_shedding, pv_limit]
+    动作空间 2 维: [p_batt, load_shedding]
     Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
-    观测空间: Box(58,) 或 Box(59,) (多模式)
+    观测空间: Box(56,) 或 Box(57,) (多模式)
     """
 
     metadata = {"render_modes": []}
@@ -207,35 +141,22 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     def __init__(self, data: dict, mode: str = "all",
                  lstm_predictor: Any = None,
                  reward_weights: dict[str, list[float]] | None = None,
-                 use_grid2op: bool = True,
-                 grid2op_backend: str = "lightsim",
-                 config: "MupcConfig | None" = None):
+                 config: Any = None):
         """
         Args:
             data: SmartDSLoader 返回的 data dict
             mode: "all" (多模式) 或 "MODE-01"~"MODE-05" (单模式)
             lstm_predictor: LSTM 模型 (有 predict(step_idx)→(30,) 接口) 或 None→Oracle
             reward_weights: 自定义权重, e.g. {"MODE-01": [1.5, 0.3, 3.0]}
-            use_grid2op: True=使用 Grid2Op 电压仿真, False=降级到 VoltageSimulator
-            grid2op_backend: "lightsim" (C++ 加速) 或 "pandapower" (Python)
-            config: 配置对象，未指定时从全局配置读取
+            config: MupcConfig 配置对象，None 则使用硬编码默认值
         """
-        from config.config_manager import get_config
-        self._cfg = config or get_config()
-
         self._data = data
         self._mode = mode
         self._data_len = data["n_steps"]
+        self._weights = {**DEFAULT_WEIGHTS, **(reward_weights or {})}
 
-        # 奖励权重：命令行自定义 > 配置文件 > 默认值
-        cfg_weights = {
-            "MODE-01": self._cfg.reward_weights.MODE_01,
-            "MODE-02": self._cfg.reward_weights.MODE_02,
-            "MODE-03": self._cfg.reward_weights.MODE_03,
-            "MODE-04": self._cfg.reward_weights.MODE_04,
-            "MODE-05": self._cfg.reward_weights.MODE_05,
-        }
-        self._weights = {**cfg_weights, **(reward_weights or {})}
+        # v2.7 配置支持
+        self._cfg = config
 
         # LSTM 预测器 / Oracle
         if lstm_predictor is not None:
@@ -244,47 +165,39 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             from lstm_model import OraclePredictor
             self._predictor = OraclePredictor(data)
 
-        # 动作校验器（传入配置的动作约束参数）
-        vs = self._cfg.action_constraints
-        self._validator = ActionValidator(
-            p_batt_max=vs.p_batt_max,
-            s_max=vs.s_max,
-            load_shed_max=vs.load_shed_max,
-            delta_p_max=vs.delta_p_max,
-        )
+        # 动作校验器
+        self._validator = ActionValidator()
 
-        # 电压仿真器（Grid2Op 不可用时降级使用）
-        # 注意: q_batt 是实时电压调节器的输出 (K_Q=200.0 kVar/p.u.)，
-        # 而 voltage_simulator.k_q=0.03 是线路灵敏度系数（p.u./S_BASE），
-        # 两者物理含义不同：q_batt 已包含控制响应，voltage_simulator.k_q 仅用于模拟电压对功率的灵敏度
-        # 故 VoltageSimulator 保留使用 k_q=0.03，不与 q_control.k_q 混淆
-        vc = self._cfg.voltage_simulator
-        self._voltage_sim = VoltageSimulator(
-            k_p=vc.k_p, k_q=vc.k_q, s_base=vc.s_base,
-            v_min=vc.v_min, v_max=vc.v_max,
-            noise_std=vc.noise_std, imbalance=vc.imbalance,
-            impedance_drift_pct=vc.impedance_drift_pct,
-            harmonic_3rd_pct=vc.harmonic_3rd_pct,
-            harmonic_5th_pct=vc.harmonic_5th_pct,
-        )
-
-        # ── Grid2Op 电压仿真（可开关切换）───────────────────────
-        self._use_grid2op = use_grid2op
-        self._grid2op_backend = grid2op_backend
-        self._grid2op_power_flow: "Grid2OpPowerFlow | None" = None
-        self._grid2op_init_failed = False
+        # 电压仿真器
+        self._voltage_sim = VoltageSimulator()
 
         # 观测/动作空间 (v2.5: 58维单模式, 59维多模式)
-        obs_dim = 58 if self._mode != "all" else 59
+        obs_dim = 58 if mode != "all" else 59
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # 动作: [p_batt_norm, load_shed_norm, pv_limit_norm] (3维)
-        # Q_batt 由实时电压调节器闭环控制，不经过 RL
-        # pv_limit: 光伏有功限值比例 (0.0=全部切除, 1.0=全部出力)
-        low_act = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
-        high_act = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        # v2.7 下垂模式检测
+        self._dual_mode = False
+        self._dual_validator: "DualActionValidator | None" = None
+        if config is not None and getattr(config.dual_control, 'enabled', False):
+            self._dual_mode = True
+            from action_validator import DualActionValidator
+            self._dual_validator = DualActionValidator(
+                p_batt_max=P_BATT_MAX_KW,
+                k_droop_min=self._cfg.dual_control.k_droop_min,
+                k_droop_max=self._cfg.dual_control.k_droop_max,
+                p_ref_ramp_limit_kw=self._cfg.dual_control.p_ref_ramp_limit_kw,
+                load_shed_max=LOAD_SHED_MAX_KW,
+                pv_limit_min=self._cfg.dual_control.pv_limit_min,
+            )
+            # 5 维: [p_ref_norm, k_droop_norm, load_shed_norm, pv_limit_norm]
+            low_act = np.array([-1.0, -1.0, 0.0, 0.0], dtype=np.float32)
+            high_act = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        else:
+            # 3 维: [p_batt_norm, load_shed_norm, pv_limit_norm] (保留 pv_limit 动作)
+            low_act = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+            high_act = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # 内部状态
@@ -306,41 +219,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
-        # v2.6 新增: 电压斜率追踪（用于 |ΔV| 惩罚）
-        self._prev_v_avg: float = 1.0
-        # v2.10 新增: 电池SOH跟踪（累计步数）
-        self._total_steps: int = 0
-        # v2.9 新增: 动作延迟缓冲区（模拟 RTU 轮询延迟）
-        cc = self._cfg.comm
-        delay_steps = np.random.randint(cc.action_delay_steps_min, cc.action_delay_steps_max + 1)
-        self._action_delay_steps = delay_steps
-        self._action_delay_buf: list = [
-            np.zeros(3, dtype=np.float32) for _ in range(delay_steps)
-        ]  # 预填充延迟缓冲区
-
-    def _init_grid2op(self) -> None:
-        """延迟初始化 Grid2Op（首次 reset 前不创建）。
-
-        在 use_grid2op=True 时调用，尝试创建 Grid2OpPowerFlow 实例。
-        如果 Grid2Op 不可用，标记为失败并降级到 VoltageSimulator。
-        """
-        if not self._use_grid2op or self._grid2op_init_failed:
-            return
-
-        try:
-            from grid2op_env import Grid2OpPowerFlow, NumpyChronics, create_mupc_network
-
-            net = create_mupc_network()
-            chronics = NumpyChronics(self._data, force_china_data=False)
-            self._grid2op_power_flow = Grid2OpPowerFlow(
-                net, chronics, storage_soc_init=self._soc
-            )
-        except Exception as e:
-            # Grid2Op 不可用：降级到 VoltageSimulator
-            print(f"[WARN] Grid2Op 初始化失败，降级到 VoltageSimulator: {e}")
-            self._grid2op_init_failed = True
-            self._use_grid2op = False
-            self._grid2op_power_flow = None
 
     # ── 模式管理 ────────────────────────────────────────
 
@@ -378,8 +256,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._peak_demand = 200.0
         self._prev_p_batt = 0.0
         self._prev_q_batt = 0.0
-        self._prev_v_avg = 1.0  # v2.6: 电压斜率追踪
-        self._total_steps = 0  # v2.10: 电池SOH累计步数（episode内不清零，跨episode累加）
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -394,21 +270,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 重置校验器
         self._validator.reset()
-
-        # v2.9: 重置动作延迟缓冲区
-        self._action_delay_buf = [
-            np.zeros(3, dtype=np.float32) for _ in range(self._action_delay_steps)
-        ]
-        # v2.9: 重置 VoltageSimulator 谐波相位计数器
-        if hasattr(self._voltage_sim, '_step_count'):
-            self._voltage_sim._step_count = 0
-
-        # ── Grid2Op 初始化/重置 ────────────────────────────────
-        if self._use_grid2op:
-            if self._grid2op_power_flow is None:
-                self._init_grid2op()
-            if self._grid2op_power_flow is not None:
-                self._grid2op_power_flow.reset(initial_storage_soc=self._soc)
+        # v2.7: 重置下垂模式 validator 的历史状态
+        if self._dual_validator is not None:
+            self._dual_validator.reset()
 
         # 电压越限计数器（用于死区触发）
         self._voltage_violation_count: int = 0
@@ -428,21 +292,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         """
         action = np.asarray(action, dtype=np.float32)
 
-        # v2.9: 动作延迟缓冲区（FIFO）
-        # Pop 队首（延迟 N 步后的动作），Push 当前新动作
-        delayed_action = self._action_delay_buf.pop(0)
-        self._action_delay_buf.append(action.copy())
-        action_to_apply = delayed_action
-
-        # ── Grid2Op SOC 同步（step 入口：Grid2Op → MupcEnv）─────
-        if self._use_grid2op and self._grid2op_power_flow is not None:
-            grid_soc = self._grid2op_power_flow.get_storage_soc()
-            self._soc = float(grid_soc)
-
         # 1. 计算 Q_batt (由实时电压环给出，基于前一步电压)
         v_prev = (self._va + self._vb + self._vc) / 3.0
         v_error = v_prev - 1.0
-        q_batt = float(np.clip(-K_Q * v_error, -Q_BATT_MAX_KVAR, Q_BATT_MAX_KVAR))
+        K_Q_V = 200.0
+        q_batt = float(np.clip(-K_Q_V * v_error, -Q_BATT_MAX_KVAR, Q_BATT_MAX_KVAR))
 
         # v2.5: 计算 q_realtime_margin = 1 - |q_batt| / Q_BATT_MAX
         # 0=打满(无裕度), 1=空闲(最大裕度)
@@ -451,33 +305,42 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # v2.5: 更新季节时段编码 (每小时更新一次即可，这里每步更新)
         self._update_season_time_encoding()
 
-        # 2. 动作约束校验 (ACT-01/03/05)
+        # 2. 动作约束校验
         dispatch_p = self._data["dispatch_p_set"][self._step_idx]
         if abs(dispatch_p) < 1e-6:
             dispatch_p_use = None
         else:
             dispatch_p_use = float(dispatch_p)
-        clamped, violated, violations = self._validator.validate(
-            action_to_apply, dispatch_p_use, q_batt_real=q_batt)
 
-        # 3. 反归一化动作到物理值 (3维: P_batt + Load_shedding + Pv_limit)
-        p_batt = clamped[0] * P_BATT_MAX_KW
-        load_shed = clamped[1] * LOAD_SHED_MAX_KW
-        pv_limit = clamped[2] * 1.0  # [0.0, 1.0] 无量纲
-        # Q_batt 已在上方计算，由实时电压调节器闭环给出
+        if self._dual_mode:
+            # v2.7 双参数模式: 使用预创建的 DualActionValidator 实例（避免每步重建）
+            clamped_dual, violated, violations = self._dual_validator.validate(
+                action, dispatch_p_use, is_anti_reverse=False)
+            p_ref = clamped_dual[0] * P_BATT_MAX_KW
+            k_droop = clamped_dual[1] * (self._cfg.dual_control.k_droop_max -
+                                          self._cfg.dual_control.k_droop_min) / 2.0 + \
+                      (self._cfg.dual_control.k_droop_max +
+                       self._cfg.dual_control.k_droop_min) / 2.0
+            load_shed = clamped_dual[2] * LOAD_SHED_MAX_KW
+            pv_limit = clamped_dual[3] * 1.0
+            p_batt = p_ref  # 下垂模式: 执行器根据 P_output = P_ref + k_droop × ΔV 计算
+        else:
+            # 标准模式: 使用现有 ActionValidator
+            clamped, violated, violations = self._validator.validate(
+                action, dispatch_p_use, q_batt_real=q_batt)
+            p_batt = clamped[0] * P_BATT_MAX_KW
+            load_shed = clamped[1] * LOAD_SHED_MAX_KW
+            pv_limit = clamped[2] * 1.0 if len(clamped) > 2 else 1.0
+            k_droop = 0.0  # 标准模式不使用 k_droop
 
-        # 4. 有效负荷与光伏 (pv_limit 可主动弃光)
+        # 3. 有效负荷与光伏
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
-        p_pv_eff = p_pv_raw * pv_limit  # v2.6: 主动弃光
+        p_pv_eff = p_pv_raw * pv_limit  # 应用 pv_limit
 
-        # 4. SOC 更新 (SAFETY: hard clamp，带充放电效率)
-        # 放电(p_batt>0): ΔSOC = -P*dt/(E*η_dis)  充电(p_batt<0): ΔSOC = -P*dt*η_chg/E
-        if p_batt > 0:
-            soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH / BATTERY_DISCHARGE_EFF
-        else:
-            soc_raw = self._soc + (-p_batt * DT_HOURS) * BATTERY_CHARGE_EFF / BATTERY_CAPACITY_KWH
+        # 4. SOC 更新 (SAFETY: hard clamp)
+        soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH
         soc_new = float(np.clip(soc_raw, SOC_MIN, SOC_MAX))
         soc_clipped = abs(soc_raw - soc_new) > 1e-9
 
@@ -490,36 +353,23 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         load_rate = s_transformer / TRANSFORMER_KVA
         load_rate_unclamped = load_rate  # 用于奖励计算
 
-        # 7. 电压更新 (Grid2Op 潮流计算 或 VoltageSimulator 降级)
-        has_illegal = False
-        if self._use_grid2op and self._grid2op_power_flow is not None:
-            # 转换为 Grid2Op 单位: kW → MW
-            storage_p_mw = p_batt / 1000.0
-            storage_q_mvar = q_batt / 1000.0  # kVar → MVar
-
-            va, vb, vc, has_illegal = self._grid2op_power_flow.step(
-                storage_p_mw, storage_q_mvar)
-
-            # 同步 SOC 到 Grid2Op（step 出口：MupcEnv → Grid2Op）
-            self._grid2op_power_flow.set_storage_soc(soc_new)
-        else:
-            # 降级到原 VoltageSimulator
-            p_net = p_pv_eff - p_load_eff + p_batt
-            va, vb, vc = self._voltage_sim.step(
-                p_net, float(q_batt), self._va, self._vb, self._vc)
+        # 7. 电压更新 (使用实时电压环给出的 q_batt)
+        p_net = p_pv_eff - p_load_eff + p_batt
+        va, vb, vc = self._voltage_sim.step(
+            p_net, float(q_batt), self._va, self._vb, self._vc,
+        )
         v_avg = (va + vb + vc) / 3.0
 
-        # v2.6: 电压斜率追踪（用于 |ΔV| 惩罚）
-        delta_v = abs(v_avg - self._prev_v_avg)
-
         # 8. 电压越限计数器 (死区: ±5%, [0.95, 1.05])
-        if abs(v_avg - 1.0) > VOLTAGE_DEADBAND:
+        V_DEAD = 0.05
+        if abs(v_avg - 1.0) > V_DEAD:
             self._voltage_violation_count += 1
         else:
             self._voltage_violation_count = 0  # 恢复正常则重置
 
         # 9. 需量更新 (1 小时滑动窗口)
-        demand_start = max(0, self._step_idx - DEMAND_WINDOW_STEPS + 1)
+        window = 4
+        demand_start = max(0, self._step_idx - window + 1)
         demand_slice = self._data["load_power"][demand_start:self._step_idx + 1]
         current_demand = max(float(np.mean(demand_slice)), CONTRACT_DEMAND_KW * 0.3)
         peak_demand = max(self._peak_demand, current_demand)
@@ -537,7 +387,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         prev_p_batt_for_reward = self._prev_p_batt
         self._prev_p_batt = p_batt
         self._prev_q_batt = float(q_batt)
-        self._prev_v_avg = v_avg  # v2.6: 电压斜率追踪
 
         # 11. 奖励计算
         reward, reward_info = self._compute_reward(
@@ -549,12 +398,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             va=va, vb=vb, vc=vc,
             prev_p_batt=prev_p_batt_for_reward,
             voltage_violation_count=self._voltage_violation_count,
-            delta_v=delta_v,
         )
 
         # 12. 推进时间
         self._step_idx += 1
-        self._total_steps += 1  # v2.10: SOH累计步数
         terminated = (self._step_idx - self._episode_start) >= EPISODE_LENGTH
         truncated = self._step_idx >= self._data_len - 16
 
@@ -566,7 +413,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_batt": p_batt,
             "q_batt": float(q_batt),
             "load_shedding": load_shed,
-            "pv_limit": float(pv_limit), # v2.6: 主动弃光
+            "pv_limit": float(pv_limit),
             "grid_power": grid_power,
             "va": va, "vb": vb, "vc": vc,
             "v_avg": float(v_avg),
@@ -576,8 +423,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "constraint_violated": violated,
             "violations": str(violations) if violations else "",
             "voltage_violation_count": self._voltage_violation_count,
-            "has_illegal": has_illegal,  # Grid2Op 潮流不收敛标记
             **reward_info,
+            # v2.7 新增双参数字段
+            "k_droop": float(k_droop) if self._dual_mode else 0.0,
+            "p_ref": float(p_batt) if self._dual_mode else p_batt,
         }
         if terminated or truncated:
             info["terminal_observation"] = self._build_observation()
@@ -698,31 +547,56 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         return obs.astype(np.float32)
 
     def _normalize_obs(self, obs: np.ndarray, params: dict) -> np.ndarray:
-        """应用 MinMax 归一化 (v2.5: 58/59维) — 向量化版本。"""
+        """应用 MinMax 归一化 (v2.5: 56维)。"""
         out = obs.copy()
         # D1 [0..9]
-        out[1:2] = _norm_slice(obs[1:2], 0.0, PV_ARRAY_KW)
-        out[2:3] = _norm_slice(obs[2:3], 0.0, LOAD_PEAK_KW)
-        out[3:4] = _norm_slice(obs[3:4], -500.0, 500.0)
-        out[5:6] = _norm_slice(obs[5:6], -500.0, 500.0)
-        out[6:9] = _norm_slice(obs[6:9], 0.85, 1.15)
-        # D2 pv [10..24] (15维) — 批量
-        out[10:25] = _norm_slice(obs[10:25], 0.0, PV_ARRAY_KW)
-        # D2 load [25..39] (15维) — 批量
-        out[25:40] = _norm_slice(obs[25:40], 0.0, LOAD_PEAK_KW)
-        # D3 电价 [41..43]
-        out[41:43] = _norm_slice(obs[41:43], 0.0, 1.5)
-        out[43:44] = _norm_slice(obs[43:44], 0.0, 3.0)
-        # D4 需量 [44..46] — 批量
-        out[44:47] = _norm_slice(obs[44:47], 0.0, 500.0)
-        # D5 气象 [47..48] — 批量（不同范围）
-        out[47:49] = _norm_slice(obs[47:49],
-                                  np.array([0.0, -20.0]),
-                                  np.array([1500.0, 60.0]))
-        # D6 调度 [49]
-        out[49:50] = _norm_slice(obs[49:50], -500.0, 500.0)
-        # [0,4,9,50,51..57,(58)] 保持 identity（原值）
+        out[0] = obs[0]  # SOC: identity
+        out[1] = self._minmax(obs[1], 0.0, PV_ARRAY_KW)
+        out[2] = self._minmax(obs[2], 0.0, LOAD_PEAK_KW)
+        out[3] = self._minmax(obs[3], -500.0, 500.0)
+        out[4] = obs[4]  # transformer_load: identity
+        out[5] = self._minmax(obs[5], -500.0, 500.0)
+        out[6] = self._minmax(obs[6], 0.85, 1.15)
+        out[7] = self._minmax(obs[7], 0.85, 1.15)
+        out[8] = self._minmax(obs[8], 0.85, 1.15)
+        out[9] = obs[9]  # q_realtime_margin: identity [0,1]
+        # D2 pv [10..24]
+        out[10:25] = self._minmax(obs[10:25], 0.0, PV_ARRAY_KW)
+        # D2 load [26..40]
+        out[26:41] = self._minmax(obs[26:41], 0.0, LOAD_PEAK_KW)
+        # D3 [41..43]
+        out[41] = self._minmax(obs[41], 0.0, 1.5)
+        out[42] = self._minmax(obs[42], 0.0, 1.5)
+        out[43] = self._minmax(obs[43], 0.0, 3.0)
+        # D4 [44..46]
+        out[44] = self._minmax(obs[44], 0.0, 500.0)
+        out[45] = self._minmax(obs[45], 0.0, 500.0)
+        out[46] = self._minmax(obs[46], 0.0, 500.0)
+        # D5 [47..48]
+        out[47] = self._minmax(obs[47], 0.0, 1500.0)
+        out[48] = self._minmax(obs[48], -20.0, 60.0)
+        # D6 [49]
+        out[49] = self._minmax(obs[49], -500.0, 500.0)
+        # D7 [50] q_realtime_margin: identity
+        out[50] = obs[50]
+        # D7 [51..56] season_encoding: one-hot, identity
+        # D7 [57] time_period: binary, identity
+        # mode_id [58]: identity
         return out
+
+    @staticmethod
+    def _minmax(x, lo, hi):
+        """MinMax 归一化, 支持标量和数组。"""
+        clipped = np.clip(x, lo, hi)
+        result = (clipped - lo) / (hi - lo + 1e-9)
+        if np.isscalar(x):
+            return float(result)
+        return result.astype(np.float32)
+
+    @staticmethod
+    def _minmax_scalar(x, lo, hi) -> float:
+        """标量 MinMax 归一化。"""
+        return float((np.clip(float(x), lo, hi) - lo) / (hi - lo + 1e-9))
 
     # ── 奖励函数 ────────────────────────────────────────
 
@@ -759,20 +633,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
 
-        # ── 光伏消纳率 (含电压前置条件 + v2.6 主动弃光) ──
-        pv_total = max(r["p_pv_raw"], 1e-6)  # 原始光伏总出力
-        pv_limit = r.get("pv_limit", 1.0)    # v2.6: 主动弃光比例
-        pv_eff = r["p_pv_raw"] * pv_limit    # 限后光伏出力
-        pv_self = min(pv_eff, r["p_load_raw"]) + max(0.0, -r["p_batt"])
+        # ── 光伏消纳率 (含电压前置条件) ──
+        pv_total = max(r["p_pv_raw"], 1e-6)
+        pv_self = min(r["p_pv_raw"], r["p_load_raw"]) + max(0.0, -r["p_batt"])
         r_pv = min(pv_self / pv_total, 1.0)
         # v2.5: 电压偏高时弃光奖励不计入
         if v_avg >= VOLTAGE_HIGH_LIMIT:
             r_pv = 0.0
-            # v2.9: 主动弃光奖励（弃光悖论解决）
-            # 高电压时 pv_limit 越低 → 弃光越多 → 奖励越高
-            r_pv_limit = (1.0 - pv_limit) ** 2  # 二次型：大幅弃光奖励更高
-        else:
-            r_pv_limit = 0.0
 
         # ── 自适应损耗系数 α(s) ──
         soc_new = r.get("soc_new", self._soc)
@@ -783,18 +650,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         else:
             alpha = 1.0  # 常规调度
 
-        # ── 过载惩罚: 梯度从 OVERLOAD_START_PCT 开始（Quadratic + Linear）──
-        # p_overload = -(0.3095·x² + 0.026·x), x ∈ [0, 1]，惩罚区间 [OVERLOAD_START_PCT, OVERLOAD_THRESHOLD]
+        # ── 过载惩罚: 梯度从 75% 开始（Quadratic + Linear）──
         lr_unc = r.get("load_rate_unclamped", r["load_rate"])
-        overload_t = max(0.0, (lr_unc - OVERLOAD_START_PCT) / max(1e-6, OVERLOAD_THRESHOLD - OVERLOAD_START_PCT))
+        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
         p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
 
         # ── 电池衰减: C-rate² × α(s)（v2.5 自适应系数）──
         c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
-        # v2.10: SOH 反馈惩罚
-        # SOH(t) = max(0.70, 1.0 - 0.00005 * total_steps)，每万步约 -0.5% SOH
-        soh = max(0.70, 1.0 - 0.00005 * self._total_steps)
-        p_batt_deg = alpha * (c_rate ** 2) / soh
+        p_batt_deg = alpha * (c_rate ** 2)
 
         # ── 电压质量惩罚 (v2.5: 条件触发式) ──
         p_voltage = 0.0
@@ -816,30 +679,20 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         w5 = w[4] if len(w) > 4 else 0.0
         p_ramp_penalty = w5 * delta_p / BATTERY_CAPACITY_KWH
 
-        # ── v2.6: 电压变化斜率惩罚（阻抗感知，迫使 AI 平滑调节）──
-        delta_v = r.get("delta_v", 0.0)
-        w6 = w[5] if len(w) > 5 else 0.0
-        p_voltage_slope = w6 * delta_v
-
         total = (w[0] * r_pv
-                 + w[0] * r_pv_limit
                  - w[1] * p_batt_deg
                  - w[2] * p_overload
                  - w4 * p_voltage
-                 - p_ramp_penalty
-                 - p_voltage_slope)
+                 - p_ramp_penalty)
 
         info = {
             "r_pv_consumption": float(r_pv),
-            "r_pv_limit_active": float(r_pv_limit),  # v2.9
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload),
             "p_voltage_deviation": float(-p_voltage),
             "p_ramp_penalty": float(-p_ramp_penalty),
-            "p_voltage_slope": float(-p_voltage_slope),  # v2.6
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
-            "soh": float(soh),  # v2.10
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5
         }
         return float(total), info
@@ -855,14 +708,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 电池衰减: C-rate²（非线性）
         c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
-        # v2.10: SOH 反馈惩罚
-        soh = max(0.70, 1.0 - 0.00005 * self._total_steps)
-        p_batt_deg = (c_rate ** 2) / soh
+        p_batt_deg = c_rate ** 2
 
-        # 过载惩罚: 梯度从 OVERLOAD_START_PCT 开始（Quadratic + Linear）
-        # p_overload = -(0.3095·x² + 0.026·x), x ∈ [0, 1]，惩罚区间 [OVERLOAD_START_PCT, OVERLOAD_THRESHOLD]
+        # 过载惩罚: 梯度从 75% 开始（Quadratic + Linear，匹配设计文档）
         lr_unc = r.get("load_rate_unclamped", r["load_rate"])
-        overload_t = max(0.0, (lr_unc - OVERLOAD_START_PCT) / max(1e-6, OVERLOAD_THRESHOLD - OVERLOAD_START_PCT))
+        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
         p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
         w3 = w[2] if len(w) > 2 else 0.0
 
@@ -871,7 +721,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "r_price_spread": float(r_spread),
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload) if w3 > 0 else 0.0,
-            "soh": float(soh),  # v2.10
         }
         return float(total), info
 

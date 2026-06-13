@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.10 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.9 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.8 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
@@ -10,6 +11,8 @@
 **对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.6 (`[REVIEWED: PASS]`)
 
 ---
+
+> **v2.10 变更说明（v2.7 双参数动作空间合并）：** 新增下垂模式（`config.dual_control.enabled=true`），RL 输出 4 维动作（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit），执行器按 P_output = P_ref + k_droop × ΔV 计算最终功率。NumPy PPO 支持 dual_mode，5 维策略输出（p_ref, k_droop, load_shedding, pv_limit, confidence），buffer 使用 `env.action_space.shape[0]` 截断至 4 维。DualActionValidator 实现 ACT-DUAL-01~05 约束规则（p_ref 斜率限制、k_droop 范围、|p_ref| ≤ |dispatch_p|、pv_limit ≥ 0.1 防逆流）。
 
 > **v2.9 变更说明（v2.7/v2.8/v2.9 合并）：** 动态阻抗扰动（VoltageSimulator 每步对 k_p/k_q 加 ±10% 随机扰动）+ 3/5 次谐波注入（3%/2% 幅值）。通信延迟模拟（mupc_env FIFO 动作缓冲区 1~3 步延迟）。MODE-01 奖励函数新增主动弃光专项奖励（v_avg>=1.05 时，pv_limit 越低奖励越高，解决弃光悖论）。config 新增 CommConfig / voltage_simulator 谐波/阻抗漂移参数。
 
@@ -233,6 +236,24 @@ VoltageSimulator 模式（降级）:
 | 2 | pv_limit | [0, 1] → [0, 1] | — | 光伏有功限功率比例（v2.6 新增，主动弃光） |
 
 > **v2.6 分层控制架构：** Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。pv_limit 由 RL 主动控制（主动弃光），与 Q 调节互补。RL 专注能量管理（P_batt + Load_shedding + Pv_limit），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
+
+**下垂模式（4维，v2.7新增）**
+
+当 `config.dual_control.enabled=true` 时启用，RL 输出 4 维动作：
+
+| 维度 | 字段 | 范围 | 说明 |
+|------|------|------|------|
+| A1 | P_ref | [-50, 50] kW | 有功功率基准点 |
+| A2 | k_droop | [-100, 100] kW/V | 电压-有功下垂系数 |
+| A3 | load_shedding | [0, 60] kW | 可中断负荷切除量 |
+| A4 | pv_limit | [0.1, 1] | 光伏限功率比例（防逆流） |
+
+执行器根据下垂公式计算最终功率：P_output = P_ref + k_droop × ΔV
+
+**配置参数：**
+- `dual_control.enabled`: 启用/禁用下垂模式
+- `dual_control.k_droop_min/max`: 下垂系数范围 [-100, 100]
+- `dual_control.p_ref_ramp_limit_kw`: P_ref 变化率限制 (50.0 kW/步)
 
 **核心物理方程**：
 

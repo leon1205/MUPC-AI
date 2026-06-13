@@ -2,25 +2,12 @@
 MUPC RL 模型训练主入口。
 
 用法:
-  #快速测试（5万步，Oracle预测）
-  python train.py --mode MODE-01 --total-timesteps 50000 --no-lstm
-
-  # LSTM训练 + RL训练（合并数据，1M步）
-  python train.py --mode MODE-01 --data-source merged --train-lstm \
-         --lstm-params hidden_dim=128,num_layers=3,epochs=200,patience=30 \
-         --total-timesteps 1000000 --export-onnx
-
-  # 5个独立模型（SMART-DS数据，20万步/每模式）
-  python train.py --mode single --data-source smartds --total-timesteps 200000
-
-  # 多模式单模型（Oracle预测，100万步）
-  python train.py --mode all --no-lstm --total-timesteps 1000000
-
-  # 中国数据 + 低学习率衰减
-  python train.py --mode all --data-source china --lr-decay --total-timesteps 500000
-
-  # 独立训练 LSTM（仅LSTM，不跑RL）
-  python train.py --train-lstm --data-source merged --lstm-params epochs=100
+  python train.py                          # 默认多模式 PPO 训练
+  python train.py --mode MODE-01           # 单模式 (农网灌溉)
+  python train.py --algo sac               # SAC 算法
+  python train.py --total-timesteps 50000  # 快速测试
+  python train.py --reward-weights MODE-01=1.5,0.3,3.0  # 自定义权重
+  python train.py --no-lstm                # 使用 Oracle 预测
 """
 
 import argparse
@@ -65,69 +52,36 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python train.py --mode MODE-01 --total-timesteps 50000 --no-lstm
-  python train.py --mode all --data-source merged --train-lstm --total-timesteps 1000000
-  python train.py --train-lstm --data-source merged --lstm-params epochs=100
+  python train.py                                          # 默认多模式 PPO
+  python train.py --mode MODE-01 --algo sac               # 单模式 SAC
+  python train.py --total-timesteps 50000                 # 快速测试
+  python train.py --reward-weights MODE-01=1.5,0.3,3.0   # 自定义权重
         """,
     )
-
-    # ── 模式 ──
     p.add_argument("--mode", type=str, default="all",
-                   choices=["all", "MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05", "single"],
-                   help="训练模式: all=多模式单模型, single=5个独立模型, MODE-0X=单模式 (default: all)")
+                   choices=["all", "MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"],
+                   help="训练模式 (default: all = 多模式单模型)")
     p.add_argument("--algo", type=str, default="ppo",
                    choices=["ppo", "sac"],
                    help="RL 算法 (default: ppo)")
-
-    # ── 数据 ──
-    p.add_argument("--data-source", type=str, default="smartds",
-                   choices=["smartds", "china", "merged", "unified"],
-                   help="数据源: smartds=SMART-DS, china=中国合成, merged=SMART-DS+中国合并, unified=三源合并 (default: smartds)")
-    p.add_argument("--lat", type=float, default=31.23, help="中国数据纬度 (default: 31.23)")
-    p.add_argument("--lon", type=float, default=121.47, help="中国数据经度 (default: 121.47)")
-    # ── 兼容旧参数 ──
-    p.add_argument("--merge", action="store_true",
-                   help="[兼容] 等同于 --data-source merged")
-
-    # ── LSTM ──
-    p.add_argument("--train-lstm", action="store_true",
-                   help="仅训练 LSTM 预测器（不跑 RL 训练）")
-    p.add_argument("--lstm-checkpoint", type=str, default=None,
-                   help="预训练 LSTM 模型路径")
-    p.add_argument("--lstm-params", type=str, default="",
-                   help="LSTM 超参，格式: key=val[,key=val] (hidden_dim,num_layers,epochs,batch_size,patience)")
-    p.add_argument("--no-lstm", action="store_true",
-                   help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
-
-    # ── RL 训练 ──
     p.add_argument("--total-timesteps", type=int, default=175200,
                    help="总训练步数 (default: 175200)")
-    p.add_argument("--lr", type=float, default=3e-4,
-                   help="学习率 (default: 3e-4)")
-    p.add_argument("--lr-decay", action="store_true",
-                   help="启用学习率线性衰减 (1e-4 → 1e-5)")
-    p.add_argument("--ent-coef", type=float, default=0.01,
-                   help="熵系数 (default: 0.01)")
-    p.add_argument("--net-arch", type=str, default="128,128",
-                   help="网络结构，逗号分隔 (default: 128,128)")
-    p.add_argument("--eval-freq", type=int, default=10000,
-                   help="评估频率 (default: 10000)")
-
-    # ──通用 ──
-    p.add_argument("--config", type=str, default=None,
-                   help="YAML 配置文件路径，如 config/mupc_env_config.yaml "
-                        "(未指定时使用代码中的硬编码默认值)")
-    p.add_argument("--seed", type=int, default=42, help="随机种子 (default: 42)")
+    p.add_argument("--reward-weights", type=str, default="",
+                   help="自定义权重, e.g. MODE-01=1.5,0.3,3.0 (逗号分隔)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="随机种子 (default: 42)")
     p.add_argument("--tensorboard-log", type=str, default="./tensorboard_logs/",
                    help="TensorBoard 日志目录")
     p.add_argument("--checkpoint-path", type=str, default="./checkpoints/",
                    help="模型保存目录")
+    p.add_argument("--no-lstm", action="store_true",
+                   help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
+    p.add_argument("--dual-mode", action="store_true",
+                   help="启用双参数下垂控制模式（5维动作，v2.7）")
+    p.add_argument("--lstm-checkpoint", type=str, default=None,
+                   help="预训练 LSTM 模型路径")
     p.add_argument("--export-onnx", action="store_true",
                    help="训练完成后自动导出 ONNX")
-    p.add_argument("--reward-weights", type=str, default="",
-                   help="自定义权重, e.g. MODE-01=1.5,0.3,3.0 (逗号分隔)")
-    p.add_argument("--curriculum", action="store_true",
-                   help="启用课程学习：Phase1(MODE-02) → Phase2(MODE-01) → Phase3(混合)")
     return p.parse_args()
 
 
@@ -147,44 +101,12 @@ def parse_custom_weights(raw: str) -> dict[str, list[float]]:
     return result
 
 
-# ── LSTM 参数解析 ──────────────────────────────────────────────
-
-def parse_lstm_params(raw: str) -> dict:
-    """解析 --lstm-params 参数。"""
-    defaults = {
-        "hidden_dim": 64, "num_layers": 2, "epochs": 200,
-        "batch_size": 64, "patience": 20,
-    }
-    if not raw:
-        return defaults
-    for part in raw.split(","):
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        defaults[k.strip()] = float(v.strip()) if "." in v else int(v.strip())
-    return defaults
-
-
-# ── 网络结构解析 ──────────────────────────────────────────────
-
-def parse_net_arch(raw: str) -> list[int]:
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
-
-
 # ═══════════════════════════════════════════════════════════════
 # 主入口
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     args = parse_args()
-
-    # ── 配置文件加载（优先于其他初始化）──────────────
-    from config.config_manager import load_config
-    load_config(args.config)
-
-    # ── 兼容旧参数 ──────────────────────────────────────
-    if args.merge:
-        args.data_source = "merged"
 
     # ── 依赖检测 ────────────────────────────────────────
     print("=" * 56)
@@ -200,246 +122,93 @@ def main():
 
     # ── 数据加载 ────────────────────────────────────────
     print("\n── 数据加载 ──")
-    from data_loader import SmartDSLoader, ChinaDataLoader, UnifiedDataLoader
-
-    if args.data_source == "smartds":
-        loader = SmartDSLoader()
-        data = loader.load_all()
-    elif args.data_source == "china":
-        loader = ChinaDataLoader()
-        data = loader.load_all()
-    elif args.data_source in ("merged", "unified"):
-        loader = UnifiedDataLoader(
-            lat=args.lat, lon=args.lon,
-            merge_data=True,
-            auto_generate=True,
-        )
-        data = loader.load_all()
-    else:
-        raise ValueError(f"未知 data_source: {args.data_source}")
-
+    from data_loader import SmartDSLoader
+    loader = SmartDSLoader()
+    data = loader.load_all()
     train_data, val_data = loader.split(data)
-    print(f" 训练: {train_data['n_steps']} 步 ({train_data['n_steps']*15/60/24:.0f} 天), "
-          f"验证: {val_data['n_steps']} 步 ({val_data['n_steps']*15/60/24:.0f} 天)")
 
     # ── LSTM / Oracle ────────────────────────────────────
     predictor = None
-    lstm_trained_path = None
-
-    if args.train_lstm:
-        # 仅训练 LSTM，不跑 RL
-        _train_lstm_only(train_data, val_data, args)
-        print("\nLSTM 训练完成（无 RL 训练）。")
-
-        # LSTM 训练后导出 ONNX（如果指定了 --export-onnx）
-        if args.export_onnx and has_torch:
-            print("\n── LSTM ONNX 导出 ──")
-            try:
-                import export_onnx
-                lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
-                onnx_path = export_onnx.export_lstm(lstm_path, "./exported_models/")
-                print(f"  LSTM ONNX 已导出: {onnx_path}")
-            except Exception as e:
-                print(f"  LSTM ONNX 导出失败: {e}")
-        return
-
     if not args.no_lstm and args.lstm_checkpoint:
-        import torch
         from lstm_model import LSTMForecast
         print(f"\n── LSTM 模型加载 ──")
         model = LSTMForecast()
         model.load_state_dict(torch.load(args.lstm_checkpoint, map_location="cpu"))
         model.lstm.eval()
         predictor = model
-        predictor.set_data(train_data)
-        lstm_trained_path = args.lstm_checkpoint
     elif not args.no_lstm and has_torch:
         print("\n── LSTM 模型训练 ──")
         from lstm_model import LSTMTrainer
-        lstm_cfg = parse_lstm_params(args.lstm_params)
-        print(f"  LSTM 参数: {lstm_cfg}")
-        trainer = LSTMTrainer(lstm_cfg)
+        trainer = LSTMTrainer({"epochs": 50, "batch_size": 64})
         result = trainer.train(train_data, val_data)
         predictor = result["model"]
-        predictor.set_data(train_data)
         # 保存 LSTM checkpoint
-        os.makedirs(args.checkpoint_path, exist_ok=True)
         lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
+        os.makedirs(args.checkpoint_path, exist_ok=True)
         import torch
         torch.save(predictor.state_dict(), lstm_path)
-        print(f"  LSTM checkpoint 已保存: {lstm_path}")
-        lstm_trained_path = lstm_path
+        print(f"LSTM checkpoint 已保存: {lstm_path}")
     else:
         from lstm_model import OraclePredictor
         print("\n── 使用 Oracle 预测 ──")
         predictor = OraclePredictor(train_data)
 
-    # ── 课程学习训练 (v2.6) ───────────────────────────────
+    # ── 环境创建 ────────────────────────────────────────
+    print("\n── 环境创建 ──")
+    custom_weights = parse_custom_weights(args.reward_weights)
 
-    def _run_curriculum_training(train_data: dict, val_data: dict,
-                                predictor, args) -> None:
-        """三阶段课程学习训练。
-
-        Phase 1: MODE-02 (基础) — 削峰填谷 + SOC 管理，175200 步
-        Phase 2: MODE-01 (进阶) — 加入电压约束 + 低惩罚权重，175200 步
-        Phase 3: 混合模式 (对抗) — 全惩罚权重，175200 步
-
-        总步数 = 3 × 175200 = 525600 步
-        """
-        from mupc_env import MupcEnv
-
-        #课程学习权重配置
-        # Phase 1: MODE-02 only (基础经济性)
-        phase1_weights = {
-            "MODE-02": [1.0, 1.0, 2.0], # w1(价差), w2(电池), w3(过载)
-        }
-        # Phase 2: MODE-01 (进阶电压安全)，降低 w4(电压惩罚)
-        phase2_weights = {
-            "MODE-01": [1.0, 0.5, 2.0, 0.3, 0.5],  # w4(电压) 从 1.0 降到 0.3
-        }
-        # Phase 3: MODE-01 全权重 + all 混合
-        phase3_weights = {
-            "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w4(电压) 恢复 1.0
-            "MODE-02": [1.0, 1.0, 2.0],
-            "MODE-03": [1.0, 0.5],
-            "MODE-04": [1.0, 2.0, 1.0],
-            "MODE-05": [1.0, 1.0],
-        }
-
-        phase_steps = args.total_timesteps # 每阶段步数
-        phases = [
-            ("Phase 1:基础 (MODE-02 削峰填谷)", "MODE-02", phase1_weights),
-            ("Phase 2: 进阶 (MODE-01 电压约束)", "MODE-01", phase2_weights),
-            ("Phase 3: 对抗 (混合模式)", "all", phase3_weights),
-        ]
-
-        has_sb3 = False
-        has_gym = False
-        try:
-            import stable_baselines3 as sb3
-            import gymnasium
-            has_sb3 = True
-            has_gym = True
-        except ImportError:
-            pass
-
-        for phase_name, mode, weights in phases:
-            print(f"\n{'─' * 56}")
-            print(f"  {phase_name}")
-            print(f"{'─' * 56}")
-
-            env = MupcEnv(train_data, mode=mode, lstm_predictor=predictor,
-                          reward_weights=weights)
-            eval_env = MupcEnv(val_data, mode=mode, lstm_predictor=predictor,
-                              reward_weights=weights)
-
-            obs_dim = env.observation_space.shape[0]
-            print(f"  观测空间: Box({obs_dim},), 动作空间: Box(3,), 算法: {args.algo}")
-            print(f"  训练步数: {phase_steps}")
-
-            #临时修改 args 的 total_timesteps
-            orig_steps = args.total_timesteps
-            args.total_timesteps = phase_steps
-
-            if has_sb3 and has_gym:
-                _train_sb3(env, eval_env, args, obs_dim, mode)
-            else:
-                _train_numpy_ppo(env, eval_env, args, obs_dim, mode)
-
-            args.total_timesteps = orig_steps
-
-        print(f"\n{'─' * 56}")
-        print("  课程学习训练完成")
-        print(f"{'─' * 56}")
-
-    # ── 确定训练模式列表 ────────────────────────────────
-    if args.mode == "single":
-        modes = ["MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"]
-    elif args.mode == "all":
-        modes = ["all"]
+    from mupc_env import MupcEnv
+    if args.dual_mode:
+        from config.config_manager import get_config
+        cfg = get_config()
+        cfg.dual_control.enabled = True
+        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                      config=cfg,
+                      reward_weights=custom_weights if custom_weights else None)
+        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                           config=cfg,
+                           reward_weights=custom_weights if custom_weights else None)
     else:
-        modes = [args.mode]
+        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                      reward_weights=custom_weights if custom_weights else None)
+        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                           reward_weights=custom_weights if custom_weights else None)
+
+    obs_dim = env.observation_space.shape[0]
+    print(f"  观测空间: Box({obs_dim},)")
+    print(f"  动作空间: Box(2,), 模式: {args.mode}, 算法: {args.algo}")
 
     # ── 训练 ────────────────────────────────────────────
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.tensorboard_log, exist_ok=True)
 
-    custom_weights = parse_custom_weights(args.reward_weights)
-
-    # v2.6: 课程学习模式
-    if args.curriculum:
-        print("\n" + "=" * 56)
-        print("  课程学习训练 (3 Phase)")
-        print("=" * 56)
-        _run_curriculum_training(train_data, val_data, predictor, args)
+    if has_sb3 and has_gym:
+        _train_sb3(env, eval_env, args)
     else:
-        for mode in modes:
-            print(f"\n{'=' * 56}")
-            print(f"  训练模式: {mode}")
-            print(f"{'=' * 56}")
-
-            from mupc_env import MupcEnv
-            env = MupcEnv(train_data, mode=mode, lstm_predictor=predictor,
-                          reward_weights=custom_weights if custom_weights else None)
-            eval_env = MupcEnv(val_data, mode=mode, lstm_predictor=predictor,
-                              reward_weights=custom_weights if custom_weights else None)
-
-            obs_dim = env.observation_space.shape[0]
-            print(f"  观测空间: Box({obs_dim},), 动作空间: Box(3,), 算法: {args.algo}")
-
-            if has_sb3 and has_gym:
-                _train_sb3(env, eval_env, args, obs_dim, mode)
-            else:
-                _train_numpy_ppo(env, eval_env, args, obs_dim, mode)
-
-            # ONNX 导出
-            if args.export_onnx and has_torch:
-                print("\n── ONNX 导出 ──")
-                try:
-                    import export_onnx
-                    onnx_path = export_onnx.export_rl_policy(
-                        checkpoint_dir=args.checkpoint_path,
-                        output_dir="./exported_models/",
-                        obs_dim=obs_dim,
-                    )
-                    print(f"  ONNX 模型已导出: {onnx_path}")
-                except Exception as e:
-                    print(f"  ONNX 导出失败: {e}")
+        _train_numpy_ppo(env, eval_env, args, obs_dim)
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
     print(f"{'=' * 56}")
 
-
-# ── LSTM 独立训练 ─────────────────────────────────────────────
-
-def _train_lstm_only(train_data: dict, val_data: dict, args):
-    """仅训练 LSTM，不进行 RL 训练。"""
-    print("\n" + "=" * 56)
-    print("  LSTM 独立训练")
-    print("=" * 56)
-
-    from lstm_model import LSTMTrainer
-    import torch
-
-    lstm_cfg = parse_lstm_params(args.lstm_params)
-    print(f"  LSTM 参数: {lstm_cfg}")
-
-    t0 = time.time()
-    trainer = LSTMTrainer(lstm_cfg)
-    result = trainer.train(train_data, val_data)
-    elapsed = time.time() - t0
-
-    os.makedirs(args.checkpoint_path, exist_ok=True)
-    lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
-    torch.save(result["model"].state_dict(), lstm_path)
-    print(f"\n  LSTM 训练完成，耗时: {elapsed:.0f}s")
-    print(f"  checkpoint: {lstm_path}")
+    # ── ONNX 导出 ──────────────────────────────────────
+    if args.export_onnx and has_torch:
+        print("\n── ONNX 导出 ──")
+        try:
+            import export_onnx
+            onnx_path = export_onnx.export_rl_policy(
+                checkpoint_dir=args.checkpoint_path,
+                output_dir="./exported_models/",
+                obs_dim=obs_dim,
+            )
+            print(f"ONNX 模型已导出: {onnx_path}")
+        except Exception as e:
+            print(f"ONNX 导出失败: {e}")
 
 
 # ── SB3 训练 ──────────────────────────────────────────────────
 
-def _train_sb3(env, eval_env, args, obs_dim: int, mode: str):
+def _train_sb3(env, eval_env, args):
     import gymnasium
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.callbacks import EvalCallback
@@ -450,83 +219,81 @@ def _train_sb3(env, eval_env, args, obs_dim: int, mode: str):
     algo_name = "PPO" if args.algo == "ppo" else "SAC"
 
     print(f"\n── SB3 {algo_name} 训练 ──")
-    print(f"  总步数: {args.total_timesteps}, 模式: {mode}")
+    print(f"  总步数: {args.total_timesteps}, 模式: {args.mode}")
 
+    # 包装环境
     vec_env = DummyVecEnv([lambda: Monitor(env)])
     vec_eval = DummyVecEnv([lambda: Monitor(eval_env)])
 
     eval_callback = EvalCallback(
         vec_eval, best_model_save_path=args.checkpoint_path,
-        log_path=args.checkpoint_path, eval_freq=args.eval_freq,
+        log_path=args.checkpoint_path, eval_freq=10000,
         deterministic=True, render=False,
     )
 
+    # 网络架构
     import torch.nn as nn
-    net_arch = parse_net_arch(args.net_arch)
     policy_kwargs = {
-        "net_arch": {"pi": net_arch, "vf": net_arch},
+        "net_arch": {"pi": [128, 128], "vf": [128, 128]},
         "activation_fn": nn.ReLU,
     }
 
-    # 学习率
-    if args.lr_decay:
-        from stable_baselines3.common.utils import get_linear_fn
-        lr = get_linear_fn(args.lr, 1e-5, 1.0)
-    else:
-        lr = args.lr
-
     model = algo_cls(
         "MlpPolicy", vec_env,
-        learning_rate=lr,
+        learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2 if args.algo == "ppo" else None,
-        ent_coef=args.ent_coef,
+        ent_coef=0.01,
         policy_kwargs=policy_kwargs,
         tensorboard_log=args.tensorboard_log,
         seed=args.seed,
         verbose=1,
     )
 
-    ts_name = f"{args.algo}_{mode}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
     try:
         model.learn(
             total_timesteps=args.total_timesteps,
             callback=eval_callback,
-            tb_log_name=f"mupc_{ts_name}",
+            tb_log_name=f"mupc_{args.algo}_{args.mode}_{datetime.datetime.now():%Y%m%d_%H%M%S}",
         )
-        checkpoint_path = os.path.join(args.checkpoint_path, f"final_model")
+        # 保存最终模型
+        checkpoint_path = os.path.join(args.checkpoint_path, "final_model")
         model.save(checkpoint_path)
-        print(f"  最终模型已保存: {checkpoint_path}.zip")
+        print(f"最终模型已保存: {checkpoint_path}.zip")
     except KeyboardInterrupt:
         checkpoint_path = os.path.join(args.checkpoint_path, "interrupted_model")
         model.save(checkpoint_path)
-        print(f"\n  训练中断, 模型已保存: {checkpoint_path}.zip")
+        print(f"\n训练中断, 模型已保存: {checkpoint_path}.zip")
         sys.exit(0)
 
 
 # ── NumPy PPO 训练 ────────────────────────────────────────────
 
-def _train_numpy_ppo(env, eval_env, args, obs_dim: int, mode: str):
+def _train_numpy_ppo(env, eval_env, args, obs_dim):
     from _ppo_core import NumPyPPO
 
     print(f"\n── NumPy PPO 训练 (SB3 不可用) ──")
-    print(f"  总步数: {args.total_timesteps}, 模式: {mode}")
+    print(f"  总步数: {args.total_timesteps}, 模式: {args.mode}")
 
-    model = NumPyPPO(env, obs_dim=obs_dim)
+    ppo_config = {}
+    if args.dual_mode:
+        ppo_config["dual_mode"] = True
+    model = NumPyPPO(env, obs_dim=obs_dim, config=ppo_config)
 
     try:
         log = model.learn(args.total_timesteps)
+        # 保存权重
         weights_path = os.path.join(args.checkpoint_path, "ppo_weights.npz")
         model.save_weights(weights_path)
-        print(f"  权重已保存: {weights_path}")
+        print(f"权重已保存: {weights_path}")
     except KeyboardInterrupt:
         weights_path = os.path.join(args.checkpoint_path, "ppo_weights_interrupted.npz")
         model.save_weights(weights_path)
-        print(f"\n  训练中断, 权重已保存: {weights_path}")
+        print(f"\n训练中断, 权重已保存: {weights_path}")
         sys.exit(0)
 
 
