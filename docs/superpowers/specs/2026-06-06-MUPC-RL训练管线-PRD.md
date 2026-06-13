@@ -2,11 +2,20 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.9 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
+| v2.8 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
+| v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
 **对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.6 (`[REVIEWED: PASS]`)
 
 ---
+
+> **v2.9 变更说明（v2.7/v2.8/v2.9 合并）：** 动态阻抗扰动（VoltageSimulator 每步对 k_p/k_q 加 ±10% 随机扰动）+ 3/5 次谐波注入（3%/2% 幅值）。通信延迟模拟（mupc_env FIFO 动作缓冲区 1~3 步延迟）。MODE-01 奖励函数新增主动弃光专项奖励（v_avg>=1.05 时，pv_limit 越低奖励越高，解决弃光悖论）。config 新增 CommConfig / voltage_simulator 谐波/阻抗漂移参数。
+
+> **v2.8 变更说明：** 修复 SOC 递推充放电效率因子（battery_charge/discharge_efficiency=0.90）。ONNX 导出包含完整归一化层（_normalize Bake 进模型）。PPO log_prob 统一在 pre-activation 空间计算（修复概率基准分布不匹配）。LSTM 预测输出加 ReLU 非负约束（PV/load>=0）。Rollout bootstrap 边界条件修复。grid2op_env 电池容量 200kWh→100kWh（运行时从配置读取）。VoltageSimulator K_Q 物理含义澄清。
+
+> **v2.7 变更说明：** ONNX 导出 act_dim 2→3（添加 a3 sigmoid pv_limit）。NumPy PPO 3 维动作全面支持 + tanh/sigmoid Jacobian 修正。NumPy PPO 反向传播硬编码 2 层→动态循环（支持任意 --net-arch）。V_DEAD→VOLTAGE_DEADBAND，window=4→DEMAND_WINDOW_STEPS 从配置读取。SMART-DS .npz 缓存机制。观测归一化逐元素 _minmax()→批量 _norm_slice() 向量化。
 
 > **v2.6 变更说明：** 对齐部署端 PRD v2.6。动作空间从 2 维恢复为 3 维（新增 pv_limit 光伏限功率比例，由 RL 主动弃光）。物理参数全面修正：电池最大充放电功率 500kW→50kW，电池容量 200kWh→100kWh，变压器容量 500kVA→200kVA，ACT-03 功率圆上限 500kVA→200kVA，load_shedding 上限 500kW→60kW。SCENE-01 新增 w6 电压变化斜率惩罚 R_slope = w6·|ΔV|。ACT-04（pv_limit ∈ [0,1]）约束规则恢复。
 >
