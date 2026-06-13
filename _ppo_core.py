@@ -277,7 +277,8 @@ class NumPyPPO:
         obs_dim = obs_dim or env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
 
-        self.policy = MLPPolicy(obs_dim=obs_dim, act_dim=act_dim)
+        dual_mode = self.cfg.get("dual_mode", False)
+        self.policy = MLPPolicy(obs_dim=obs_dim, act_dim=act_dim, dual_mode=dual_mode)
         self.opt_weights = MomentumSGD(lr=self.cfg["lr"])
         self.opt_log_std = MomentumSGD(lr=self.cfg["lr"])
 

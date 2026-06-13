@@ -76,6 +76,8 @@ def parse_args():
                    help="模型保存目录")
     p.add_argument("--no-lstm", action="store_true",
                    help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
+    p.add_argument("--dual-mode", action="store_true",
+                   help="启用双参数下垂控制模式（5维动作，v2.7）")
     p.add_argument("--lstm-checkpoint", type=str, default=None,
                    help="预训练 LSTM 模型路径")
     p.add_argument("--export-onnx", action="store_true",
@@ -266,7 +268,10 @@ def _train_numpy_ppo(env, eval_env, args, obs_dim):
     print(f"\n── NumPy PPO 训练 (SB3 不可用) ──")
     print(f"  总步数: {args.total_timesteps}, 模式: {args.mode}")
 
-    model = NumPyPPO(env, obs_dim=obs_dim)
+    ppo_config = {}
+    if args.dual_mode:
+        ppo_config["dual_mode"] = True
+    model = NumPyPPO(env, obs_dim=obs_dim, config=ppo_config)
 
     try:
         log = model.learn(args.total_timesteps)
