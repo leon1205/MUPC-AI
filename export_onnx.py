@@ -39,9 +39,15 @@ def _ensure_export_deps():
 
 # ── RL 策略导出模型 ────────────────────────────────────────────
 
-def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 2,
+def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 3,
                            hidden: list[int] | None = None):
-    """构建仅用于 ONNX 导出的策略网络壳。"""
+    """构建仅用于 ONNX 导出的策略网络壳。
+
+    Args:
+        obs_dim: 观测维度 (默认 58)
+        act_dim: 动作维度 (默认 3: [p_batt, load_shedding, pv_limit])
+        hidden: 隐藏层结构
+    """
     import torch
     import torch.nn as nn
 
@@ -62,10 +68,13 @@ def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 2,
         def forward(self, x):
             latent = self.shared(x)
             action = self.actor(latent)
-            # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
+            # A1: Tanh (p_batt, 范围 [-1,1])
+            # A2: Sigmoid (load_shedding, 范围 [0,1])
+            # A3: Sigmoid (pv_limit, 范围 [0,1])
             a1 = torch.tanh(action[:, :1])
-            a2 = torch.sigmoid(action[:, 1:])
-            return torch.cat([a1, a2], dim=-1)
+            a2 = torch.sigmoid(action[:, 1:2])
+            a3 = torch.sigmoid(action[:, 2:3])
+            return torch.cat([a1, a2, a3], dim=-1)
 
     return RLExportModel()
 

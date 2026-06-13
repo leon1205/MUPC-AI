@@ -30,6 +30,19 @@ except ImportError:
 from action_validator import ActionValidator
 
 
+def _norm_slice(x: np.ndarray, lo: float | np.ndarray,
+               hi: float | np.ndarray) -> np.ndarray:
+    """向量化 MinMax 归一化，支持标量/数组广播。
+
+    Args:
+        x: 输入数组（任意 shape）
+        lo: 下界（标量或与 x shape 相同的数组）
+        hi: 上界（标量或与 x shape 相同的数组）
+    """
+    clipped = np.clip(x, lo, hi)
+    return ((clipped - lo) / (hi - lo + 1e-9)).astype(np.float32)
+
+
 def _cfg():
     """懒加载配置（支持无 --config 时的硬编码回退）。"""
     from config.config_manager import get_config
@@ -59,6 +72,7 @@ LOAD_PF = _c.time.load_pf
 CONTRACT_DEMAND_KW = _c.contract.contract_demand_kw
 GRID_EMISSION_FACTOR = _c.contract.grid_emission_factor
 EPISODE_LENGTH = _c.time.episode_length
+DEMAND_WINDOW_STEPS = _c.time.demand_window_steps
 
 # ── v2.5 奖励阈值配置 ─────────────────────────────────────────
 # 对齐 MUPC AI 引擎 PRD v2.5 RewardThresholdConfig
@@ -434,15 +448,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         delta_v = abs(v_avg - self._prev_v_avg)
 
         # 8. 电压越限计数器 (死区: ±5%, [0.95, 1.05])
-        V_DEAD = 0.05
-        if abs(v_avg - 1.0) > V_DEAD:
+        if abs(v_avg - 1.0) > VOLTAGE_DEADBAND:
             self._voltage_violation_count += 1
         else:
             self._voltage_violation_count = 0  # 恢复正常则重置
 
         # 9. 需量更新 (1 小时滑动窗口)
-        window = 4
-        demand_start = max(0, self._step_idx - window + 1)
+        demand_start = max(0, self._step_idx - DEMAND_WINDOW_STEPS + 1)
         demand_slice = self._data["load_power"][demand_start:self._step_idx + 1]
         current_demand = max(float(np.mean(demand_slice)), CONTRACT_DEMAND_KW * 0.3)
         peak_demand = max(self._peak_demand, current_demand)
@@ -620,56 +632,31 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         return obs.astype(np.float32)
 
     def _normalize_obs(self, obs: np.ndarray, params: dict) -> np.ndarray:
-        """应用 MinMax 归一化 (v2.5: 56维)。"""
+        """应用 MinMax 归一化 (v2.5: 58/59维) — 向量化版本。"""
         out = obs.copy()
         # D1 [0..9]
-        out[0] = obs[0]  # SOC: identity
-        out[1] = self._minmax(obs[1], 0.0, PV_ARRAY_KW)
-        out[2] = self._minmax(obs[2], 0.0, LOAD_PEAK_KW)
-        out[3] = self._minmax(obs[3], -500.0, 500.0)
-        out[4] = obs[4]  # transformer_load: identity
-        out[5] = self._minmax(obs[5], -500.0, 500.0)
-        out[6] = self._minmax(obs[6], 0.85, 1.15)
-        out[7] = self._minmax(obs[7], 0.85, 1.15)
-        out[8] = self._minmax(obs[8], 0.85, 1.15)
-        out[9] = obs[9]  # q_realtime_margin: identity [0,1]
-        # D2 pv [10..24] (15维，索引 10-24，out[10:25] 包含 10-24)
-        out[10:25] = self._minmax(obs[10:25], 0.0, PV_ARRAY_KW)
-        # D2 load [25..39] (15维，索引 25-39) — 修正：原为 [26:41] 错误偏移了1位
-        out[25:40] = self._minmax(obs[25:40], 0.0, LOAD_PEAK_KW)
-        # D3 [41..43]
-        out[41] = self._minmax(obs[41], 0.0, 1.5)
-        out[42] = self._minmax(obs[42], 0.0, 1.5)
-        out[43] = self._minmax(obs[43], 0.0, 3.0)
-        # D4 [44..46]
-        out[44] = self._minmax(obs[44], 0.0, 500.0)
-        out[45] = self._minmax(obs[45], 0.0, 500.0)
-        out[46] = self._minmax(obs[46], 0.0, 500.0)
-        # D5 [47..48]
-        out[47] = self._minmax(obs[47], 0.0, 1500.0)
-        out[48] = self._minmax(obs[48], -20.0, 60.0)
-        # D6 [49]
-        out[49] = self._minmax(obs[49], -500.0, 500.0)
-        # D7 [50] q_realtime_margin: identity
-        out[50] = obs[50]
-        # D7 [51..56] season_encoding: one-hot, identity
-        # D7 [57] time_period: binary, identity
-        # mode_id [58]: identity
+        out[1:2] = _norm_slice(obs[1:2], 0.0, PV_ARRAY_KW)
+        out[2:3] = _norm_slice(obs[2:3], 0.0, LOAD_PEAK_KW)
+        out[3:4] = _norm_slice(obs[3:4], -500.0, 500.0)
+        out[5:6] = _norm_slice(obs[5:6], -500.0, 500.0)
+        out[6:9] = _norm_slice(obs[6:9], 0.85, 1.15)
+        # D2 pv [10..24] (15维) — 批量
+        out[10:25] = _norm_slice(obs[10:25], 0.0, PV_ARRAY_KW)
+        # D2 load [25..39] (15维) — 批量
+        out[25:40] = _norm_slice(obs[25:40], 0.0, LOAD_PEAK_KW)
+        # D3 电价 [41..43]
+        out[41:43] = _norm_slice(obs[41:43], 0.0, 1.5)
+        out[43:44] = _norm_slice(obs[43:44], 0.0, 3.0)
+        # D4 需量 [44..46] — 批量
+        out[44:47] = _norm_slice(obs[44:47], 0.0, 500.0)
+        # D5 气象 [47..48] — 批量（不同范围）
+        out[47:49] = _norm_slice(obs[47:49],
+                                  np.array([0.0, -20.0]),
+                                  np.array([1500.0, 60.0]))
+        # D6 调度 [49]
+        out[49:50] = _norm_slice(obs[49:50], -500.0, 500.0)
+        # [0,4,9,50,51..57,(58)] 保持 identity（原值）
         return out
-
-    @staticmethod
-    def _minmax(x, lo, hi):
-        """MinMax 归一化, 支持标量和数组。"""
-        clipped = np.clip(x, lo, hi)
-        result = (clipped - lo) / (hi - lo + 1e-9)
-        if np.isscalar(x):
-            return float(result)
-        return result.astype(np.float32)
-
-    @staticmethod
-    def _minmax_scalar(x, lo, hi) -> float:
-        """标量 MinMax 归一化。"""
-        return float((np.clip(float(x), lo, hi) - lo) / (hi - lo + 1e-9))
 
     # ── 奖励函数 ────────────────────────────────────────
 

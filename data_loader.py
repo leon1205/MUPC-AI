@@ -86,8 +86,16 @@ class SmartDSLoader:
 
     # ── 主加载入口 ──────────────────────────────────────
 
+    def _cache_path(self) -> Path:
+        """返回 SMART-DS 数据缓存路径。"""
+        cache_dir = self.data_dir / ".cache"
+        return cache_dir / "smartds_data.npz"
+
     def load_all(self) -> dict[str, np.ndarray]:
         """加载全部数据并合成缺失字段。
+
+        支持 .npz 缓存：若缓存文件存在则直接加载，否则计算后缓存。
+        缓存失效条件：光伏/负荷文件修改时间晚于缓存文件。
 
         Returns keys:
             D1: pv_power, load_power, grid_power, transformer_load,
@@ -101,6 +109,25 @@ class SmartDSLoader:
             + 辅助: timestamps, hour_encoded
             + norm_params: 归一化参数 dict
         """
+        cache_path = self._cache_path()
+        if cache_path.exists():
+            # 检查缓存是否过期（文件修改时间对比）
+            cache_mtime = cache_path.stat().st_mtime
+            solar_dir = self.data_dir / "solar"
+            load_dir = self.data_dir / "load_profiles"
+            newest_data = 0.0
+            for d in [solar_dir, load_dir]:
+                for fp in d.rglob("*.csv"):
+                    newest_data = max(newest_data, fp.stat().st_mtime)
+            if newest_data <= cache_mtime:
+                print(f"[CACHE] 命中缓存: {cache_path} (数据未过期)")
+                data = dict(np.load(cache_path, allow_pickle=True))
+                data["norm_params"] = data["norm_params"].item()
+                self._print_summary(data)
+                return data
+            else:
+                print("[CACHE] 缓存过期，重新计算")
+
         print("=" * 56)
         print("  SMART-DS 数据加载与状态合成")
         print("=" * 56)
@@ -161,6 +188,14 @@ class SmartDSLoader:
 
         # 打印摘要
         self._print_summary(result)
+
+        # 保存缓存
+        cache_dir = cache_path.parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        save_dict = {k: v for k, v in result.items() if k != "norm_params"}
+        save_dict["norm_params"] = result["norm_params"]  # dict, not np.array
+        np.savez(cache_path, **save_dict)
+        print(f"[CACHE] 已缓存: {cache_path}")
         return result
 
     def split(self, data: dict, train_ratio: float = 0.8

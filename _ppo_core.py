@@ -79,10 +79,13 @@ class MLPPolicy:
         """前向传播 → (action_mean, value)。"""
         latent = self._forward_shared(obs)  # (batch, 128)
         action_mean = latent @ self.weights["actor_w"] + self.weights["actor_b"]
-        # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
+        # A1: Tanh (p_batt, 范围 [-1,1])
+        # A2: Sigmoid (load_shedding, 范围 [0,1])
+        # A3: Sigmoid (pv_limit, 范围 [0,1])
         a1 = np.tanh(action_mean[:, :1])
-        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))  # sigmoid
-        action = np.concatenate([a1, a2], axis=-1)
+        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:2]))  # sigmoid
+        a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))  # sigmoid (pv_limit)
+        action = np.concatenate([a1, a2, a3], axis=-1)
         value = latent @ self.weights["critic_w"] + self.weights["critic_b"]
         return action, value.ravel()
 
@@ -102,11 +105,12 @@ class MLPPolicy:
         else:
             noise = np.random.randn(self.act_dim) * std
 
-        # 混合激活: A1=Tanh(p_batt), A2=Sigmoid(load_shedding)
+        # 混合激活: A1=Tanh(p_batt), A2=Sigmoid(load_shedding), A3=Sigmoid(pv_limit)
         am = action_mean  # (act_dim,)
         a1 = np.tanh(am[:1] + noise[:1])  # both (1,)
-        a2 = 1.0 / (1.0 + np.exp(-(am[1:] + noise[1:])))  # both (1,)
-        action = np.concatenate([a1, a2])
+        a2 = 1.0 / (1.0 + np.exp(-(am[1:2] + noise[1:2])))  # sigmoid (1,)
+        a3 = 1.0 / (1.0 + np.exp(-(am[2:3] + noise[2:3])))  # sigmoid (1,)
+        action = np.concatenate([a1, a2, a3])
 
         # 对数概率 (忽略 Tanh/Sigmoid 内部的 Jacobian 修正, 简化版)
         log_prob = -0.5 * np.sum((noise / std) ** 2 + 2.0 * np.log(std) + np.log(2 * np.pi))
@@ -332,16 +336,36 @@ class NumPyPPO:
         # 前向
         latent = self.policy._forward_shared(obs)
         action_mean = latent @ self.policy.weights["actor_w"] + self.policy.weights["actor_b"]
+        # A1: Tanh (p_batt), A2: Sigmoid (load_shedding), A3: Sigmoid (pv_limit)
         a1 = np.tanh(action_mean[:, :1])
-        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))
-        new_actions = np.concatenate([a1, a2], axis=-1)
+        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:2]))
+        a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))
+        new_actions = np.concatenate([a1, a2, a3], axis=-1)
         new_values = (latent @ self.policy.weights["critic_w"]
                       + self.policy.weights["critic_b"]).ravel()
 
-        # 简化 log_prob (用 MSE 代理 ratio)
-        # 实际 ratio ≈ exp(-0.5 * (new - old)² / σ²) 但简化用 action 距离
-        action_diff = new_actions - old_actions
-        new_logp = -0.5 * np.sum((action_diff / np.exp(self.policy.log_std)) ** 2, axis=-1)
+        # 正确的 log_prob: tanh/sigmoid Jacobian 修正
+        # A1 (tanh): log|dz/da| = -log(1 - a²)
+        # A2/A3 (sigmoid): log|dz/da| = -log(a(1-a))
+        eps = 1e-7
+        log_jac_a1 = np.log(1e-8 + 1.0 - old_actions[:, :1] ** 2)
+        log_jac_a2 = np.log(eps + old_actions[:, 1:2]) + np.log(eps + 1.0 - old_actions[:, 1:2])
+        log_jac_a3 = np.log(eps + old_actions[:, 2:3]) + np.log(eps + 1.0 - old_actions[:, 2:3])
+        log_jac = log_jac_a1 + log_jac_a2 + log_jac_a3
+
+        # 预激活值（用于计算 Gaussian log_prob）
+        a_raw = np.zeros_like(old_actions)
+        a_raw[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -0.999999, 0.999999))
+        a_raw[:, 1:2] = np.log(np.clip(old_actions[:, 1:2], eps, 1 - eps) /
+                               (1.0 - np.clip(old_actions[:, 1:2], eps, 1 - eps)))
+        a_raw[:, 2:3] = np.log(np.clip(old_actions[:, 2:3], eps, 1 - eps) /
+                               (1.0 - np.clip(old_actions[:, 2:3], eps, 1 - eps)))
+
+        std = np.exp(self.policy.log_std)
+        sigma2 = std ** 2
+        new_logp = -0.5 * np.sum((a_raw - action_mean) ** 2 / sigma2, axis=-1) \
+                  - 0.5 * np.sum(np.log(2 * np.pi * sigma2), axis=-1) \
+                  + log_jac.ravel()
 
         # ratio
         ratio = np.exp(np.clip(new_logp - old_logp, -10, 10))
@@ -354,8 +378,7 @@ class NumPyPPO:
         actor_loss = -np.mean(np.minimum(loss_a1, loss_a2))
 
         # Entropy bonus
-        std = np.exp(self.policy.log_std)
-        entropy = np.mean(np.sum(np.log(std) + 0.5 * np.log(2 * np.pi * np.e)))
+        entropy = np.mean(np.sum(np.log(std + 1e-8) + 0.5 * np.log(2 * np.pi * np.e)))
 
         # Critic loss (MSE)
         critic_loss = np.mean((returns - new_values) ** 2)
@@ -363,22 +386,11 @@ class NumPyPPO:
         total_loss = actor_loss + cfg["vf_coef"] * critic_loss - cfg["ent_coef"] * entropy
 
         # ── 解析梯度计算 ──
-        # Policy gradient: dL/dμ = ratio * advantage * (a_raw_old - μ) / σ²
-        # where a_raw_old is the pre-activation action from the old policy
-
-        std = np.exp(self.policy.log_std)  # (4,)
-        sigma2 = std ** 2
-
-        # Invert activation to get old pre-activation action
-        a_raw_old = np.zeros_like(old_actions)
-        # A1: tanh → atanh, A2: sigmoid → logit
-        eps = 0.999999
-        a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
-        a_raw_old[:, 1:] = np.log(np.clip(old_actions[:, 1:], 1e-7, 1-1e-7) /
-                                   (1.0 - np.clip(old_actions[:, 1:], 1e-7, 1-1e-7)))
+        # Policy gradient: dL/dμ = ratio * advantage * (a_raw - μ) / σ²
+        # where a_raw is the pre-activation action
 
         # Gradient of log_prob w.r.t. action_mean = (a_raw - μ) / σ²
-        dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean) / sigma2
+        dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw - action_mean) / sigma2
         dL_dmu = -dL_dmu / len(obs)  # negative because we maximize, and average
 
         # ── Backprop through actor head ──
@@ -401,35 +413,26 @@ class NumPyPPO:
         # Gradient from actor head into last hidden layer
         dL_dh = dL_dmu @ self.policy.weights["actor_w"].T  # (batch, hidden[-1])
 
-        # Backprop through fc2
-        dL_dh = dL_dh * (pre_acts[-1] > 0)  # ReLU backward
-        grad_fc2_w = post_acts[-2].T @ dL_dh
-        grad_fc2_b = dL_dh.sum(axis=0)
+        # ── Backprop through shared layers (动态循环，支持任意层数) ──
+        grads = {}
+        for key in self.policy.weights:
+            grads[key] = np.zeros_like(self.policy.weights[key])
 
-        # Backprop through fc1
-        dL_dx = dL_dh @ self.policy.weights[f"fc2_w"].T
-        dL_dx = dL_dx * (pre_acts[-2] > 0)  # ReLU backward
-        grad_fc1_w = post_acts[-3].T @ dL_dx
-        grad_fc1_b = dL_dx.sum(axis=0)
+        # 从后向前反向传播
+        dL_dh_cur = dL_dh * (pre_acts[-1] > 0)  # ReLU backward at last layer
+        for i in range(n_layers, 0, -1):
+            grad_fc_w = post_acts[i - 1].T @ dL_dh_cur
+            grad_fc_b = dL_dh_cur.sum(axis=0)
+            grads[f"fc{i}_w"] = grad_fc_w
+            grads[f"fc{i}_b"] = grad_fc_b
+            if i > 1:
+                dL_dh_cur = dL_dh_cur @ self.policy.weights[f"fc{i}_w"].T
+                dL_dh_cur = dL_dh_cur * (pre_acts[i - 2] > 0)  # ReLU backward
 
         # ── Critic gradient ──
         value_diff = (returns - new_values).reshape(-1, 1)
         grad_critic_w = latent.T @ value_diff / len(obs)
         grad_critic_b = value_diff.mean(axis=0)
-
-        # ── Assemble gradients ──
-        grads = {}
-        for key in self.policy.weights:
-            grads[key] = np.zeros_like(self.policy.weights[key])
-
-        grads["fc1_w"] = grad_fc1_w
-        grads["fc1_b"] = grad_fc1_b
-        grads["fc2_w"] = grad_fc2_w
-        grads["fc2_b"] = grad_fc2_b
-        grads["actor_w"] = grad_actor_w
-        grads["actor_b"] = grad_actor_b
-        grads["critic_w"] = cfg["vf_coef"] * grad_critic_w
-        grads["critic_b"] = cfg["vf_coef"] * grad_critic_b
 
         # ── Gradient clipping ──
         total_norm = np.sqrt(sum(np.sum(g ** 2) for g in grads.values()))
@@ -443,7 +446,7 @@ class NumPyPPO:
 
         # Update log_std
         dL_dsigma = (ratio.reshape(-1, 1) * advantages.reshape(-1, 1) *
-                     ((a_raw_old - action_mean) ** 2 / sigma2 - 1.0)).sum(axis=0) / len(obs)
+                     ((a_raw - action_mean) ** 2 / sigma2 - 1.0)).sum(axis=0) / len(obs)
         self.opt_log_std.step_scalar("log_std", self.policy.log_std, -dL_dsigma)
 
         return float(actor_loss), float(critic_loss)

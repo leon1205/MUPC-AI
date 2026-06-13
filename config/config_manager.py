@@ -48,6 +48,7 @@ class TimeConfig:
     dt_hours: float = 0.25
     episode_length: int = 96
     load_pf: float = 0.90
+    demand_window_steps: int = 4  # 需量滑动窗口步数（4步×15分钟=1小时）
 
 
 @dataclass
