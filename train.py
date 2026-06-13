@@ -158,10 +158,21 @@ def main():
     custom_weights = parse_custom_weights(args.reward_weights)
 
     from mupc_env import MupcEnv
-    env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
-                   reward_weights=custom_weights if custom_weights else None)
-    eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
-                        reward_weights=custom_weights if custom_weights else None)
+    if args.dual_mode:
+        from config.config_manager import get_config
+        cfg = get_config()
+        cfg.dual_control.enabled = True
+        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                      config=cfg,
+                      reward_weights=custom_weights if custom_weights else None)
+        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                           config=cfg,
+                           reward_weights=custom_weights if custom_weights else None)
+    else:
+        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                      reward_weights=custom_weights if custom_weights else None)
+        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                           reward_weights=custom_weights if custom_weights else None)
 
     obs_dim = env.observation_space.shape[0]
     print(f"  观测空间: Box({obs_dim},)")
