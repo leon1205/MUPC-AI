@@ -29,21 +29,32 @@ def _ortho_init(shape: tuple, scale: float = 1.0) -> np.ndarray:
 
 
 class MLPPolicy:
-    """2 层 MLP → actor(4维混合输出) + critic(1维)。
+    """2 层 MLP → actor(混合输出) + critic(1维)。
 
     网络结构:
       Input(obs_dim) → Linear(128) → ReLU → Linear(128) → ReLU
-                        ├── actor:  Linear(2) → [Tanh(:1), Sigmoid(1:)]
+                        ├── actor:  Linear(act_dim) → [Tanh(:1), Sigmoid(1:)]
                         └── critic: Linear(1)
+
+    dual_mode=False (标准模式):
+      3维动作: [p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)]
+    dual_mode=True (双参数模式):
+      5维动作: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
     """
 
     def __init__(self, obs_dim: int = 58, hidden: list[int] | None = None,
-                 act_dim: int = 2):
+                 act_dim: int = 2, dual_mode: bool = False):
         if hidden is None:
             hidden = [128, 128]
         self.obs_dim = obs_dim
         self.hidden = hidden
-        self.act_dim = act_dim
+        self.dual_mode = dual_mode
+
+        # 根据 dual_mode 设置 act_dim
+        if dual_mode:
+            self.act_dim = 5
+        else:
+            self.act_dim = 3
 
         # 权重初始化
         self.weights: dict[str, np.ndarray] = {}
@@ -55,10 +66,10 @@ class MLPPolicy:
 
         # Actor head
         last_h = hidden[-1]
-        self.weights["actor_w"] = _ortho_init((last_h, act_dim), 0.01)
-        self.weights["actor_b"] = np.zeros(act_dim, dtype=np.float32)
+        self.weights["actor_w"] = _ortho_init((last_h, self.act_dim), 0.01)
+        self.weights["actor_b"] = np.zeros(self.act_dim, dtype=np.float32)
         # 可学习 log_std
-        self.log_std = np.full(act_dim, -0.5, dtype=np.float32)
+        self.log_std = np.full(self.act_dim, -0.5, dtype=np.float32)
 
         # Critic head
         self.weights["critic_w"] = _ortho_init((last_h, 1), 1.0)
@@ -79,10 +90,22 @@ class MLPPolicy:
         """前向传播 → (action_mean, value)。"""
         latent = self._forward_shared(obs)  # (batch, 128)
         action_mean = latent @ self.weights["actor_w"] + self.weights["actor_b"]
-        # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
-        a1 = np.tanh(action_mean[:, :1])
-        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))  # sigmoid
-        action = np.concatenate([a1, a2], axis=-1)
+
+        if self.dual_mode:
+            # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
+            a1 = np.tanh(action_mean[:, :1])        # p_ref: [-1, 1]
+            a2 = np.tanh(action_mean[:, 1:2])        # k_droop: [-1, 1] → 后续 clamp
+            a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))  # sigmoid
+            a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 3:4]))  # sigmoid
+            a5 = 1.0 / (1.0 + np.exp(-action_mean[:, 4:5]))  # sigmoid
+            action = np.concatenate([a1, a2, a3, a4, a5], axis=-1)
+        else:
+            # 3 维: [p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)]
+            a1 = np.tanh(action_mean[:, :1])
+            a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:2]))
+            a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))
+            action = np.concatenate([a1, a2, a3], axis=-1)
+
         value = latent @ self.weights["critic_w"] + self.weights["critic_b"]
         return action, value.ravel()
 
@@ -91,26 +114,49 @@ class MLPPolicy:
         """采样动作。
 
         Returns:
-            (action_2d, value_scalar, log_prob_scalar)
+            (action, value_scalar, log_prob_scalar)
         """
         latent = self._forward_shared(obs[np.newaxis, :])  # (1, 128)
         action_mean = (latent @ self.weights["actor_w"] + self.weights["actor_b"]).ravel()
 
         std = np.exp(self.log_std)
         if deterministic:
-            noise = np.zeros(self.act_dim)
+            a_raw = action_mean.copy()
         else:
-            noise = np.random.randn(self.act_dim) * std
+            a_raw = action_mean + np.random.randn(self.act_dim) * std
 
-        # 混合激活: A1=Tanh(p_batt), A2=Sigmoid(load_shedding)
-        am = action_mean  # (act_dim,)
-        a1 = np.tanh(am[:1] + noise[:1])  # both (1,)
-        a2 = 1.0 / (1.0 + np.exp(-(am[1:] + noise[1:])))  # both (1,)
-        action = np.concatenate([a1, a2])
+        if self.dual_mode:
+            # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
+            a1 = np.tanh(a_raw[:1])
+            a2 = np.tanh(a_raw[1:2])
+            a3 = 1.0 / (1.0 + np.exp(-a_raw[2:3]))
+            a4 = 1.0 / (1.0 + np.exp(-a_raw[3:4]))
+            a5 = 1.0 / (1.0 + np.exp(-a_raw[4:5]))
+            action = np.concatenate([a1, a2, a3, a4, a5])
+            # log_prob Jacobian for 5 dims (action is 1D, reshape to 2D for indexing)
+            action_2d = action.reshape(1, -1)
+            eps = 1e-7
+            log_jac = (np.log(eps + 1.0 - action_2d[:, :1] ** 2).ravel() +
+                       np.log(eps + 1.0 - action_2d[:, 1:2] ** 2).ravel() +
+                       np.log(eps + action_2d[:, 2:3]) + np.log(eps + 1.0 - action_2d[:, 2:3]) +
+                       np.log(eps + action_2d[:, 3:4]) + np.log(eps + 1.0 - action_2d[:, 3:4]) +
+                       np.log(eps + action_2d[:, 4:5]) + np.log(eps + 1.0 - action_2d[:, 4:5]))
+        else:
+            # 3 维: [p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)]
+            a1 = np.tanh(a_raw[:1])
+            a2 = 1.0 / (1.0 + np.exp(-a_raw[1:2]))
+            a3 = 1.0 / (1.0 + np.exp(-a_raw[2:3]))
+            action = np.concatenate([a1, a2, a3])
+            action_2d = action.reshape(1, -1)
+            eps = 1e-7
+            log_jac = (np.log(eps + 1.0 - action_2d[:, :1] ** 2).ravel() +
+                       np.log(eps + action_2d[:, 1:2]) + np.log(eps + 1.0 - action_2d[:, 1:2]) +
+                       np.log(eps + action_2d[:, 2:3]) + np.log(eps + 1.0 - action_2d[:, 2:3]))
 
-        # 对数概率 (忽略 Tanh/Sigmoid 内部的 Jacobian 修正, 简化版)
-        log_prob = -0.5 * np.sum((noise / std) ** 2 + 2.0 * np.log(std) + np.log(2 * np.pi))
-        log_prob = float(np.clip(log_prob, -20.0, 20.0))
+        # Gaussian log_prob + Jacobian correction
+        sigma2 = std ** 2
+        log_gauss = -0.5 * np.sum((a_raw - action_mean) ** 2 / sigma2 + np.log(2 * np.pi * sigma2))
+        log_prob = float(np.clip(log_gauss + log_jac.sum(), -20.0, 20.0))
 
         value = float((latent @ self.weights["critic_w"] + self.weights["critic_b"]).ravel()[0])
         return action, value, log_prob
@@ -332,9 +378,22 @@ class NumPyPPO:
         # 前向
         latent = self.policy._forward_shared(obs)
         action_mean = latent @ self.policy.weights["actor_w"] + self.policy.weights["actor_b"]
-        a1 = np.tanh(action_mean[:, :1])
-        a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:]))
-        new_actions = np.concatenate([a1, a2], axis=-1)
+
+        if self.policy.dual_mode:
+            # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
+            a1 = np.tanh(action_mean[:, :1])        # p_ref
+            a2 = np.tanh(action_mean[:, 1:2])        # k_droop
+            a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))  # load_shedding
+            a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 3:4]))  # pv_limit
+            a5 = 1.0 / (1.0 + np.exp(-action_mean[:, 4:5]))  # confidence
+            new_actions = np.concatenate([a1, a2, a3, a4, a5], axis=-1)
+        else:
+            # 3 维: [p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)]
+            a1 = np.tanh(action_mean[:, :1])
+            a2 = 1.0 / (1.0 + np.exp(-action_mean[:, 1:2]))
+            a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))
+            new_actions = np.concatenate([a1, a2, a3], axis=-1)
+
         new_values = (latent @ self.policy.weights["critic_w"]
                       + self.policy.weights["critic_b"]).ravel()
 
@@ -371,11 +430,24 @@ class NumPyPPO:
 
         # Invert activation to get old pre-activation action
         a_raw_old = np.zeros_like(old_actions)
-        # A1: tanh → atanh, A2: sigmoid → logit
         eps = 0.999999
-        a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
-        a_raw_old[:, 1:] = np.log(np.clip(old_actions[:, 1:], 1e-7, 1-1e-7) /
-                                   (1.0 - np.clip(old_actions[:, 1:], 1e-7, 1-1e-7)))
+        if self.policy.dual_mode:
+            # 5 维: a1,a2=tanh → atanh, a3,a4,a5=sigmoid → logit
+            a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
+            a_raw_old[:, 1:2] = np.arctanh(np.clip(old_actions[:, 1:2], -eps, eps))
+            a_raw_old[:, 2:3] = np.log(np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7) /
+                                        (1.0 - np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7)))
+            a_raw_old[:, 3:4] = np.log(np.clip(old_actions[:, 3:4], 1e-7, 1-1e-7) /
+                                        (1.0 - np.clip(old_actions[:, 3:4], 1e-7, 1-1e-7)))
+            a_raw_old[:, 4:5] = np.log(np.clip(old_actions[:, 4:5], 1e-7, 1-1e-7) /
+                                        (1.0 - np.clip(old_actions[:, 4:5], 1e-7, 1-1e-7)))
+        else:
+            # 3 维: a1=tanh → atanh, a2,a3=sigmoid → logit
+            a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
+            a_raw_old[:, 1:2] = np.log(np.clip(old_actions[:, 1:2], 1e-7, 1-1e-7) /
+                                        (1.0 - np.clip(old_actions[:, 1:2], 1e-7, 1-1e-7)))
+            a_raw_old[:, 2:3] = np.log(np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7) /
+                                        (1.0 - np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7)))
 
         # Gradient of log_prob w.r.t. action_mean = (a_raw - μ) / σ²
         dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean) / sigma2
