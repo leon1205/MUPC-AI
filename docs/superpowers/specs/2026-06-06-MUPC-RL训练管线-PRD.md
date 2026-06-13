@@ -2,12 +2,14 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
-| v2.2 | 2026-06-08 | 需求分析师 | **[REVIEWED: PASS]** |
+| v2.3 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 
 **对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.5 (`[REVIEWED: PASS]`)
 
 ---
 
+> **v2.3 变更说明：** 新增下垂模式（v2.7 双参数动作空间）。当 `config.dual_control.enabled=true` 时，RL 输出 5 维动作（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit, A5: confidence），执行器根据下垂公式计算最终功率 P_output = P_ref + k_droop × ΔV。
+>
 > **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
 >
 > **v2.1 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
@@ -209,6 +211,25 @@ V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
 | 1 | load_shedding | [0, 1] → [0, 500] kW | kW | 可中断负荷切除量（RL 控制） |
 
 > **v2.4 分层控制架构：** Q 控制（q_batt_set）和 pv_limit 由 MUPC 实时控制核心模块根据电压闭环调节，不经过 RL。RL 专注能量管理（P_batt + Load_shedding），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
+
+**下垂模式（5维，v2.7新增）**
+
+当 `config.dual_control.enabled=true` 时启用，RL 输出 5 维动作：
+
+| 维度 | 字段 | 范围 | 说明 |
+|------|------|------|------|
+| A1 | P_ref | [-50, 50] kW | 有功功率基准点 |
+| A2 | k_droop | [k_min, k_max] kW/V | 电压-有功下垂系数 |
+| A3 | load_shedding | [0, 60] kW | 可中断负荷切除量 |
+| A4 | pv_limit | [0, 1] | 光伏限功率比例 |
+| A5 | confidence | [0, 1] | 决策置信度 |
+
+执行器根据下垂公式计算最终功率：P_output = P_ref + k_droop × ΔV
+
+**配置参数：**
+- `dual_control.enabled`: 启用/禁用下垂模式
+- `dual_control.k_droop_min/max`: 下垂系数范围
+- `dual_control.p_ref_ramp_limit_kw`: P_ref 变化率限制
 
 **核心物理方程**：
 
@@ -525,6 +546,14 @@ MUPC-AI2/
 | 3 | 负荷预测区分基荷/可调负荷/冲击负荷三类，训练数据如何标注？SMART-DS 不含此分类 | 高 | 影响 LSTM 训练数据准备 |
 
 ---
+
+## v2.3 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 新增下垂模式 5 维动作空间 | 文档头部/3.3 | 当 `dual_control.enabled=true` 时启用 RL 5 维输出（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit, A5: confidence），执行器按 P_output = P_ref + k_droop × ΔV 计算最终功率 |
+
+**修订依据：** MUPC AI v2.7 双参数下垂控制训练管线
 
 ## v2.2 修订记录
 
