@@ -140,18 +140,23 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
     def __init__(self, data: dict, mode: str = "all",
                  lstm_predictor: Any = None,
-                 reward_weights: dict[str, list[float]] | None = None):
+                 reward_weights: dict[str, list[float]] | None = None,
+                 config: Any = None):
         """
         Args:
             data: SmartDSLoader 返回的 data dict
             mode: "all" (多模式) 或 "MODE-01"~"MODE-05" (单模式)
             lstm_predictor: LSTM 模型 (有 predict(step_idx)→(30,) 接口) 或 None→Oracle
             reward_weights: 自定义权重, e.g. {"MODE-01": [1.5, 0.3, 3.0]}
+            config: MupcConfig 配置对象，None 则使用硬编码默认值
         """
         self._data = data
         self._mode = mode
         self._data_len = data["n_steps"]
         self._weights = {**DEFAULT_WEIGHTS, **(reward_weights or {})}
+
+        # v2.7 配置支持
+        self._cfg = config
 
         # LSTM 预测器 / Oracle
         if lstm_predictor is not None:
@@ -172,10 +177,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # 动作: [p_batt_norm, load_shed_norm] (2维)
-        # Q_batt 由实时电压调节器闭环控制，不经过 RL
-        low_act = np.array([-1.0, 0.0], dtype=np.float32)
-        high_act = np.array([1.0, 1.0], dtype=np.float32)
+        # v2.7 下垂模式检测
+        self._dual_mode = False
+        if config is not None and getattr(config.dual_control, 'enabled', False):
+            self._dual_mode = True
+            # 5 维: [p_ref_norm, k_droop_norm, load_shed_norm, pv_limit_norm]
+            low_act = np.array([-1.0, -1.0, 0.0, 0.0], dtype=np.float32)
+            high_act = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        else:
+            # 3 维: [p_batt_norm, load_shed_norm, pv_limit_norm] (保留 pv_limit 动作)
+            low_act = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+            high_act = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # 内部状态
@@ -280,26 +292,48 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # v2.5: 更新季节时段编码 (每小时更新一次即可，这里每步更新)
         self._update_season_time_encoding()
 
-        # 2. 动作约束校验 (ACT-01/03/05)
+        # 2. 动作约束校验
         dispatch_p = self._data["dispatch_p_set"][self._step_idx]
         if abs(dispatch_p) < 1e-6:
             dispatch_p_use = None
         else:
             dispatch_p_use = float(dispatch_p)
-        clamped, violated, violations = self._validator.validate(
-            action, dispatch_p_use, q_batt_real=q_batt)
 
-        # 3. 反归一化动作到物理值 (2维: P_batt + Load_shedding)
-        p_batt = clamped[0] * P_BATT_MAX_KW
-        load_shed = clamped[1] * LOAD_SHED_MAX_KW
-        # Q_batt 已在上方计算，由实时电压调节器闭环给出
-        # pv_limit 不再作为动作维度，光伏限功率由 Q 调节替代
+        if self._dual_mode:
+            # v2.7 双参数模式: 使用 DualActionValidator
+            from action_validator import DualActionValidator
+            dual_validator = DualActionValidator(
+                p_batt_max=P_BATT_MAX_KW,
+                k_droop_min=self._cfg.dual_control.k_droop_min,
+                k_droop_max=self._cfg.dual_control.k_droop_max,
+                p_ref_ramp_limit_kw=self._cfg.dual_control.p_ref_ramp_limit_kw,
+                load_shed_max=LOAD_SHED_MAX_KW,
+                pv_limit_min=self._cfg.dual_control.pv_limit_min,
+            )
+            clamped_dual, violated, violations = dual_validator.validate(
+                action, dispatch_p_use, is_anti_reverse=False)
+            p_ref = clamped_dual[0] * P_BATT_MAX_KW
+            k_droop = clamped_dual[1] * (self._cfg.dual_control.k_droop_max -
+                                          self._cfg.dual_control.k_droop_min) / 2.0 + \
+                      (self._cfg.dual_control.k_droop_max +
+                       self._cfg.dual_control.k_droop_min) / 2.0
+            load_shed = clamped_dual[2] * LOAD_SHED_MAX_KW
+            pv_limit = clamped_dual[3] * 1.0
+            p_batt = p_ref  # 下垂模式: 执行器根据 P_output = P_ref + k_droop × ΔV 计算
+        else:
+            # 标准模式: 使用现有 ActionValidator
+            clamped, violated, violations = self._validator.validate(
+                action, dispatch_p_use, q_batt_real=q_batt)
+            p_batt = clamped[0] * P_BATT_MAX_KW
+            load_shed = clamped[1] * LOAD_SHED_MAX_KW
+            pv_limit = clamped[2] * 1.0 if len(clamped) > 2 else 1.0
+            k_droop = 0.0  # 标准模式不使用 k_droop
 
-        # 3. 有效负荷与光伏 (pv_limit=1.0 恒定)
+        # 3. 有效负荷与光伏
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
-        p_pv_eff = p_pv_raw  # 无 pv_limit，全部光伏出力
+        p_pv_eff = p_pv_raw * pv_limit  # 应用 pv_limit
 
         # 4. SOC 更新 (SAFETY: hard clamp)
         soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH
@@ -353,7 +387,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 11. 奖励计算
         reward, reward_info = self._compute_reward(
             p_batt=p_batt, q_batt=float(q_batt), load_shed=load_shed,
-            pv_limit=1.0, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
+            pv_limit=pv_limit, p_pv_raw=p_pv_raw, p_load_raw=p_load_raw,
             p_load_eff=p_load_eff, grid_power=grid_power,
             load_rate=load_rate, load_rate_unclamped=load_rate_unclamped,
             soc_new=soc_new, soc_clipped=soc_clipped,
@@ -375,7 +409,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_batt": p_batt,
             "q_batt": float(q_batt),
             "load_shedding": load_shed,
-            "pv_limit": 1.0,
+            "pv_limit": float(pv_limit),
             "grid_power": grid_power,
             "va": va, "vb": vb, "vc": vc,
             "v_avg": float(v_avg),
@@ -386,6 +420,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "violations": str(violations) if violations else "",
             "voltage_violation_count": self._voltage_violation_count,
             **reward_info,
+            # v2.7 新增双参数字段
+            "k_droop": float(k_droop) if self._dual_mode else 0.0,
+            "p_ref": float(p_batt) if self._dual_mode else p_batt,
         }
         if terminated or truncated:
             info["terminal_observation"] = self._build_observation()
