@@ -163,14 +163,21 @@ class MLPPolicy:
 
     def get_action_batch(self, obs: np.ndarray,
                          deterministic: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """批量采样动作 (用于 rollout 收集)。"""
+        """批量采样动作 (用于 rollout 收集)。
+
+        注意: 使用 self.env.action_space.shape[0] 而非 self.policy.act_dim
+        来分配 buffer, 以确保与 env.step() 兼容 (dual_mode 时 policy 输出 5 维,
+        但 env 只接受 4 维)。
+        """
         n = len(obs)
-        actions = np.zeros((n, self.act_dim), dtype=np.float32)
+        env_act_dim = self.env.action_space.shape[0]
+        actions = np.zeros((n, env_act_dim), dtype=np.float32)
         values = np.zeros(n, dtype=np.float32)
         log_probs = np.zeros(n, dtype=np.float32)
         for i in range(n):
             a, v, lp = self.get_action(obs[i], deterministic)
-            actions[i] = a
+            # 只取环境能接受的动作维度
+            actions[i] = a[:env_act_dim]
             values[i] = v
             log_probs[i] = lp
         return actions, values, log_probs
@@ -299,8 +306,9 @@ class NumPyPPO:
 
         while steps_done < total_timesteps:
             # ── Rollout 收集 ──
+            env_act_dim = self.env.action_space.shape[0]
             buf_obs = np.zeros((cfg["n_steps"], self.policy.obs_dim), dtype=np.float32)
-            buf_act = np.zeros((cfg["n_steps"], self.policy.act_dim), dtype=np.float32)
+            buf_act = np.zeros((cfg["n_steps"], env_act_dim), dtype=np.float32)
             buf_rew = np.zeros(cfg["n_steps"], dtype=np.float32)
             buf_val = np.zeros(cfg["n_steps"] + 1, dtype=np.float32)
             buf_done = np.zeros(cfg["n_steps"], dtype=np.bool_)
@@ -315,11 +323,13 @@ class NumPyPPO:
 
                 buf_obs[t] = obs
                 act, val, logp = self.policy.get_action(obs)
-                buf_act[t] = act
+                # 只取环境能接受的动作维度
+                act_for_env = act[:env_act_dim]
+                buf_act[t] = act_for_env
                 buf_val[t] = val
                 buf_logp[t] = logp
 
-                obs, rew, term, trunc, _ = self.env.step(act)
+                obs, rew, term, trunc, _ = self.env.step(act_for_env)
                 buf_rew[t] = rew
                 buf_done[t] = term or trunc
                 episode_reward += rew
