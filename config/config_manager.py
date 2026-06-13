@@ -68,6 +68,18 @@ class VoltageSimulatorConfig:
     v_max: float = 1.15
     noise_std: float = 0.005
     imbalance: float = 0.003
+    # 动态阻抗扰动（模拟线路老化/温度变化导致的 R/X 漂移）
+    impedance_drift_pct: float = 0.10   # ±10% 随机扰动
+    # 谐波背景（模拟农网配电侧 3/5 次谐波污染）
+    harmonic_3rd_pct: float = 0.03     # 3次谐波 3% 幅值
+    harmonic_5th_pct: float = 0.02     # 5次谐波 2% 幅值
+
+
+@dataclass
+class CommConfig:
+    """通信延迟配置（模拟 RTU 轮询周期）。"""
+    action_delay_steps_min: int = 1   # 最小延迟步数（1步=15分钟）
+    action_delay_steps_max: int = 3    # 最大延迟步数
 
 
 @dataclass
@@ -142,6 +154,7 @@ class MupcConfig:
     action_space: ActionSpaceConfig = field(default_factory=ActionSpaceConfig)
     obs_normalization: ObsNormalizationConfig = field(default_factory=ObsNormalizationConfig)
     reward_weights: RewardWeightsConfig = field(default_factory=RewardWeightsConfig)
+    comm: CommConfig = field(default_factory=CommConfig)
 
     # 配置文件路径（用于校验）
     _source_file: Optional[str] = field(default=None, repr=False)
@@ -167,6 +180,7 @@ class MupcConfig:
             action_space=_section(ActionSpaceConfig, data.get("action_space", {})),
             obs_normalization=_section(ObsNormalizationConfig, data.get("obs_normalization", {})),
             reward_weights=_section(RewardWeightsConfig, data.get("reward_weights", {})),
+            comm=_section(CommConfig, data.get("comm", {})),
             _source_file=str(path),
         )
 

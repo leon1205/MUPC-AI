@@ -123,23 +123,34 @@ ALL_MODES = ["MODE-01", "MODE-02", "MODE-03", "MODE-04", "MODE-05"]
 # ═══════════════════════════════════════════════════════════════
 
 class VoltageSimulator:
-    """三相电压简化线路模型 (Q-V 耦合)，参数由配置文件决定。"""
+    """三相电压简化线路模型 (Q-V 耦合)，含动态阻抗扰动和谐波注入。
+
+    每次 step 对 k_p/k_q 加随机扰动，模拟线路老化/温度变化导致的阻抗漂移。
+    同时叠加 3/5 次谐波，模拟农网配电侧谐波污染。
+    """
 
     def __init__(self, k_p: float = 0.05, k_q: float = 0.03, s_base: float = 500.0,
                  v_min: float = 0.85, v_max: float = 1.15,
-                 noise_std: float = 0.005, imbalance: float = 0.003):
-        self.K_P = k_p
-        self.K_Q = k_q
+                 noise_std: float = 0.005, imbalance: float = 0.003,
+                 impedance_drift_pct: float = 0.10,
+                 harmonic_3rd_pct: float = 0.03,
+                 harmonic_5th_pct: float = 0.02):
+        self.base_K_P = k_p
+        self.base_K_Q = k_q
         self.S_BASE = s_base
         self.V_MIN = v_min
         self.V_MAX = v_max
         self.NOISE_STD = noise_std
         self.IMBALANCE = imbalance
+        self.DRIFT_PCT = impedance_drift_pct
+        self.H3_PCT = harmonic_3rd_pct
+        self.H5_PCT = harmonic_5th_pct
+        self._step_count = 0  # 用于谐波相位计算
 
     def step(self, p_net: float, q_batt: float,
              prev_va: float, prev_vb: float, prev_vc: float
              ) -> tuple[float, float, float]:
-        """一步电压更新。
+        """一步电压更新（含动态扰动）。
 
         Args:
             p_net: 净有功 = P_pv_eff - P_load_eff + P_batt (kW)
@@ -149,10 +160,26 @@ class VoltageSimulator:
         Returns:
             (va, vb, vc) 三相电压 (p.u.)
         """
-        dv = (self.K_P * p_net + self.K_Q * q_batt) / self.S_BASE
-        va = prev_va + dv + np.random.normal(0, self.NOISE_STD)
-        vb = prev_vb + dv + np.random.normal(0, self.NOISE_STD) + self.IMBALANCE
-        vc = prev_vc + dv + np.random.normal(0, self.NOISE_STD) - self.IMBALANCE
+        # 动态阻抗扰动：每步对 k_p/k_q 加 ±DRIFT_PCT 随机扰动
+        k_p = self.base_K_P * (1.0 + np.random.uniform(-self.DRIFT_PCT, self.DRIFT_PCT))
+        k_q = self.base_K_Q * (1.0 + np.random.uniform(-self.DRIFT_PCT, self.DRIFT_PCT))
+
+        dv = (k_p * p_net + k_q * q_batt) / self.S_BASE
+
+        # 谐波注入：基于步数计算相位（96步=24小时）
+        t = self._step_count
+        harm_3 = self.H3_PCT * np.sin(3 * 2 * np.pi * t / 96)
+        harm_5 = self.H5_PCT * np.sin(5 * 2 * np.pi * t / 96)
+        self._step_count += 1
+
+        noise_a = np.random.normal(0, self.NOISE_STD)
+        noise_b = np.random.normal(0, self.NOISE_STD)
+        noise_c = np.random.normal(0, self.NOISE_STD)
+
+        va = prev_va + dv + noise_a + harm_3 + harm_5
+        vb = prev_vb + dv + noise_b + harm_3 + harm_5 + self.IMBALANCE
+        vc = prev_vc + dv + noise_c + harm_3 + harm_5 - self.IMBALANCE
+
         return (
             float(np.clip(va, self.V_MIN, self.V_MAX)),
             float(np.clip(vb, self.V_MIN, self.V_MAX)),
@@ -235,6 +262,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             k_p=vc.k_p, k_q=vc.k_q, s_base=vc.s_base,
             v_min=vc.v_min, v_max=vc.v_max,
             noise_std=vc.noise_std, imbalance=vc.imbalance,
+            impedance_drift_pct=vc.impedance_drift_pct,
+            harmonic_3rd_pct=vc.harmonic_3rd_pct,
+            harmonic_5th_pct=vc.harmonic_5th_pct,
         )
 
         # ── Grid2Op 电压仿真（可开关切换）───────────────────────
@@ -277,6 +307,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
         # v2.6 新增: 电压斜率追踪（用于 |ΔV| 惩罚）
         self._prev_v_avg: float = 1.0
+        # v2.9 新增: 动作延迟缓冲区（模拟 RTU 轮询延迟）
+        cc = self._cfg.comm
+        delay_steps = np.random.randint(cc.action_delay_steps_min, cc.action_delay_steps_max + 1)
+        self._action_delay_steps = delay_steps
+        self._action_delay_buf: list = [
+            np.zeros(3, dtype=np.float32) for _ in range(delay_steps)
+        ]  # 预填充延迟缓冲区
 
     def _init_grid2op(self) -> None:
         """延迟初始化 Grid2Op（首次 reset 前不创建）。
@@ -354,6 +391,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 重置校验器
         self._validator.reset()
 
+        # v2.9: 重置动作延迟缓冲区
+        self._action_delay_buf = [
+            np.zeros(3, dtype=np.float32) for _ in range(self._action_delay_steps)
+        ]
+        # v2.9: 重置 VoltageSimulator 谐波相位计数器
+        if hasattr(self._voltage_sim, '_step_count'):
+            self._voltage_sim._step_count = 0
+
         # ── Grid2Op 初始化/重置 ────────────────────────────────
         if self._use_grid2op:
             if self._grid2op_power_flow is None:
@@ -379,6 +424,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         """
         action = np.asarray(action, dtype=np.float32)
 
+        # v2.9: 动作延迟缓冲区（FIFO）
+        # Pop 队首（延迟 N 步后的动作），Push 当前新动作
+        delayed_action = self._action_delay_buf.pop(0)
+        self._action_delay_buf.append(action.copy())
+        action_to_apply = delayed_action
+
         # ── Grid2Op SOC 同步（step 入口：Grid2Op → MupcEnv）─────
         if self._use_grid2op and self._grid2op_power_flow is not None:
             grid_soc = self._grid2op_power_flow.get_storage_soc()
@@ -403,7 +454,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         else:
             dispatch_p_use = float(dispatch_p)
         clamped, violated, violations = self._validator.validate(
-            action, dispatch_p_use, q_batt_real=q_batt)
+            action_to_apply, dispatch_p_use, q_batt_real=q_batt)
 
         # 3. 反归一化动作到物理值 (3维: P_batt + Load_shedding + Pv_limit)
         p_batt = clamped[0] * P_BATT_MAX_KW
@@ -712,6 +763,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # v2.5: 电压偏高时弃光奖励不计入
         if v_avg >= VOLTAGE_HIGH_LIMIT:
             r_pv = 0.0
+            # v2.9: 主动弃光奖励（弃光悖论解决）
+            # 高电压时 pv_limit 越低 → 弃光越多 → 奖励越高
+            r_pv_limit = (1.0 - pv_limit) ** 2  # 二次型：大幅弃光奖励更高
+        else:
+            r_pv_limit = 0.0
 
         # ── 自适应损耗系数 α(s) ──
         soc_new = r.get("soc_new", self._soc)
@@ -757,6 +813,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         p_voltage_slope = w6 * delta_v
 
         total = (w[0] * r_pv
+                 + w[0] * r_pv_limit
                  - w[1] * p_batt_deg
                  - w[2] * p_overload
                  - w4 * p_voltage
@@ -765,6 +822,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         info = {
             "r_pv_consumption": float(r_pv),
+            "r_pv_limit_active": float(r_pv_limit),  # v2.9
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload),
             "p_voltage_deviation": float(-p_voltage),
