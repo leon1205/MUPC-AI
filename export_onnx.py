@@ -39,16 +39,29 @@ def _ensure_export_deps():
 
 # ── RL 策略导出模型 ────────────────────────────────────────────
 
-def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 2,
-                           hidden: list[int] | None = None):
-    """构建仅用于 ONNX 导出的策略网络壳。"""
+def _build_rl_export_model(obs_dim: int = 58,
+                           hidden: list[int] | None = None,
+                           pv_array_kw: float = 150.0,
+                           load_peak_kw: float = 60.0,
+                           dual_mode: bool = False):
+    """构建仅用于 ONNX 导出的策略网络壳。
+
+    Args:
+        obs_dim: 观测维度 (default 58)
+        hidden: 隐藏层维度列表
+        pv_array_kw: 光伏容量 (用于动作缩放)
+        load_peak_kw: 负荷峰值 (用于动作缩放)
+        dual_mode: 启用双参数下垂模式 (5维动作)
+    """
     import torch
     import torch.nn as nn
 
     if hidden is None:
         hidden = [128, 128]
 
-    class RLExportModel(nn.Module):
+    act_dim = 5 if dual_mode else 3
+
+    class RLExportModelWithNorm(nn.Module):
         def __init__(self):
             super().__init__()
             prev = obs_dim
@@ -58,16 +71,46 @@ def _build_rl_export_model(obs_dim: int = 58, act_dim: int = 2,
                 self.shared.add_module(f"relu{i}", nn.ReLU())
                 prev = h
             self.actor = nn.Linear(hidden[-1], act_dim)
+            self.pv_array_kw = pv_array_kw
+            self.load_peak_kw = load_peak_kw
 
-        def forward(self, x):
-            latent = self.shared(x)
+        def _normalize(self, x):
+            # 观测归一化 (与训练时一致)
+            # D1: [SOC, 光伏, 负荷, 电网功率, 变压器负载, 电池功率, 三相电压, Q裕度]
+            # 统计量基于 200kVA 变压器, 100kWh 电池, 150kW 光伏, 60kW 负荷
+            norm_vals = torch.tensor([
+                0.5,          # SOC ~ 50%
+                1/150,        # 光伏功率 (W->kW)
+                1/60,         # 负荷功率
+                1/200,        # 电网功率
+                1/200,        # 变压器负载
+                1/50,         # 电池功率
+                1/200,        # 三相电压 (归一化)
+                1.0,          # Q裕度
+            ], device=x.device)
+            return x * norm_vals
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x_norm = self._normalize(x)
+            latent = self.shared(x_norm)
             action = self.actor(latent)
-            # A1: Tanh (p_batt, 范围 [-1,1]), A2: Sigmoid (load_shedding, 范围 [0,1])
-            a1 = torch.tanh(action[:, :1])
-            a2 = torch.sigmoid(action[:, 1:])
-            return torch.cat([a1, a2], dim=-1)
 
-    return RLExportModel()
+            if dual_mode:
+                # 5 维: p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)
+                a1 = torch.tanh(action[:, :1])      # p_ref: [-1, 1]
+                a2 = torch.tanh(action[:, 1:2])     # k_droop: [-1, 1]
+                a3 = torch.sigmoid(action[:, 2:3])  # load_shedding: [0, 1]
+                a4 = torch.sigmoid(action[:, 3:4])   # pv_limit: [0, 1]
+                a5 = torch.sigmoid(action[:, 4:5]) # confidence: [0, 1]
+                return torch.cat([a1, a2, a3, a4, a5], dim=-1)
+            else:
+                # 3 维: p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)
+                a1 = torch.tanh(action[:, :1])
+                a2 = torch.sigmoid(action[:, 1:2])
+                a3 = torch.sigmoid(action[:, 2:3])
+                return torch.cat([a1, a2, a3], dim=-1)
+
+    return RLExportModelWithNorm()
 
 
 # ── 权重加载 ──────────────────────────────────────────────────
@@ -102,10 +145,22 @@ def export_rl_policy(
     output_dir: str = "./exported_models/",
     obs_dim: int = 58,
     checkpoint_path: str | None = None,
+    pv_array_kw: float = 150.0,
+    load_peak_kw: float = 60.0,
+    dual_mode: bool = False,
 ) -> str:
     """导出 RL 策略网络为 ONNX。
 
     自动检测 checkpoint 格式 (SB3 .zip 或 NumPy .npz)。
+
+    Args:
+        checkpoint_dir: checkpoint 目录
+        output_dir: 输出目录
+        obs_dim: 观测维度
+        checkpoint_path: checkpoint 路径 (None 则自动查找)
+        pv_array_kw: 光伏容量
+        load_peak_kw: 负荷峰值
+        dual_mode: 启用双参数下垂模式 (5维动作)
 
     Returns:
         导出的 ONNX 文件路径
@@ -130,7 +185,8 @@ def export_rl_policy(
     is_npz = checkpoint_path.endswith(".npz")
 
     # 构建 PyTorch 模型并加载权重
-    model = _build_rl_export_model(obs_dim)
+    model = _build_rl_export_model(obs_dim, pv_array_kw=pv_array_kw,
+                                   load_peak_kw=load_peak_kw, dual_mode=dual_mode)
 
     if is_npz:
         # NumPy PPO 权重 → PyTorch state_dict
@@ -352,6 +408,12 @@ def main():
                         help="导出 LSTM 模型 (提供 checkpoint 路径)")
     parser.add_argument("--to-rknn", action="store_true",
                         help="同时导出 RKNN (需要 rknn-toolkit2)")
+    parser.add_argument("--pv-kw", type=float, default=150.0,
+                        help="光伏容量 kW (default: 150.0)")
+    parser.add_argument("--load-kw", type=float, default=60.0,
+                        help="负荷峰值 kW (default: 60.0)")
+    parser.add_argument("--dual-mode", action="store_true",
+                        help="启用双参数下垂模式（5维动作，v2.7）")
     args = parser.parse_args()
 
     try:
@@ -368,6 +430,9 @@ def main():
             output_dir=args.output_dir,
             obs_dim=args.obs_dim,
             checkpoint_path=args.checkpoint,
+            pv_array_kw=args.pv_kw,
+            load_peak_kw=args.load_kw,
+            dual_mode=args.dual_mode,
         )
 
         if args.to_rknn:
