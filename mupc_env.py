@@ -179,8 +179,18 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # v2.7 下垂模式检测
         self._dual_mode = False
+        self._dual_validator: "DualActionValidator | None" = None
         if config is not None and getattr(config.dual_control, 'enabled', False):
             self._dual_mode = True
+            from action_validator import DualActionValidator
+            self._dual_validator = DualActionValidator(
+                p_batt_max=P_BATT_MAX_KW,
+                k_droop_min=self._cfg.dual_control.k_droop_min,
+                k_droop_max=self._cfg.dual_control.k_droop_max,
+                p_ref_ramp_limit_kw=self._cfg.dual_control.p_ref_ramp_limit_kw,
+                load_shed_max=LOAD_SHED_MAX_KW,
+                pv_limit_min=self._cfg.dual_control.pv_limit_min,
+            )
             # 5 维: [p_ref_norm, k_droop_norm, load_shed_norm, pv_limit_norm]
             low_act = np.array([-1.0, -1.0, 0.0, 0.0], dtype=np.float32)
             high_act = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
@@ -260,6 +270,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 重置校验器
         self._validator.reset()
+        # v2.7: 重置下垂模式 validator 的历史状态
+        if self._dual_validator is not None:
+            self._dual_validator.reset()
 
         # 电压越限计数器（用于死区触发）
         self._voltage_violation_count: int = 0
@@ -300,17 +313,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             dispatch_p_use = float(dispatch_p)
 
         if self._dual_mode:
-            # v2.7 双参数模式: 使用 DualActionValidator
-            from action_validator import DualActionValidator
-            dual_validator = DualActionValidator(
-                p_batt_max=P_BATT_MAX_KW,
-                k_droop_min=self._cfg.dual_control.k_droop_min,
-                k_droop_max=self._cfg.dual_control.k_droop_max,
-                p_ref_ramp_limit_kw=self._cfg.dual_control.p_ref_ramp_limit_kw,
-                load_shed_max=LOAD_SHED_MAX_KW,
-                pv_limit_min=self._cfg.dual_control.pv_limit_min,
-            )
-            clamped_dual, violated, violations = dual_validator.validate(
+            # v2.7 双参数模式: 使用预创建的 DualActionValidator 实例（避免每步重建）
+            clamped_dual, violated, violations = self._dual_validator.validate(
                 action, dispatch_p_use, is_anti_reverse=False)
             p_ref = clamped_dual[0] * P_BATT_MAX_KW
             k_droop = clamped_dual[1] * (self._cfg.dual_control.k_droop_max -
