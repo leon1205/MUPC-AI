@@ -308,6 +308,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)  # 时段 one-hot [白天, 夜间]
         # v2.6 新增: 电压斜率追踪（用于 |ΔV| 惩罚）
         self._prev_v_avg: float = 1.0
+        # v2.10 新增: 电池SOH跟踪（累计步数）
+        self._total_steps: int = 0
         # v2.9 新增: 动作延迟缓冲区（模拟 RTU 轮询延迟）
         cc = self._cfg.comm
         delay_steps = np.random.randint(cc.action_delay_steps_min, cc.action_delay_steps_max + 1)
@@ -377,6 +379,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._prev_p_batt = 0.0
         self._prev_q_batt = 0.0
         self._prev_v_avg = 1.0  # v2.6: 电压斜率追踪
+        self._total_steps = 0  # v2.10: 电池SOH累计步数（episode内不清零，跨episode累加）
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -551,6 +554,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 12. 推进时间
         self._step_idx += 1
+        self._total_steps += 1  # v2.10: SOH累计步数
         terminated = (self._step_idx - self._episode_start) >= EPISODE_LENGTH
         truncated = self._step_idx >= self._data_len - 16
 
@@ -787,7 +791,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # ── 电池衰减: C-rate² × α(s)（v2.5 自适应系数）──
         c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
-        p_batt_deg = alpha * (c_rate ** 2)
+        # v2.10: SOH 反馈惩罚
+        # SOH(t) = max(0.70, 1.0 - 0.00005 * total_steps)，每万步约 -0.5% SOH
+        soh = max(0.70, 1.0 - 0.00005 * self._total_steps)
+        p_batt_deg = alpha * (c_rate ** 2) / soh
 
         # ── 电压质量惩罚 (v2.5: 条件触发式) ──
         p_voltage = 0.0
@@ -832,6 +839,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_voltage_slope": float(-p_voltage_slope),  # v2.6
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
+            "soh": float(soh),  # v2.10
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5
         }
         return float(total), info
@@ -847,7 +855,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 电池衰减: C-rate²（非线性）
         c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
-        p_batt_deg = c_rate ** 2
+        # v2.10: SOH 反馈惩罚
+        soh = max(0.70, 1.0 - 0.00005 * self._total_steps)
+        p_batt_deg = (c_rate ** 2) / soh
 
         # 过载惩罚: 梯度从 OVERLOAD_START_PCT 开始（Quadratic + Linear）
         # p_overload = -(0.3095·x² + 0.026·x), x ∈ [0, 1]，惩罚区间 [OVERLOAD_START_PCT, OVERLOAD_THRESHOLD]
@@ -861,6 +871,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "r_price_spread": float(r_spread),
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload) if w3 > 0 else 0.0,
+            "soh": float(soh),  # v2.10
         }
         return float(total), info
 
