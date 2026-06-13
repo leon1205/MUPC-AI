@@ -40,7 +40,8 @@ class PhysicalConfig:
 class SafetyConfig:
     soc_min: float = 0.10
     soc_max: float = 0.90
-    overload_threshold: float = 0.85
+    overload_threshold: float = 0.85   # 过载判断阈值（变压器额定容量百分比）
+    overload_start_pct: float = 0.75  # 过载惩罚起始点（75% 开始惩罚，与 overload_threshold 形成惩罚区间）
     battery_charge_efficiency: float = 0.90   # 充电效率 (锂离子电池典型值 90%)
     battery_discharge_efficiency: float = 0.90  # 放电效率 (锂离子电池典型值 90%)
 

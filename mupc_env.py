@@ -68,6 +68,7 @@ SOC_MAX = _c.safety.soc_max
 BATTERY_CHARGE_EFF = _c.safety.battery_charge_efficiency
 BATTERY_DISCHARGE_EFF = _c.safety.battery_discharge_efficiency
 OVERLOAD_THRESHOLD = _c.safety.overload_threshold
+OVERLOAD_START_PCT = _c.safety.overload_start_pct
 DT_HOURS = _c.time.dt_hours
 LOAD_PF = _c.time.load_pf
 
@@ -778,9 +779,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         else:
             alpha = 1.0  # 常规调度
 
-        # ── 过载惩罚: 梯度从 75% 开始（Quadratic + Linear）──
+        # ── 过载惩罚: 梯度从 OVERLOAD_START_PCT 开始（Quadratic + Linear）──
+        # p_overload = -(0.3095·x² + 0.026·x), x ∈ [0, 1]，惩罚区间 [OVERLOAD_START_PCT, OVERLOAD_THRESHOLD]
         lr_unc = r.get("load_rate_unclamped", r["load_rate"])
-        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
+        overload_t = max(0.0, (lr_unc - OVERLOAD_START_PCT) / max(1e-6, OVERLOAD_THRESHOLD - OVERLOAD_START_PCT))
         p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
 
         # ── 电池衰减: C-rate² × α(s)（v2.5 自适应系数）──
@@ -847,9 +849,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
         p_batt_deg = c_rate ** 2
 
-        # 过载惩罚: 梯度从 75% 开始（Quadratic + Linear，匹配设计文档）
+        # 过载惩罚: 梯度从 OVERLOAD_START_PCT 开始（Quadratic + Linear）
+        # p_overload = -(0.3095·x² + 0.026·x), x ∈ [0, 1]，惩罚区间 [OVERLOAD_START_PCT, OVERLOAD_THRESHOLD]
         lr_unc = r.get("load_rate_unclamped", r["load_rate"])
-        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
+        overload_t = max(0.0, (lr_unc - OVERLOAD_START_PCT) / max(1e-6, OVERLOAD_THRESHOLD - OVERLOAD_START_PCT))
         p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
         w3 = w[2] if len(w) > 2 else 0.0
 
