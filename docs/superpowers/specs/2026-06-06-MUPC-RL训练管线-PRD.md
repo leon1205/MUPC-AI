@@ -8,7 +8,7 @@
 
 ---
 
-> **v2.3 变更说明：** 新增下垂模式（v2.7 双参数动作空间）。当 `config.dual_control.enabled=true` 时，RL 输出 5 维动作（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit, A5: confidence），执行器根据下垂公式计算最终功率 P_output = P_ref + k_droop × ΔV。
+> **v2.3 变更说明：** 新增下垂模式（v2.7 双参数动作空间）。当 `config.dual_control.enabled=true` 时，RL 输出 4 维动作（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit），执行器根据下垂公式计算最终功率 P_output = P_ref + k_droop × ΔV。
 >
 > **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
 >
@@ -212,24 +212,23 @@ V_phase = 1.0 + k_p * (P_pv - P_load + P_batt) / S_base
 
 > **v2.4 分层控制架构：** Q 控制（q_batt_set）和 pv_limit 由 MUPC 实时控制核心模块根据电压闭环调节，不经过 RL。RL 专注能量管理（P_batt + Load_shedding），避免 ms 级 Q 控制与 min 级 P 控制的时间尺度冲突。
 
-**下垂模式（5维，v2.7新增）**
+**下垂模式（4维，v2.7新增）**
 
-当 `config.dual_control.enabled=true` 时启用，RL 输出 5 维动作：
+当 `config.dual_control.enabled=true` 时启用，RL 输出 4 维动作：
 
 | 维度 | 字段 | 范围 | 说明 |
 |------|------|------|------|
 | A1 | P_ref | [-50, 50] kW | 有功功率基准点 |
-| A2 | k_droop | [k_min, k_max] kW/V | 电压-有功下垂系数 |
+| A2 | k_droop | [-100, 100] kW/V | 电压-有功下垂系数 |
 | A3 | load_shedding | [0, 60] kW | 可中断负荷切除量 |
-| A4 | pv_limit | [0, 1] | 光伏限功率比例 |
-| A5 | confidence | [0, 1] | 决策置信度 |
+| A4 | pv_limit | [0.1, 1] | 光伏限功率比例（防逆流） |
 
 执行器根据下垂公式计算最终功率：P_output = P_ref + k_droop × ΔV
 
 **配置参数：**
 - `dual_control.enabled`: 启用/禁用下垂模式
-- `dual_control.k_droop_min/max`: 下垂系数范围
-- `dual_control.p_ref_ramp_limit_kw`: P_ref 变化率限制
+- `dual_control.k_droop_min/max`: 下垂系数范围 [-100, 100]
+- `dual_control.p_ref_ramp_limit_kw`: P_ref 变化率限制 (50.0 kW/步)
 
 **核心物理方程**：
 
@@ -551,7 +550,7 @@ MUPC-AI2/
 
 | 序号 | 修订项 | 修订位置 | 说明 |
 |------|--------|----------|------|
-| 1 | 新增下垂模式 5 维动作空间 | 文档头部/3.3 | 当 `dual_control.enabled=true` 时启用 RL 5 维输出（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit, A5: confidence），执行器按 P_output = P_ref + k_droop × ΔV 计算最终功率 |
+| 1 | 新增下垂模式 4 维动作空间 | 文档头部/3.3 | 当 `dual_control.enabled=true` 时启用 RL 4 维输出（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit），执行器按 P_output = P_ref + k_droop × ΔV 计算最终功率 |
 
 **修订依据：** MUPC AI v2.7 双参数下垂控制训练管线
 
