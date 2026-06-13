@@ -215,6 +215,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._current_mode: str = "MODE-01"
         self._prev_p_batt: float = 0.0
         self._prev_q_batt: float = 0.0
+        self._prev_k_droop: float = 0.0  # v2.8: 下垂系数平滑惩罚
+        self._prev_v_avg: float = 1.0   # v2.6: 电压变化斜率惩罚
         # v2.5 新增字段
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
@@ -256,6 +258,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._peak_demand = 200.0
         self._prev_p_batt = 0.0
         self._prev_q_batt = 0.0
+        self._prev_k_droop = 0.0  # v2.8
+        self._prev_v_avg = 1.0   # v2.6
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -385,8 +389,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._current_demand = current_demand
         self._peak_demand = peak_demand
         prev_p_batt_for_reward = self._prev_p_batt
+        prev_k_droop_for_reward = self._prev_k_droop
+        prev_v_avg_for_reward = self._prev_v_avg
         self._prev_p_batt = p_batt
         self._prev_q_batt = float(q_batt)
+        self._prev_k_droop = k_droop
+        self._prev_v_avg = v_avg
 
         # 11. 奖励计算
         reward, reward_info = self._compute_reward(
@@ -398,6 +406,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             va=va, vb=vb, vc=vc,
             prev_p_batt=prev_p_batt_for_reward,
             voltage_violation_count=self._voltage_violation_count,
+            k_droop=k_droop,  # v2.8
+            prev_k_droop=prev_k_droop_for_reward,  # v2.8
+            prev_v_avg=prev_v_avg_for_reward,  # v2.6
         )
 
         # 12. 推进时间
@@ -624,22 +635,33 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload - w4*P_voltage - w5*R_ramp
+        """SCENE-01 奖励函数 (v2.8 P-Q 协同度奖励重构).
 
-        v2.5 变更:
-          - 弃光奖励电压前置条件: v_avg >= VOLTAGE_HIGH_LIMIT (1.05) → R_pv = 0
-          - 自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}: SOC极低保护 / 电压支撑 / 常规
-          - 电压惩罚条件触发: q_realtime_margin <= Q_MARGIN_THRESHOLD (10%) 且越限 >= 2 步
+        R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth
+
+        v2.8 核心变更:
+          - 移除"电压硬惩罚"P_voltage_deviation，改为"行为奖励"R_PQ_coordination
+          - 弃光场景差异化: v_avg>=1.05 时检查 p_ref 方向而非简单置零
+          - 新增下垂系数平滑惩罚 R_smooth
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
+        dev = abs(v_avg - 1.0)
+        v_low = v_avg < (1.0 - VOLTAGE_DEADBAND)   # < 0.95
+        v_high = v_avg > (1.0 + VOLTAGE_DEADBAND)  # > 1.05
+        p_ref = r["p_batt"]  # 在 dual_mode 下是 p_ref，标准模式下是 p_batt
 
-        # ── 光伏消纳率 (含电压前置条件) ──
+        # ── 光伏消纳率 (v2.8 差异化弃光奖励) ──
         pv_total = max(r["p_pv_raw"], 1e-6)
-        pv_self = min(r["p_pv_raw"], r["p_load_raw"]) + max(0.0, -r["p_batt"])
+        pv_self = min(r["p_pv_raw"], r["p_load_raw"]) + max(0.0, -p_ref)
         r_pv = min(pv_self / pv_total, 1.0)
-        # v2.5: 电压偏高时弃光奖励不计入
+        # v2.8: 高电压时差异化处理（检查动作方向而非简单置零）
         if v_avg >= VOLTAGE_HIGH_LIMIT:
-            r_pv = 0.0
+            if p_ref < 0:
+                # 充电消纳光伏 — 正确行为
+                r_pv = min(r_pv, 1.0)
+            else:
+                # 反而在放电 — 严厉惩罚
+                r_pv = -20.0
 
         # ── 自适应损耗系数 α(s) ──
         soc_new = r.get("soc_new", self._soc)
@@ -655,42 +677,75 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
         p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
 
-        # ── 电池衰减: C-rate² × α(s)（v2.5 自适应系数）──
-        c_rate = abs(r["p_batt"]) / BATTERY_CAPACITY_KWH
+        # ── 电池衰减: C-rate² × α(s) ──
+        c_rate = abs(p_ref) / BATTERY_CAPACITY_KWH
         p_batt_deg = alpha * (c_rate ** 2)
 
-        # ── 电压质量惩罚 (v2.5: 条件触发式) ──
-        p_voltage = 0.0
-        violation_count = r.get("voltage_violation_count", 0)
-        dev = abs(v_avg - 1.0)
-
-        if dev > VOLTAGE_DEADBAND and violation_count >= 2 and self._q_realtime_margin <= Q_MARGIN_THRESHOLD:
-            dev_excess = dev - VOLTAGE_DEADBAND
-            if v_avg < 1.0:
-                p_voltage = VOLTAGE_PENALTY_LOW * (dev_excess / 0.10) ** 2
+        # ── P-Q 协同度奖励 (v2.8 新增，替代原电压惩罚) ──
+        # 仅在电压越限时计算
+        r_pq = 0.0
+        Q_THRESHOLD = 0.10   # q_realtime_margin > 10% 视为"有裕度"
+        P_THRESHOLD = 5.0    # kW，省电策略阈值
+        if dev > VOLTAGE_DEADBAND:
+            if self._q_realtime_margin > Q_THRESHOLD:
+                # Q 有裕度: AI 最优解是"偷懒"省电池
+                if abs(p_ref) < P_THRESHOLD:
+                    r_pq = +50.0   # 大额奖励
+                else:
+                    r_pq = -5.0    # 轻微惩罚（强行出力浪费电池）
             else:
-                p_voltage = VOLTAGE_PENALTY_HIGH * (dev_excess / 0.10) ** 2
+                # Q 已饱和: AI 必须正确出手
+                if v_low and p_ref < 0:
+                    r_pq = +50.0   # 低电压 + 放电（正确）
+                elif v_high and p_ref > 0:
+                    r_pq = +50.0   # 高电压 + 充电（正确）
+                elif v_low and p_ref >= 0:
+                    r_pq = -30.0   # 低电压 + 不放电（失职）
+                elif v_high and p_ref <= 0:
+                    r_pq = -30.0   # 高电压 + 不充电（失职）
+                # else: r_pq = 0.0
 
         w4 = w[3] if len(w) > 3 else 0.0
 
         # ── 功率变化率惩罚 ──
         prev_p = r.get("prev_p_batt", 0.0)
-        delta_p = abs(r["p_batt"] - prev_p)
+        delta_p = abs(p_ref - prev_p)
         w5 = w[4] if len(w) > 4 else 0.0
         p_ramp_penalty = w5 * delta_p / BATTERY_CAPACITY_KWH
+
+        # ── 电压变化斜率惩罚 (v2.6) ──
+        prev_v = r.get("prev_v_avg", 1.0)
+        w6 = w[5] if len(w) > 5 else 0.0
+        r_voltage_slope = abs(v_avg - prev_v) if "prev_v_avg" in r else 0.0
+        p_voltage_slope = w6 * r_voltage_slope
+
+        # ── 下垂系数平滑惩罚 (v2.8 新增) ──
+        r_smooth = 0.0
+        w7 = w[6] if len(w) > 6 else 0.0
+        if w7 > 0:
+            k_droop = r.get("k_droop", 0.0)
+            prev_k = r.get("prev_k_droop", 0.0)
+            K_MAX = 50.0   # k_droop 上限 (kW/V)
+            lambda_smooth = 1.0
+            delta_k = abs(k_droop - prev_k) if k_droop != 0.0 or prev_k != 0.0 else 0.0
+            r_smooth = -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
 
         total = (w[0] * r_pv
                  - w[1] * p_batt_deg
                  - w[2] * p_overload
-                 - w4 * p_voltage
-                 - p_ramp_penalty)
+                 + w4 * r_pq
+                 - p_ramp_penalty
+                 - p_voltage_slope
+                 + w7 * r_smooth)
 
         info = {
-            "r_pv_consumption": float(r_pv),
+            "r_pv_consumption": float(r_pv),        # v2.8 差异化弃光
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload),
-            "p_voltage_deviation": float(-p_voltage),
+            "r_pq_coordination": float(r_pq),       # v2.8 新增
             "p_ramp_penalty": float(-p_ramp_penalty),
+            "r_voltage_slope": float(r_voltage_slope),  # v2.6
+            "r_smooth": float(r_smooth),            # v2.8 新增
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5

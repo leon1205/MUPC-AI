@@ -2,15 +2,18 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.11 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.10 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.9 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.8 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.6 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.8 (`[REVIEWED: PASS]`)
 
 ---
+
+> **v2.11 变更说明（对齐部署端 v2.8）：** SCENE-01 奖励函数重构（R_PQ_coordination + R_smooth）。移除"电压硬惩罚"，引入 P-Q 协同度奖励（Q 有裕度时省电奖励/Q 饱和时正确出手奖励）。弃光场景差异化（v_avg≥1.05 时检查 p_ref 方向，充电消纳=正确/放电=惩罚）。新增下垂系数平滑惩罚 R_smooth（防止 k_droop 震荡）。新增 w7 光滑惩罚权重。训练管线对齐下游 v2.8 PRD。
 
 > **v2.10 变更说明（v2.7 双参数动作空间合并）：** 新增下垂模式（`config.dual_control.enabled=true`），RL 输出 4 维动作（A1: P_ref, A2: k_droop, A3: load_shedding, A4: pv_limit），执行器按 P_output = P_ref + k_droop × ΔV 计算最终功率。NumPy PPO 支持 dual_mode，5 维策略输出（p_ref, k_droop, load_shedding, pv_limit, confidence），buffer 使用 `env.action_space.shape[0]` 截断至 4 维。DualActionValidator 实现 ACT-DUAL-01~05 约束规则（p_ref 斜率限制、k_droop 范围、|p_ref| ≤ |dispatch_p|、pv_limit ≥ 0.1 防逆流）。
 
