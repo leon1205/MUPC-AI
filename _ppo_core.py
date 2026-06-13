@@ -544,24 +544,37 @@ if __name__ == "__main__":
     print("  NumPy PPO 自测")
     print("=" * 52)
 
-    # 1. MLPPolicy 2D 输出验证
-    print("\n[1] MLPPolicy 2D 输出...")
-    policy = MLPPolicy(obs_dim=48, act_dim=2)
-    obs = np.random.randn(48).astype(np.float32)
+    # 1. MLPPolicy 3维输出验证
+    print("\n[1] MLPPolicy 3维输出...")
+    policy = MLPPolicy(obs_dim=58, act_dim=3, dual_mode=False)
+    obs = np.random.randn(58).astype(np.float32)
     action, value = policy.forward(obs[np.newaxis, :])
-    assert action.shape == (1, 2), f"action shape {action.shape} != (1,2)"
+    assert action.shape == (1, 3), f"action shape {action.shape} != (1,3)"
     assert -1.0 <= action[0, 0] <= 1.0, f"p_batt {action[0,0]} out of [-1,1]"
     assert 0.0 <= action[0, 1] <= 1.0, f"load_shed {action[0,1]} out of [0,1]"
-    print(f"  p_batt={action[0,0]:.3f}, load_shed={action[0,1]:.3f} [OK]")
+    assert 0.0 <= action[0, 2] <= 1.0, f"pv_limit {action[0,2]} out of [0,1]"
+    print(f"  p_batt={action[0,0]:.3f}, load={action[0,1]:.3f}, pv={action[0,2]:.3f} [OK]")
 
-    # 2. get_action 确定性/随机
+    # 1b. MLPPolicy 5维输出验证（dual_mode）
+    print("\n[1b] MLPPolicy 5维输出（dual_mode）...")
+    policy5 = MLPPolicy(obs_dim=58, act_dim=5, dual_mode=True)
+    action5, value5 = policy5.forward(obs[np.newaxis, :])
+    assert action5.shape == (1, 5), f"action5 shape {action5.shape} != (1,5)"
+    assert -1.0 <= action5[0, 0] <= 1.0, f"p_ref {action5[0,0]} out of [-1,1]"
+    assert -1.0 <= action5[0, 1] <= 1.0, f"k_droop {action5[0,1]} out of [-1,1]"
+    assert 0.0 <= action5[0, 2] <= 1.0, f"load {action5[0,2]} out of [0,1]"
+    assert 0.0 <= action5[0, 3] <= 1.0, f"pv {action5[0,3]} out of [0,1]"
+    assert 0.0 <= action5[0, 4] <= 1.0, f"conf {action5[0,4]} out of [0,1]"
+    print(f"  p_ref={action5[0,0]:.3f}, k_droop={action5[0,1]:.3f}, load={action5[0,2]:.3f} [OK]")
+
+    # 2. get_action 确定性/随机（3维）
     print("[2] get_action 采样...")
     act_det, _, _ = policy.get_action(obs, deterministic=True)
-    assert act_det.shape == (2,), f"det shape {act_det.shape}"
+    assert act_det.shape == (3,), f"det shape {act_det.shape}"
     act_stoch, _, _ = policy.get_action(obs, deterministic=False)
-    assert act_stoch.shape == (2,), f"stoch shape {act_stoch.shape}"
-    print(f"  deterministic: p={act_det[0]:.3f}, l={act_det[1]:.3f} [OK]")
-    print(f"  stochastic:   p={act_stoch[0]:.3f}, l={act_stoch[1]:.3f} [OK]")
+    assert act_stoch.shape == (3,), f"stoch shape {act_stoch.shape}"
+    print(f"  deterministic: p={act_det[0]:.3f}, l={act_det[1]:.3f}, pv={act_det[2]:.3f} [OK]")
+    print(f"  stochastic:   p={act_stoch[0]:.3f}, l={act_stoch[1]:.3f}, pv={act_stoch[2]:.3f} [OK]")
 
     # 3. ActionValidator 3 条约束规则
     print("[3] ActionValidator 约束规则...")
