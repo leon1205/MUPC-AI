@@ -174,7 +174,7 @@ class DualActionValidator:
 
         # ACT-DUAL-03: p_ref 变化率约束
         delta_p = abs(p_ref - self.prev_p_ref)
-        if delta_p >= self.P_REF_RAMP_LIMIT:
+        if delta_p > self.P_REF_RAMP_LIMIT:
             sign = 1.0 if p_ref > self.prev_p_ref else -1.0
             p_ref = self.prev_p_ref + sign * self.P_REF_RAMP_LIMIT
             violations["ACT-DUAL-03"] = True
