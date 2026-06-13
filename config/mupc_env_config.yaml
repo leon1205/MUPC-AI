@@ -21,6 +21,8 @@ safety:
   soc_min: 0.10                  # SOC 下限硬约束
   soc_max: 0.90                  # SOC 上限硬约束
   overload_threshold: 0.85       # 过载阈值 (变压器额定容量百分比)
+  battery_charge_efficiency: 0.90  # 充电效率 (锂离子电池典型值 90%)
+  battery_discharge_efficiency: 0.90  # 放电效率 (锂离子电池典型值 90%)
 
 # ═══════════════════════════════════════════════════════════════
 # 时间参数

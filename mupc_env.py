@@ -65,6 +65,8 @@ LOAD_PEAK_KW = _c.physical.load_peak_kw
 
 SOC_MIN = _c.safety.soc_min
 SOC_MAX = _c.safety.soc_max
+BATTERY_CHARGE_EFF = _c.safety.battery_charge_efficiency
+BATTERY_DISCHARGE_EFF = _c.safety.battery_discharge_efficiency
 OVERLOAD_THRESHOLD = _c.safety.overload_threshold
 DT_HOURS = _c.time.dt_hours
 LOAD_PF = _c.time.load_pf
@@ -224,6 +226,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         )
 
         # 电压仿真器（Grid2Op 不可用时降级使用）
+        # 注意: q_batt 是实时电压调节器的输出 (K_Q=200.0 kVar/p.u.)，
+        # 而 voltage_simulator.k_q=0.03 是线路灵敏度系数（p.u./S_BASE），
+        # 两者物理含义不同：q_batt 已包含控制响应，voltage_simulator.k_q 仅用于模拟电压对功率的灵敏度
+        # 故 VoltageSimulator 保留使用 k_q=0.03，不与 q_control.k_q 混淆
         vc = self._cfg.voltage_simulator
         self._voltage_sim = VoltageSimulator(
             k_p=vc.k_p, k_q=vc.k_q, s_base=vc.s_base,
@@ -411,8 +417,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         p_pv_raw = float(self._data["pv_power"][self._step_idx])
         p_pv_eff = p_pv_raw * pv_limit  # v2.6: 主动弃光
 
-        # 4. SOC 更新 (SAFETY: hard clamp)
-        soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH
+        # 4. SOC 更新 (SAFETY: hard clamp，带充放电效率)
+        # 放电(p_batt>0): ΔSOC = -P*dt/(E*η_dis)  充电(p_batt<0): ΔSOC = -P*dt*η_chg/E
+        if p_batt > 0:
+            soc_raw = self._soc + (-p_batt * DT_HOURS) / BATTERY_CAPACITY_KWH / BATTERY_DISCHARGE_EFF
+        else:
+            soc_raw = self._soc + (-p_batt * DT_HOURS) * BATTERY_CHARGE_EFF / BATTERY_CAPACITY_KWH
         soc_new = float(np.clip(soc_raw, SOC_MIN, SOC_MAX))
         soc_clipped = abs(soc_raw - soc_new) > 1e-9
 

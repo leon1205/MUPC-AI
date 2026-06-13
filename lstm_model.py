@@ -109,15 +109,16 @@ class LSTMForecast:
     def forward(self, x) -> "torch.Tensor":
         """
         Args:
-            x: (batch, seq_len, input_dim) = (batch, 4, 6)
+            x: (batch, seq_len, input_dim) = (batch, 8, 7)
         Returns:
             (batch, forecast_steps * 2) = (batch, 30)
             前 15 维 = pv_forecast, 后 15 维 = load_forecast
+            使用 ReLU 保证输出非负（PV/load 均应为 >= 0）
         """
         out, (h_n, _) = self.lstm(x)
         last_hidden = h_n[-1]  # (batch, hidden_dim)
-        pv_pred = self.head_pv(last_hidden)
-        load_pred = self.head_load(last_hidden)
+        pv_pred = _torch.relu(self.head_pv(last_hidden))   # 非负约束
+        load_pred = _torch.relu(self.head_load(last_hidden))  # 非负约束
         return _torch.cat([pv_pred, load_pred], dim=-1)
 
     def predict_numpy(self, x: np.ndarray) -> np.ndarray:

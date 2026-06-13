@@ -20,10 +20,19 @@ if TYPE_CHECKING:
     from grid2op import Environment
     from grid2op_env.numpy_chronics import NumpyChronics
 
-# ── 物理常量（与 mupc_env.py 保持一致）───────────────────────────
+# ── 物理常量（运行时从配置读取，避免导入时序问题）─────────────────
 
-BATTERY_CAPACITY_KWH: float = 200.0  # 电池容量 (kWh)
-BATTERY_CAPACITY_MWH: float = BATTERY_CAPACITY_KWH / 1000.0  # 0.2 MWh
+def _battery_capacity_kwh() -> float:
+    """运行时获取电池容量（从配置）。"""
+    try:
+        from config.config_manager import get_config
+        return get_config().physical.battery_capacity_kwh
+    except Exception:
+        return 100.0  # 回退默认值，与 mupc_env_config.yaml 一致
+
+
+def _battery_capacity_mwh() -> float:
+    return _battery_capacity_kwh() / 1000.0
 
 
 class Grid2OpPowerFlow:

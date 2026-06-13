@@ -93,28 +93,35 @@ class MLPPolicy:
                    ) -> tuple[np.ndarray, float, float]:
         """采样动作。
 
+        采样在 pre-activation 空间进行，然后应用 tanh/sigmoid。
+        log_prob 包含 tanh/sigmoid Jacobian 修正，与 _update_step() 完全一致。
+
         Returns:
-            (action_2d, value_scalar, log_prob_scalar)
+            (action, value_scalar, log_prob_scalar)
         """
         latent = self._forward_shared(obs[np.newaxis, :])  # (1, 128)
         action_mean = (latent @ self.weights["actor_w"] + self.weights["actor_b"]).ravel()
 
         std = np.exp(self.log_std)
         if deterministic:
-            noise = np.zeros(self.act_dim)
+            a_raw = action_mean.copy()
         else:
-            noise = np.random.randn(self.act_dim) * std
+            a_raw = action_mean + np.random.randn(self.act_dim) * std
 
         # 混合激活: A1=Tanh(p_batt), A2=Sigmoid(load_shedding), A3=Sigmoid(pv_limit)
-        am = action_mean  # (act_dim,)
-        a1 = np.tanh(am[:1] + noise[:1])  # both (1,)
-        a2 = 1.0 / (1.0 + np.exp(-(am[1:2] + noise[1:2])))  # sigmoid (1,)
-        a3 = 1.0 / (1.0 + np.exp(-(am[2:3] + noise[2:3])))  # sigmoid (1,)
+        a1 = np.tanh(a_raw[:1])
+        a2 = 1.0 / (1.0 + np.exp(-a_raw[1:2]))
+        a3 = 1.0 / (1.0 + np.exp(-a_raw[2:3]))
         action = np.concatenate([a1, a2, a3])
 
-        # 对数概率 (忽略 Tanh/Sigmoid 内部的 Jacobian 修正, 简化版)
-        log_prob = -0.5 * np.sum((noise / std) ** 2 + 2.0 * np.log(std) + np.log(2 * np.pi))
-        log_prob = float(np.clip(log_prob, -20.0, 20.0))
+        # log_prob = log N(a_raw; action_mean, std²) + tanh/sigmoid Jacobian
+        eps = 1e-7
+        sigma2 = std ** 2
+        log_gauss = -0.5 * np.sum((a_raw - action_mean) ** 2 / sigma2 + np.log(2 * np.pi * sigma2))
+        log_jac = (np.log(eps + 1.0 - action[:, :1] ** 2).ravel() +
+                   np.log(eps + action[:, 1:2]) + np.log(eps + 1.0 - action[:, 1:2]) +
+                   np.log(eps + action[:, 2:3]) + np.log(eps + 1.0 - action[:, 2:3]))
+        log_prob = float(np.clip(log_gauss + log_jac.sum(), -20.0, 20.0))
 
         value = float((latent @ self.weights["critic_w"] + self.weights["critic_b"]).ravel()[0])
         return action, value, log_prob
@@ -292,13 +299,18 @@ class NumPyPPO:
                         callback(episode_count, steps_done, log["rewards"][-1])
 
                 if steps_done >= total_timesteps:
+                    # 提前终止：先将 bootstrap 写入 buf_val[t+1]（GAE 期望位置）
+                    _, last_val, _ = self.policy.get_action(obs)
+                    buf_val[t + 1] = last_val
                     break
 
-            # 最后一步的 value (bootstrap)
-            _, last_val, _ = self.policy.get_action(obs)
-            buf_val[t + 1 if steps_done < total_timesteps else t] = last_val
+            # 正常循环结束（或提前终止后到这里）：最后一步的 value (bootstrap)
+            if steps_done < total_timesteps:
+                _, last_val, _ = self.policy.get_action(obs)
+                buf_val[t + 1] = last_val
 
             # ── GAE ──
+            # t 是最后一个写入的位置（共 t+1 个样本）
             advantages, returns = compute_gae(
                 buf_rew[:t+1], buf_val[:t+2], buf_done[:t+1],
                 cfg["gamma"], cfg["gae_lambda"],

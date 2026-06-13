@@ -41,6 +41,8 @@ class SafetyConfig:
     soc_min: float = 0.10
     soc_max: float = 0.90
     overload_threshold: float = 0.85
+    battery_charge_efficiency: float = 0.90   # 充电效率 (锂离子电池典型值 90%)
+    battery_discharge_efficiency: float = 0.90  # 放电效率 (锂离子电池典型值 90%)
 
 
 @dataclass
