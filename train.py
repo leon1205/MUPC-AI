@@ -176,13 +176,15 @@ def main():
 
     obs_dim = env.observation_space.shape[0]
     print(f"  观测空间: Box({obs_dim},)")
-    print(f"  动作空间: Box(2,), 模式: {args.mode}, 算法: {args.algo}")
+    act_dim = env.action_space.shape[0]
+    print(f"  动作空间: Box({act_dim},), 模式: {args.mode}, 算法: {args.algo}")
 
     # ── 训练 ────────────────────────────────────────────
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.tensorboard_log, exist_ok=True)
 
-    if has_sb3 and has_gym:
+    # dual_mode 需要使用 NumPy PPO（SB3 MlpPolicy 不支持双参数动作空间）
+    if has_sb3 and has_gym and not args.dual_mode:
         _train_sb3(env, eval_env, args)
     else:
         _train_numpy_ppo(env, eval_env, args, obs_dim)

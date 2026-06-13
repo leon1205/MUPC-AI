@@ -1,10 +1,11 @@
 # MUPC AI 优化引擎 - 模块产品需求文档 (PRD)
 
-[REVIEWED: PASS] — v2.6 农网台区参数更新
+[REVIEWED: PASS] — v2.7 双参数动作空间
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
 | v2.6 | 2026-06-10 | 需求分析师 | 评审通过 |
+| v2.7 | 2026-06-13 | 需求分析师 | 评审通过 |
 | v2.5 | 2026-06-08 | 需求分析师 | 评审通过 |
 | v2.4 | 2026-06-07 | 需求分析师 | 评审通过 |
 
@@ -17,6 +18,8 @@
 > **v2.1 核心变更：** 状态空间移除 D5（电能质量），动作空间移除 A3a/A3b/A3c（分相补偿系数）。三相不平衡治理由实时控制核心模块独立处理。详见第 5 章。
 >
 > **v2.2 核心变更：** D1-实时数据新增三相电压标幺值（voltage_phase_a/b/c），用于电压感知 P/Q 协同控制（过/低电压检测→有功充放+无功调节）。验证 q_batt_set 符号定义完整性。详见第 5 章。
+>
+> **v2.7 核心变更：** 动作空间从单参数（p_batt_set）升级为双参数（P_ref + k_droop）模式，实现下垂控制 P_output = P_ref + k_droop × ΔV。AI 负责稳态全局优化（P_ref），执行器负责毫秒级暂态调节（k_droop × ΔV）。通信中断时执行器保持最后有效参数，继续下垂控制，保障本质安全不停机。详见第 5.3 节（双参数动作空间）和第 5.4 节（下垂控制逻辑）。
 >
 > **v2.6 核心变更：** 动作空间从 2 维扩展为 3 维（恢复 pv_limit 主动弃光）；SCENE-01 奖励函数新增 w6 电压变化斜率惩罚 R_voltage_slope = |ΔV|，迫使 AI 平滑调节。详见第 5 章（动作空间）和第 6 章（奖励函数）。
 >
@@ -439,6 +442,29 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 | ACT-04 | pv_limit ∈ [0.0, 1.0] | 光伏限功率比例约束（v2.6 恢复） |
 | ACT-05 | 当 dispatch_p_set 有效时，p_batt_set 绝对值不得超过 dispatch_p_set 绝对值 | 调度指令权限约束 |
 
+### 5.4a 双参数模式校验规则（v2.7）
+
+> **v2.7 双参数模式说明：** 动作空间从单参数（p_batt_set）升级为双参数（P_ref + k_droop），实现下垂控制公式 `P_output = P_ref + k_droop × ΔV`。k_droop 范围由实时控制模块提供，通过 intercore 获取。
+
+| 规则 ID | 约束条件 | 说明 |
+|---------|----------|------|
+| ACT-DUAL-01 | p_ref ∈ [-max_batt_discharge_power, max_batt_charge_power] | 充电/放电功率约束 |
+| ACT-DUAL-02 | k_droop ∈ [k_droop_min, k_droop_max] | 下垂系数范围由实时控制模块提供 |
+| ACT-DUAL-03 | Δp_ref 变化率 <= p_batt_ramp_limit_kw / 步 | 防止基准点突变 |
+| ACT-DUAL-04 | 当 dispatch_p_set 有效时，p_ref 绝对值不得超过 dispatch_p_set 绝对值 | 调度指令权限约束 |
+| ACT-DUAL-05 | pv_limit ∈ [pv_limit_min, 1.0]（防逆流场景除外）| 光伏限功率下限约束 |
+
+### 5.4b 通信中断降级规则（v2.7）
+
+| 异常场景 | 检测条件 | 处理措施 |
+|----------|----------|----------|
+| 通信中断 | intercore TCP 断开检测 | 执行器保持最后收到的 P_ref 和 k_droop，继续按下垂公式计算 |
+| k_droop 超范围 | k_droop < k_min 或 k_droop > k_max | clamp 至 [k_min, k_max]，记录 WARN 日志 |
+| p_ref 超范围 | p_ref < -P_safe 或 p_ref > P_safe | clamp 至 [-P_safe, P_safe]，记录 WARN 日志 |
+| 双参数缺失 | P_ref 和 k_droop 同时为 NaN | 触发 AI 降级，使用兜底策略 |
+
+**降级原则：** 通信中断时保持最后有效的 P_ref 和 k_droop，不主动归零。继续按下垂公式 `P_output = P_ref + k_droop × ΔV` 计算，保障基础安全不停机。
+
 ### 5.5 接口定义
 
 ```rust
@@ -453,13 +479,44 @@ pub struct ActionOutput {
 }
 ```
 
+### 5.5a 双参数动作输出结构（v2.7）
+
+```rust
+/// 动作输出结构体（v2.7 双参数模式）
+#[derive(Debug, Clone)]
+pub struct ActionOutput {
+    pub p_ref: f64,           // 有功功率基准点 (kW), 范围由 ActionSpaceConfig 确定
+    pub k_droop: f64,         // 电压-有功下垂系数 (kW/V), 范围由实时控制模块提供
+    pub load_shedding: f64,   // 可中断负荷切除量 (kW), 保留
+    pub pv_limit: f64,         // 光伏限功率比例, 保留
+    pub confidence: f64,      // 决策置信度 (0.0 ~ 1.0)
+}
+```
+
+### 5.5b 下垂控制公式（v2.7）
+
+执行器根据下垂公式计算实时功率输出：
+
+```
+P_output = P_ref + k_droop × ΔV
+```
+
+其中：
+- P_output：执行器最终输出的有功功率设定值
+- P_ref：AI 输出的有功基准点
+- k_droop：AI 输出的下垂系数（电压-有功下垂系数）
+- ΔV：电压偏差（V_actual - V_target），单位 V
+
+**k_droop 物理含义：** 电压每升高 1V，输出功率增加 k_droop kW（充电方向）；电压每降低 1V，输出功率减少 k_droop kW（放电方向）。
+
 ### 5.6 消息总线集成
 
 | Topic | 发布者 | 订阅者 | 数据格式 | 频率 |
 |-------|--------|--------|----------|------|
-| `ai/action_output` | ModelManager | strategy-engine, intercore | `ActionOutput` JSON | 1Hz |
+| `ai/action_output` | ModelManager | strategy-engine, intercore | `ActionOutput` JSON（含 p_ref, k_droop）| 1Hz |
 | `ai/reward_value` | RewardCalculator | OnlineUpdater, Web UI | `RewardValue` JSON | 1Hz |
 | `ai/model_status` | ModelManager | Web UI, 告警模块 | `ModelStatus` JSON | 1Hz |
+| `ai/droop_range` | intercore | ActionValidator | `{k_min: f64, k_max: f64}` JSON | 按需更新 |
 
 ### 5.7 状态/动作空间验收标准
 
@@ -474,6 +531,17 @@ pub struct ActionOutput {
 | ACT-08 | 每个动作维度的取值范围严格执行定义边界 | 单元测试（边界值验证 + clamp 验证）|
 | ACT-09 | 4 条约束规则（ACT-01/03/04/05）均在动作输出时执行校验，违反约束时自动 clamp 并记录 WARN 日志 | 集成测试 |
 | ACT-10 | 约束校验总延迟 < 0.5ms | 性能测试 |
+| **DUAL-01** | RL 模型输出包含 P_ref 和 k_droop 两个参数 | 单元测试 |
+| **DUAL-02** | P_ref 取值范围符合 ActionSpaceConfig 约束 | 单元测试（边界值验证）|
+| **DUAL-03** | k_droop 取值范围符合实时控制模块提供的 [k_min, k_max] | 集成测试 |
+| **DUAL-04** | 双参数通过 intercore 同时下发（TCP 帧 v2.0）| 集成测试（抓包验证）|
+| **DUAL-05** | 下垂公式 P = P_ref + k_droop × ΔV 在执行器端正确执行 | 集成测试（模拟 ΔV）|
+| **DUAL-06** | k_droop 管理权归 AI 引擎，实时控制模块不得修改 | 代码审查 |
+| **DUAL-07** | 通信中断时执行器保持最后有效的 P_ref 和 k_droop | 集成测试（断联测试）|
+| **DUAL-08** | P_ref 和 k_droop 任一超范围时自动 clamp 并记录 WARN 日志 | 集成测试 |
+| **FALLBACK-01** | AI 推理失败时自动降级至本地策略 | 集成测试（模拟推理失败）|
+| **FALLBACK-02** | 通信中断时执行器保持最后有效的 P_ref 和 k_droop | 集成测试（断联测试）|
+| **FALLBACK-03** | 通信恢复后自动切回 AI 双参数控制 | 集成测试 |
 
 ### 5.8 RL 决策验收标准
 
@@ -1213,3 +1281,16 @@ AI 引擎可通过 p_batt/q_batt 协同控制主动调节。v2.3 仅恢复电压
 | 2 | 版本号更新 | 文档头部 | v2.5 → v2.6 |
 
 **修订依据：** 农网台区新规格落地：变压器 200kVA、光伏 150kW、储能 50kW/100kWh、居民负荷 60kW、农业冲击负荷最高 120kW。代码默认值已同步更新。
+
+## v2.7 修订记录
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | 双参数动作空间 | 5.3/5.4a/5.4b/5.5a/5.5b | 动作空间从单参数（p_batt_set）升级为双参数（P_ref + k_droop），实现下垂控制 P_output = P_ref + k_droop × ΔV |
+| 2 | ACT-DUAL-01~05 校验规则 | 5.4a | 新增双参数模式校验规则（p_ref 值域、k_droop 范围、变化率、调度约束、pv_limit 下限） |
+| 3 | 通信中断降级规则 | 5.4b | 执行器保持最后有效的 P_ref 和 k_droop，继续下垂控制，保障本质安全不停机 |
+| 4 | 消息总线 Topic 扩展 | 5.6 | 新增 `ai/droop_range` topic，用于传递 k_droop 范围 |
+| 5 | 双参数验收标准 | 5.7 | 新增 DUAL-01~08 和 FALLBACK-01~03 验收标准 |
+| 6 | 版本号更新 | 文档头部 | v2.6 → v2.7 |
+
+**修订依据：** 动作空间重构 PRD（2026-06-13）已合并。原方案存在暂态响应盲区（AI 推理周期秒级无法覆盖毫秒级电压波动）、通信强依赖（通信中断即失控）、安全裁剪破坏梯度、Sim-to-Real 鸿沟大等问题。v2.7 通过双参数模式实现时间尺度解耦：AI 负责稳态全局优化（P_ref），执行器负责毫秒级暂态调节（k_droop × ΔV）。

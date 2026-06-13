@@ -414,8 +414,10 @@ class NumPyPPO:
 
         # 简化 log_prob (用 MSE 代理 ratio)
         # 实际 ratio ≈ exp(-0.5 * (new - old)² / σ²) 但简化用 action 距离
-        action_diff = new_actions - old_actions
-        new_logp = -0.5 * np.sum((action_diff / np.exp(self.policy.log_std)) ** 2, axis=-1)
+        # 注意: old_actions 是 env_act_dim 维（4D for dual_mode），new_actions 是 policy.act_dim 维（5D for dual_mode）
+        # 需要对齐维度
+        action_diff = new_actions[:, :old_actions.shape[1]] - old_actions
+        new_logp = -0.5 * np.sum((action_diff / np.exp(self.policy.log_std[:old_actions.shape[1]])) ** 2, axis=-1)
 
         # ratio
         ratio = np.exp(np.clip(new_logp - old_logp, -10, 10))
@@ -427,8 +429,8 @@ class NumPyPPO:
         loss_a2 = clipped * advantages
         actor_loss = -np.mean(np.minimum(loss_a1, loss_a2))
 
-        # Entropy bonus
-        std = np.exp(self.policy.log_std)
+        # Entropy bonus (only over env dimensions, not extra policy dims)
+        std = np.exp(self.policy.log_std[:old_actions.shape[1]])
         entropy = np.mean(np.sum(np.log(std) + 0.5 * np.log(2 * np.pi * np.e)))
 
         # Critic loss (MSE)
@@ -440,7 +442,7 @@ class NumPyPPO:
         # Policy gradient: dL/dμ = ratio * advantage * (a_raw_old - μ) / σ²
         # where a_raw_old is the pre-activation action from the old policy
 
-        std = np.exp(self.policy.log_std)  # (4,)
+        std = np.exp(self.policy.log_std[:old_actions.shape[1]])  # only env dimensions
         sigma2 = std ** 2
 
         # Invert activation to get old pre-activation action
@@ -465,12 +467,19 @@ class NumPyPPO:
                                         (1.0 - np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7)))
 
         # Gradient of log_prob w.r.t. action_mean = (a_raw - μ) / σ²
-        dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean) / sigma2
+        dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean[:, :old_actions.shape[1]]) / sigma2
         dL_dmu = -dL_dmu / len(obs)  # negative because we maximize, and average
 
+        # Pad to policy.act_dim (extra dimensions don't affect loss)
+        if self.policy.act_dim > old_actions.shape[1]:
+            dL_dmu_full = np.zeros((dL_dmu.shape[0], self.policy.act_dim), dtype=np.float32)
+            dL_dmu_full[:, :old_actions.shape[1]] = dL_dmu
+        else:
+            dL_dmu_full = dL_dmu
+
         # ── Backprop through actor head ──
-        grad_actor_w = latent.T @ dL_dmu
-        grad_actor_b = dL_dmu.sum(axis=0)
+        grad_actor_w = latent.T @ dL_dmu_full
+        grad_actor_b = dL_dmu_full.sum(axis=0)
 
         # ── Backprop through shared layers ──
         # Re-run forward with mask tracking
@@ -486,7 +495,7 @@ class NumPyPPO:
             post_acts.append(post)
 
         # Gradient from actor head into last hidden layer
-        dL_dh = dL_dmu @ self.policy.weights["actor_w"].T  # (batch, hidden[-1])
+        dL_dh = dL_dmu_full @ self.policy.weights["actor_w"].T  # (batch, hidden[-1])
 
         # ── Backprop through shared layers (动态循环，支持任意层数) ──
         grads = {}
@@ -526,8 +535,11 @@ class NumPyPPO:
 
         # Update log_std
         dL_dsigma = (ratio.reshape(-1, 1) * advantages.reshape(-1, 1) *
-                     ((a_raw_old - action_mean) ** 2 / sigma2 - 1.0)).sum(axis=0) / len(obs)
-        self.opt_log_std.step_scalar("log_std", self.policy.log_std, -dL_dsigma)
+                     ((a_raw_old - action_mean[:, :old_actions.shape[1]]) ** 2 / sigma2 - 1.0)).sum(axis=0) / len(obs)
+        # Only update the env-relevant dimensions; pad zeros for unused policy dimensions
+        full_dL_dsigma = np.zeros(self.policy.act_dim, dtype=np.float32)
+        full_dL_dsigma[:old_actions.shape[1]] = dL_dsigma
+        self.opt_log_std.step_scalar("log_std", self.policy.log_std, -full_dL_dsigma)
 
         return float(actor_loss), float(critic_loss)
 
