@@ -121,3 +121,13 @@ reward_weights:
 comm:
   action_delay_steps_min: 1        # 最小延迟步数（1步=15分钟）
   action_delay_steps_max: 3        # 最大延迟步数（模拟 RTU 轮询周期 15~45min）
+
+# ═══════════════════════════════════════════════════════════════
+# 双参数下垂控制配置 (v2.7 新增)
+# ═══════════════════════════════════════════════════════════════
+dual_control:
+  enabled: false                  # 启用双参数下垂模式（替代标准 3 维动作）
+  k_droop_min: -100.0            # 下垂系数下限 (kW/V)
+  k_droop_max: 100.0             # 下垂系数上限 (kW/V)
+  p_ref_ramp_limit_kw: 50.0      # P_ref 变化率限制 (kW/步)
+  pv_limit_min: 0.1              # 光伏限功率下限（防逆流场景除外）

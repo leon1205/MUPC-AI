@@ -84,6 +84,16 @@ class CommConfig:
 
 
 @dataclass
+class DualControlConfig:
+    """双参数下垂控制配置 (v2.7)"""
+    enabled: bool = False
+    k_droop_min: float = -100.0
+    k_droop_max: float = 100.0
+    p_ref_ramp_limit_kw: float = 50.0
+    pv_limit_min: float = 0.1
+
+
+@dataclass
 class QControlConfig:
     k_q: float = 200.0
 
@@ -156,6 +166,7 @@ class MupcConfig:
     obs_normalization: ObsNormalizationConfig = field(default_factory=ObsNormalizationConfig)
     reward_weights: RewardWeightsConfig = field(default_factory=RewardWeightsConfig)
     comm: CommConfig = field(default_factory=CommConfig)
+    dual_control: DualControlConfig = field(default_factory=DualControlConfig)
 
     # 配置文件路径（用于校验）
     _source_file: Optional[str] = field(default=None, repr=False)
@@ -182,6 +193,7 @@ class MupcConfig:
             obs_normalization=_section(ObsNormalizationConfig, data.get("obs_normalization", {})),
             reward_weights=_section(RewardWeightsConfig, data.get("reward_weights", {})),
             comm=_section(CommConfig, data.get("comm", {})),
+            dual_control=_section(DualControlConfig, data.get("dual_control", {})),
             _source_file=str(path),
         )
 
