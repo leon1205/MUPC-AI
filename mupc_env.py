@@ -171,8 +171,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 电压仿真器
         self._voltage_sim = VoltageSimulator()
 
-        # 观测/动作空间 (v2.5: 58维单模式, 59维多模式)
-        obs_dim = 58 if mode != "all" else 59
+        # 观测/动作空间 (v2.10: 61维单模式, 62维多模式，含D9安全覆盖状态3字段)
+        obs_dim = 61 if mode != "all" else 62
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
@@ -260,6 +260,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._prev_q_batt = 0.0
         self._prev_k_droop = 0.0  # v2.8
         self._prev_v_avg = 1.0   # v2.6
+        # v2.10 新增: D9 安全覆盖状态
+        self._safety_override_active = False
+        self._safety_override_p_ref = 0.0  # kW
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -409,6 +412,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             k_droop=k_droop,  # v2.8
             prev_k_droop=prev_k_droop_for_reward,  # v2.8
             prev_v_avg=prev_v_avg_for_reward,  # v2.6
+            safety_override_active=self._safety_override_active,  # v2.10
+            safety_override_p_ref=self._safety_override_p_ref,  # v2.10
         )
 
         # 12. 推进时间
@@ -480,26 +485,29 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── 观测构建 ────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
-        """构建 58 维观测向量 (多模式追加 mode_id 为 59 维)。
+        """构建 61 维观测向量 (多模式追加 mode_id 为 62 维)。
 
-        对齐下游 MUPC AI 引擎设计文档 v2.5 to_input_vector:
+        对齐下游 MUPC AI 引擎设计文档 v2.10 to_input_vector (59维基础+3维D9):
 
         索引   内容                      字段数
         [0..9]  D1: 10 标量              (含 q_realtime_margin)
         [10..24] D2 pv_forecast          15维
         [25..39] D2 load_forecast         15维
-        [41..43] D3 电价                  3字段
-        [44..46] D4 需量                  3字段
-        [47..48] D5 气象                  2字段
-        [49]     D6 dispatch_p_set        1字段
-        [50]     D7 q_realtime_margin     1字段
-        [51..56] D7 season_encoding       6字段
-        [57]     D7 time_period_encoding  1字段
-        [58]     (可选) mode_id           1字段
+        [40..42] D3 电价                  3字段
+        [43..45] D4 需量                  3字段
+        [46..47] D5 气象                  2字段
+        [48]     D6 dispatch_p_set        1字段
+        [49]     D7 q_realtime_margin     1字段
+        [50..55] D7 season_encoding       6字段
+        [56]     D7 time_period_encoding  1字段
+        [57]     D9 safety_override_active (bool→1.0/0.0)
+        [58]     D9 safety_override_p_ref 1字段
+        [59]     D9 safety_override_reason_code 1字段
+        [60]     (可选) mode_id           1字段
 
-        总维度: 10+15+15+3+3+2+1+1+6+1 = 58 (单模式)
+        总维度: 10+15+15+3+3+2+1+1+6+1+3 = 61 (单模式)
         """
-        obs_dim = 58 if self._mode != "all" else 59
+        obs_dim = 61 if self._mode != "all" else 62
         obs = np.zeros(obs_dim, dtype=np.float32)
         params = self._data.get("norm_params", {})
 
@@ -522,36 +530,41 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # ── D2 [25..39] load_forecast (15维) ──
         obs[25:40] = forecast[15:30]
 
-        # ── D3 [41..43] 电价 ──
-        obs[41] = self._data["current_electricity_price"][self._step_idx]
-        obs[42] = self._data["next_period_price"][self._step_idx]
-        obs[43] = self._data["price_tariff_id"][self._step_idx]
+        # ── D3 [40..42] 电价 ──
+        obs[40] = self._data["current_electricity_price"][self._step_idx]
+        obs[41] = self._data["next_period_price"][self._step_idx]
+        obs[42] = self._data["price_tariff_id"][self._step_idx]
 
-        # ── D4 [44..46] 需量 ──
-        obs[44] = self._current_demand
-        obs[45] = CONTRACT_DEMAND_KW
-        obs[46] = self._peak_demand
+        # ── D4 [43..45] 需量 ──
+        obs[43] = self._current_demand
+        obs[44] = CONTRACT_DEMAND_KW
+        obs[45] = self._peak_demand
 
-        # ── D5 [47..48] 气象 ──
-        obs[47] = self._data["solar_irradiance"][self._step_idx]
-        obs[48] = self._data["temperature"][self._step_idx]
+        # ── D5 [46..47] 气象 ──
+        obs[46] = self._data["solar_irradiance"][self._step_idx]
+        obs[47] = self._data["temperature"][self._step_idx]
 
-        # ── D6 [49] 调度 ──
+        # ── D6 [48] 调度 ──
         dp = self._data["dispatch_p_set"][self._step_idx]
-        obs[49] = dp if abs(dp) > 1e-6 else 0.0
+        obs[48] = dp if abs(dp) > 1e-6 else 0.0
 
-        # ── D7 [50] q_realtime_margin ──
-        obs[50] = self._q_realtime_margin
+        # ── D7 [49] q_realtime_margin ──
+        obs[49] = self._q_realtime_margin
 
-        # ── D7 [51..56] season_encoding (6维) ──
-        obs[51:57] = self._season_encoding
+        # ── D7 [50..55] season_encoding (6维) ──
+        obs[50:56] = self._season_encoding
 
-        # ── D7 [57] time_period_encoding (1维) ──
-        obs[57] = self._time_period_encoding[0]  # 0=夜间, 1=白天 (二进制编码)
+        # ── D7 [56] time_period_encoding (1维) ──
+        obs[56] = self._time_period_encoding[0]  # 0=夜间, 1=白天 (二进制编码)
 
-        # ── mode_id [58] (可选) ──
+        # ── D9 [57..59] 安全覆盖状态 (v2.10 新增) ──
+        obs[57] = 1.0 if self._safety_override_active else 0.0
+        obs[58] = self._safety_override_p_ref
+        obs[59] = 0.0  # reason_code: 0=none, 1=voltage_violation, 2=q_exhausted, 3=emergency
+
+        # ── mode_id [60/61] (可选) ──
         if self._mode == "all":
-            obs[58] = MODE_ID_MAP[self._current_mode]
+            obs[60] = MODE_ID_MAP[self._current_mode]
 
         # ── 归一化 ──
         obs = self._normalize_obs(obs, params)
@@ -635,9 +648,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """SCENE-01 奖励函数 (v2.8 P-Q 协同度奖励重构).
+        """SCENE-01 奖励函数 (v2.10 安全覆盖惩罚).
 
-        R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth
+        R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination
+            - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth - w8*R_safety_override
+
+        v2.10 核心变更:
+          - 新增 R_safety_override 惩罚项：当 safety_override_active=True 时触发
+          - AI 引擎感知被实时控制模块覆盖事件，学习避免触发覆盖的策略
 
         v2.8 核心变更:
           - 移除"电压硬惩罚"P_voltage_deviation，改为"行为奖励"R_PQ_coordination
@@ -730,13 +748,29 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             delta_k = abs(k_droop - prev_k) if k_droop != 0.0 or prev_k != 0.0 else 0.0
             r_smooth = -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
 
+        # ── 安全覆盖惩罚 (v2.10 新增) ──
+        r_safety_override = 0.0
+        w8 = w[7] if len(w) > 7 else 0.0
+        if w8 > 0 and r.get("safety_override_active", False):
+            # reason_code: 0=none, 1=voltage_violation, 2=q_exhausted, 3=emergency
+            reason_code = r.get("safety_override_reason_code", 0)
+            if reason_code == 1:       # voltage_violation
+                r_safety_override = -50.0
+            elif reason_code == 2:    # q_exhausted
+                r_safety_override = -30.0
+            elif reason_code == 3:    # emergency
+                r_safety_override = -100.0
+            else:                      # unknown/generic
+                r_safety_override = -20.0
+
         total = (w[0] * r_pv
                  - w[1] * p_batt_deg
                  - w[2] * p_overload
                  + w4 * r_pq
                  - p_ramp_penalty
                  - p_voltage_slope
-                 + w7 * r_smooth)
+                 + w7 * r_smooth
+                 + w8 * r_safety_override)
 
         info = {
             "r_pv_consumption": float(r_pv),        # v2.8 差异化弃光
@@ -746,6 +780,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "p_ramp_penalty": float(-p_ramp_penalty),
             "r_voltage_slope": float(r_voltage_slope),  # v2.6
             "r_smooth": float(r_smooth),            # v2.8 新增
+            "r_safety_override": float(r_safety_override),  # v2.10 新增
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5

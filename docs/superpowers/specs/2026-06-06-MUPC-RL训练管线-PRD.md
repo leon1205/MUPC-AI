@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.12 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.11 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.10 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.9 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -9,9 +10,11 @@
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.8 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.11 (`[REVIEWED: PASS]`)
 
 ---
+
+> **v2.12 变更说明（对齐部署端 v2.10）：** 观测空间从 58/59 维扩展为 61/62 维（新增 D9 安全覆盖状态 3 字段：safety_override_active, safety_override_p_ref, safety_override_reason_code）。SCENE-01 奖励函数新增 R_safety_override 惩罚项（w8 加权）：safety_override_active=True 时根据触发原因惩罚（voltage_violation=-50/q_exhausted=-30/emergency=-100/generic=-20），激励 AI 学习避免触发覆盖的策略。训练管线对齐下游 v2.10 PRD。
 
 > **v2.11 变更说明（对齐部署端 v2.8）：** SCENE-01 奖励函数重构（R_PQ_coordination + R_smooth）。移除"电压硬惩罚"，引入 P-Q 协同度奖励（Q 有裕度时省电奖励/Q 饱和时正确出手奖励）。弃光场景差异化（v_avg≥1.05 时检查 p_ref 方向，充电消纳=正确/放电=惩罚）。新增下垂系数平滑惩罚 R_smooth（防止 k_droop 震荡）。新增 w7 光滑惩罚权重。训练管线对齐下游 v2.8 PRD。
 
