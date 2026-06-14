@@ -68,11 +68,11 @@ VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
 # ═══════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS: dict[str, list[float]] = {
-    # v2.12 MODE-01: w1~w12 (R-04~R-07 已实现)
+    # v2.13 MODE-01: w1~w13 (v2.13 已实现)
     # w1(光伏消纳), w2(电池损耗), w3(过载), w4(P-Q协同), w5(变化率),
     # w6(电压斜率), w7(下垂平滑), w8(安全覆盖), w9(过载预警), w10(SOC预警),
-    # w11(SOC均衡), w12(冲击负荷响应)
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5],
+    # w11(SOC均衡), w12(冲击预备度), w13(状态改善率)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5],
     "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
     "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
     "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
@@ -221,6 +221,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._prev_q_batt: float = 0.0
         self._prev_k_droop: float = 0.0  # v2.8: 下垂系数平滑惩罚
         self._prev_v_avg: float = 1.0   # v2.6: 电压变化斜率惩罚
+        # v2.13 新增: Welford 动态归一化状态
+        self._welford_mean: float = 0.0
+        self._welford_m2: float = 1.0   # 对方差的无偏估计
+        self._welford_count: int = 0
+        # v2.13 新增: 状态改善率奖励
+        self._prev_v_dev: float = 0.0   # 上一步的电压偏差绝对值
         # v2.5 新增字段
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
@@ -267,6 +273,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # v2.10 新增: D9 安全覆盖状态
         self._safety_override_active = False
         self._safety_override_p_ref = 0.0  # kW
+        # v2.13 新增: Welford 动态归一化状态
+        self._welford_mean = 0.0
+        self._welford_m2 = 1.0
+        self._welford_count = 0
+        self._prev_v_dev = 0.0  # v2.13: 状态改善率奖励
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -398,10 +409,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         prev_p_batt_for_reward = self._prev_p_batt
         prev_k_droop_for_reward = self._prev_k_droop
         prev_v_avg_for_reward = self._prev_v_avg
+        prev_v_dev_for_reward = self._prev_v_dev  # v2.13
         self._prev_p_batt = p_batt
         self._prev_q_batt = float(q_batt)
         self._prev_k_droop = k_droop
         self._prev_v_avg = v_avg
+        self._prev_v_dev = abs(v_avg - 1.0)  # v2.13
 
         # 11. 奖励计算
         reward, reward_info = self._compute_reward(
@@ -416,6 +429,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             k_droop=k_droop,  # v2.8
             prev_k_droop=prev_k_droop_for_reward,  # v2.8
             prev_v_avg=prev_v_avg_for_reward,  # v2.6
+            prev_v_dev=prev_v_dev_for_reward,  # v2.13
             safety_override_active=self._safety_override_active,  # v2.10
             safety_override_p_ref=self._safety_override_p_ref,  # v2.10
         )
@@ -652,18 +666,18 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """SCENE-01 奖励函数 (v2.12 R-04~R-07 中优先级实现).
+        """SCENE-01 奖励函数 (v2.13 精细化奖励函数设计).
 
         R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination
             - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth - w8*R_safety_override
             + w9*R_overload_warning + w10*R_soc_warning + w11*R_soc_balance
-            + w12*R_shock_response
+            + w12*R_shock_response + w13*R_state_improve
 
-        v2.12 核心变更（R-04~R-07，已实现）:
-          - R-04: 变压器过载分段惩罚（<75%:0, 75~90%:线性, 90~100%:指数, >=100%:硬惩罚-100）
-          - R-05: 电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)
-          - R-06: 冲击负荷响应奖励 R_shock_response
-          - R-07: P-Q 协同度阈值可配置化（Q_THRESHOLD/P_THRESHOLD）
+        v2.13 核心变更（v2.14.x，已实现）:
+          - P-Q协同Sigmoid平滑化（替代硬阈值，k=50）
+          - Welford动态自适应归一化（替代固定系数）
+          - 状态改善率奖励 R_state_improve
+          - 冲击负荷预备度奖励重构
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
         dev = abs(v_avg - 1.0)
@@ -712,29 +726,34 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         c_rate = abs(p_ref) / BATTERY_CAPACITY_KWH
         p_batt_deg = alpha * (c_rate ** 2)
 
-        # ── P-Q 协同度奖励 (v2.8 新增，替代原电压惩罚) ──
-        # 仅在电压越限时计算
+        # ── P-Q 协同度奖励 (v2.13 Sigmoid平滑化) ──
+        # 替代硬阈值，v2.13: w_save = sigmoid(k*(q_margin-q_threshold))
         r_pq = 0.0
-        Q_THRESHOLD = 0.10   # q_realtime_margin > 10% 视为"有裕度"
-        P_THRESHOLD = 5.0    # kW，省电策略阈值
+        SIGMOID_K = 50.0   # 控制过渡陡峭程度
+        Q_THRESHOLD = 0.10
+        P_THRESHOLD = 5.0
         if dev > VOLTAGE_DEADBAND:
-            if self._q_realtime_margin > Q_THRESHOLD:
-                # Q 有裕度: AI 最优解是"偷懒"省电池
-                if abs(p_ref) < P_THRESHOLD:
-                    r_pq = +50.0   # 大额奖励
-                else:
-                    r_pq = -5.0    # 轻微惩罚（强行出力浪费电池）
+            q_margin = self._q_realtime_margin
+            # Sigmoid 平滑过渡
+            w_save = 1.0 / (1.0 + math.exp(-SIGMOID_K * (q_margin - Q_THRESHOLD)))
+            w_support = 1.0 - w_save
+            # 省电策略基准（Q有裕度时AI应"偷懒"）
+            if abs(p_ref) < P_THRESHOLD:
+                r_lazy = +50.0
             else:
-                # Q 已饱和: AI 必须正确出手
-                if v_low and p_ref < 0:
-                    r_pq = +50.0   # 低电压 + 放电（正确）
-                elif v_high and p_ref > 0:
-                    r_pq = +50.0   # 高电压 + 充电（正确）
-                elif v_low and p_ref >= 0:
-                    r_pq = -30.0   # 低电压 + 不放电（失职）
-                elif v_high and p_ref <= 0:
-                    r_pq = -30.0   # 高电压 + 不充电（失职）
-                # else: r_pq = 0.0
+                r_lazy = -5.0
+            # 正确出手基准（Q饱和时AI必须正确动作）
+            if v_low and p_ref < 0:
+                r_correct = +50.0
+            elif v_high and p_ref > 0:
+                r_correct = +50.0
+            elif v_low and p_ref >= 0:
+                r_correct = -30.0
+            elif v_high and p_ref <= 0:
+                r_correct = -30.0
+            else:
+                r_correct = 0.0
+            r_pq = w_save * r_lazy + w_support * r_correct
 
         w4 = w[3] if len(w) > 3 else 0.0
 
@@ -824,6 +843,34 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                 r_shock = (w_shock * load_shedding / max(LOAD_SHED_MAX_KW, 1e-6)
                            - lambda_shock * 1.0 / max_response_time)
 
+        # ── R-06 冲击负荷预备度奖励重构 (v2.13) ──
+        r_readiness = 0.0
+        w12 = w[11] if len(w) > 11 else 0.0
+        if w12 > 0:
+            soc_reserve_target = 0.3
+            p_ref_reserve_target = 10.0  # kW
+            r_readiness = (w12 * (soc_reserve_target - soc_new)
+                          + 0.5 * max(0.0, p_ref_reserve_target - abs(p_ref)))
+
+        # ── R-14.4 状态改善率奖励 (v2.13) ──
+        r_state_improve = 0.0
+        w13 = w[12] if len(w) > 12 else 0.0
+        if w13 > 0 and dev > VOLTAGE_DEADBAND:
+            prev_v_dev = r.get("prev_v_dev", 0.0)
+            v_dev_curr = dev
+            if prev_v_dev > v_dev_curr and p_ref * (prev_v_dev - v_dev_curr) > 0:
+                r_state_improve = w13 * (prev_v_dev - v_dev_curr) * (1.0 if p_ref >= 0 else -1.0)
+
+        # ── Welford 动态归一化状态更新 (v2.13) ──
+        raw_reward = (w[0] * r_pv - alpha * w[1] * p_batt_deg
+                     - w[2] * p_overload + w4 * r_pq)
+        delta = raw_reward - self._welford_mean
+        self._welford_count += 1
+        self._welford_mean += delta / self._welford_count
+        delta2 = raw_reward - self._welford_mean
+        self._welford_m2 += delta * delta2
+        sigma = math.sqrt(self._welford_m2 / self._welford_count) if self._welford_count > 1 else 1.0
+
         # ── R-01 奖励子项标准化到 [-1, 1] 区间 ──
         # 各子项归一化后加权求和，统一量纲加速 RL 收敛
         # 正值奖励: r_pv [0,1], r_pq [-30,50]→[0,1], r_*_warning [0,-1]→[0,-1], r_soc_balance
@@ -842,13 +889,15 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         r_overload_warning_norm = float(np.clip(r_overload_warning, -1.0, 0.0)) if r_overload_warning < 0 else 0.0
         r_soc_warning_norm = float(np.clip(r_soc_warning, -1.0, 0.0)) if r_soc_warning < 0 else 0.0
         r_soc_balance_norm = float(np.clip(r_soc_balance / 0.5, -1.0, 1.0)) if r_soc_balance != 0 else 0.0
-        r_shock_norm = float(np.clip(r_shock / 20.0, -1.0, 1.0)) if r_shock != 0 else 0.0
+        r_readiness_norm = float(np.clip(r_readiness / 0.5, -1.0, 1.0)) if r_readiness != 0 else 0.0
+        r_state_improve_norm = float(np.clip(r_state_improve / 0.1, -1.0, 1.0)) if r_state_improve != 0 else 0.0
 
-        # w8~w12 可能在旧配置中不存在，使用 guarded 访问
+        # w8~w13 可能在旧配置中不存在，使用 guarded 访问
         w8_val = w[8] if len(w) > 8 else 0.0
         w9_val = w[9] if len(w) > 9 else 0.0
         w10_val = w[10] if len(w) > 10 else 0.0
-        w12_val = w[12] if len(w) > 12 else 0.0
+        w12_val = w[11] if len(w) > 11 else 0.0
+        w13_val = w[12] if len(w) > 12 else 0.0
 
         total = (w[0] * r_pv_norm
                  + w[1] * p_batt_deg_norm
@@ -861,13 +910,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                  + w9_val * r_overload_warning_norm
                  + w10_val * r_soc_warning_norm
                  + w11 * r_soc_balance_norm
-                 + w12_val * r_shock_norm)
+                 + w12_val * r_readiness_norm
+                 + w13_val * r_state_improve_norm)
 
         info = {
             "r_pv_consumption": float(r_pv),        # v2.8 差异化弃光
             "p_battery_degradation": float(-p_batt_deg),
             "p_transformer_overload": float(-p_overload),
-            "r_pq_coordination": float(r_pq),       # v2.8 新增
+            "r_pq_coordination": float(r_pq),       # v2.13 Sigmoid平滑化
             "p_ramp_penalty": float(-p_ramp_penalty),
             "r_voltage_slope": float(r_voltage_slope),  # v2.6
             "r_smooth": float(r_smooth),            # v2.8 新增
@@ -875,7 +925,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "r_overload_warning": float(r_overload_warning),  # v2.12 R-02
             "r_soc_warning": float(r_soc_warning),        # v2.12 R-02
             "r_soc_balance": float(r_soc_balance),        # v2.12 R-03
-            "r_shock_response": float(r_shock),            # v2.12 R-06
+            "r_readiness": float(r_readiness),            # v2.13 R-06 预备度奖励
+            "r_state_improve": float(r_state_improve),    # v2.13 R-14.4 状态改善率
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5

@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.15 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.14 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.13 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.12 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -12,13 +13,13 @@
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.12 (`[REVIEWED: PASS]`)（符号链接 → MUPC2/superpowers/specs/modules/）
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.13 (`[REVIEWED: PASS]`)（符号链接 → MUPC2/superpowers/specs/modules/）
 
 ---
 
-> **v2.14 变更说明（对齐部署端 v2.12 R-04~R-07）：** SCENE-01 奖励函数四项改进（R-04~R-07 已实现）。R-04：变压器过载分段惩罚（<75%:0, 75~90% 线性 0~10, 90~100% 指数 10~50, >=100% 硬惩罚 -100）。R-05：电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)，电压偏差越大权重越高。R-06：冲击负荷响应奖励 R_shock_response（load_rate 波动检测触发）。R-07：P-Q 协同度阈值常量移至模块顶部，支持可配置化。新增 w12 权重。训练管线对齐下游 v2.12 PRD。
+> **v2.15 变更说明（对齐部署端 v2.13）：** SCENE-01 奖励函数精细化设计。P-Q协同Sigmoid平滑化（k=50，平滑过渡替代硬阈值）。Welford动态自适应归一化（RunningStats状态更新，替代固定系数）。状态改善率奖励 R_state_improve（电压偏差实际改善才给正向反馈）。冲击负荷预备度奖励重构（R_readiness替代R_shock_response，保持SOC/放电缓冲空间）。新增 w12（预备度）、w13（状态改善率）权重。
 
-> **v2.13 变更说明（对齐部署端 v2.12 R-01~R-03）：** SCENE-01 奖励函数三项改进（R-01~R-03 已实现）。R-01：各奖励子项标准化到 [-1,1] 区间，统一量纲加速 RL 收敛。R-02：引入塑造奖励 overload_warning + soc_warning。R-03：新增 SOC 均衡奖励 R_soc_balance = -λ×|SOC-0.5|。新增 w9/w10/w11 权重。
+> **v2.14 变更说明（对齐部署端 v2.12 R-04~R-07）：** SCENE-01 奖励函数四项改进（R-04~R-07 已实现）。R-04：变压器过载分段惩罚（<75%:0, 75~90% 线性 0~10, 90~100% 指数 10~50, >=100% 硬惩罚 -100）。R-05：电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)，电压偏差越大权重越高。R-06：冲击负荷响应奖励 R_shock_response（load_rate 波动检测触发）。R-07：P-Q 协同度阈值常量移至模块顶部，支持可配置化。新增 w12 权重。训练管线对齐下游 v2.12 PRD。
 
 > **v2.12 变更说明（对齐部署端 v2.10）：** 观测空间从 58/59 维扩展为 61/62 维（新增 D9 安全覆盖状态 3 字段：safety_override_active, safety_override_p_ref, safety_override_reason_code）。SCENE-01 奖励函数新增 R_safety_override 惩罚项（w8 加权）：safety_override_active=True 时根据触发原因惩罚（voltage_violation=-50/q_exhausted=-30/emergency=-100/generic=-20），激励 AI 学习避免触发覆盖的策略。训练管线对齐下游 v2.10 PRD。
 
