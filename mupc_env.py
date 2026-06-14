@@ -68,7 +68,10 @@ VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
 # ═══════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS: dict[str, list[float]] = {
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5],  # w1(光伏消纳), w2(电池), w3(过载), w4(电压质量), w5(变化率)
+    # v2.12 MODE-01: w1~w11 (R-01~R-03 已实现)
+    # w1(光伏消纳), w2(电池损耗), w3(过载), w4(P-Q协同), w5(变化率),
+    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖), w9(过载预警), w10(SOC预警), w11(SOC均衡)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5],
     "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
     "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
     "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
@@ -648,19 +651,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """SCENE-01 奖励函数 (v2.10 安全覆盖惩罚).
+        """SCENE-01 奖励函数 (v2.12 奖励子项标准化 + 塑造奖励 + SOC均衡).
 
         R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination
             - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth - w8*R_safety_override
+            + w9*R_overload_warning + w10*R_soc_warning + w11*R_soc_balance
 
-        v2.10 核心变更:
-          - 新增 R_safety_override 惩罚项：当 safety_override_active=True 时触发
-          - AI 引擎感知被实时控制模块覆盖事件，学习避免触发覆盖的策略
-
-        v2.8 核心变更:
-          - 移除"电压硬惩罚"P_voltage_deviation，改为"行为奖励"R_PQ_coordination
-          - 弃光场景差异化: v_avg>=1.05 时检查 p_ref 方向而非简单置零
-          - 新增下垂系数平滑惩罚 R_smooth
+        v2.12 核心变更（R-01~R-03，已实现）:
+          - R-01: 各奖励子项标准化到 [-1,1] 区间，统一量纲加速 RL 收敛
+          - R-02: 引入塑造奖励 overload_warning(load>85%) + soc_warning(SOC接近边界)
+          - R-03: 新增 SOC 均衡奖励 -λ×|SOC-0.5|，鼓励 SOC 保持在 50% 附近
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
         dev = abs(v_avg - 1.0)
@@ -763,14 +763,69 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             else:                      # unknown/generic
                 r_safety_override = -20.0
 
-        total = (w[0] * r_pv
-                 - w[1] * p_batt_deg
-                 - w[2] * p_overload
-                 + w4 * r_pq
-                 - p_ramp_penalty
-                 - p_voltage_slope
-                 + w7 * r_smooth
-                 + w8 * r_safety_override)
+        # ── R-02 塑造奖励 (v2.12 新增) ──
+        # overload_warning: 负载率 >85% 开始预警，逐步惩罚
+        lr_unc = r.get("load_rate_unclamped", r["load_rate"])
+        r_overload_warning = 0.0
+        w9 = w[8] if len(w) > 8 else 0.0
+        if w9 > 0 and lr_unc > 0.85:
+            # 线性从 0 惩罚到 -1.0
+            r_overload_warning = -(lr_unc - 0.85) / 0.15
+
+        # soc_warning: SOC 接近 15%/85% 边界时预警
+        soc_new = r.get("soc_new", self._soc)
+        r_soc_warning = 0.0
+        w10 = w[9] if len(w) > 9 else 0.0
+        if w10 > 0:
+            soc_margin_low = soc_new - SOC_CRITICAL    # 接近 15%
+            soc_margin_high = 0.90 - soc_new            # 接近 85%
+            soc_margin = min(soc_margin_low, soc_margin_high)
+            if soc_margin < 0.10:  # < 10% 边际
+                r_soc_warning = -(0.10 - soc_margin) / 0.10  # 线性到 -1.0
+
+        # ── R-03 SOC 均衡奖励 (v2.12 新增) ──
+        # 鼓励 SOC 保持在 50% 附近: R_soc_balance = -λ × |SOC - 0.5|
+        r_soc_balance = 0.0
+        w11 = w[10] if len(w) > 10 else 0.0
+        if w11 > 0:
+            lambda_soc = 1.0  # 可配置化
+            r_soc_balance = -lambda_soc * abs(soc_new - 0.5)
+
+        # ── R-01 奖励子项标准化到 [-1, 1] 区间 ──
+        # 各子项归一化后加权求和，统一量纲加速 RL 收敛
+        # 正值奖励: r_pv [0,1], r_pq [-30,50]→[0,1], r_*_warning [0,-1]→[0,-1], r_soc_balance
+        # 负值惩罚: p_batt_deg [0,0.25]→[-1,0], p_overload [-0.2,0]→[-1,0],
+        #          p_ramp [-0.05,0]→[-1,0], r_voltage_slope [-0.4,0]→[-1,0],
+        #          r_smooth [-150,0]→[-1,0], r_safety_override [-100,0]→[-1,0]
+
+        r_pv_norm = float(np.clip(r_pv, 0.0, 1.0))
+        p_batt_deg_norm = float(np.clip(-p_batt_deg / 0.25, -1.0, 0.0)) if p_batt_deg > 0 else 0.0
+        p_overload_norm = float(np.clip(p_overload / 0.2, -1.0, 0.0)) if p_overload < 0 else 0.0
+        r_pq_norm = float(np.clip(r_pq / 50.0, -1.0, 1.0))
+        p_ramp_norm = float(np.clip(-p_ramp_penalty / 0.05, -1.0, 0.0)) if p_ramp_penalty > 0 else 0.0
+        p_voltage_slope_norm = float(np.clip(-p_voltage_slope / 0.4, -1.0, 0.0)) if p_voltage_slope > 0 else 0.0
+        r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
+        r_safety_override_norm = float(np.clip(r_safety_override / 100.0, -1.0, 0.0)) if r_safety_override < 0 else 0.0
+        r_overload_warning_norm = float(np.clip(r_overload_warning, -1.0, 0.0)) if r_overload_warning < 0 else 0.0
+        r_soc_warning_norm = float(np.clip(r_soc_warning, -1.0, 0.0)) if r_soc_warning < 0 else 0.0
+        r_soc_balance_norm = float(np.clip(r_soc_balance / 0.5, -1.0, 1.0)) if r_soc_balance != 0 else 0.0
+
+        # w8/w9/w10 可能在旧配置中不存在，使用 guarded 访问
+        w8_val = w[8] if len(w) > 8 else 0.0
+        w9_val = w[9] if len(w) > 9 else 0.0
+        w10_val = w[10] if len(w) > 10 else 0.0
+
+        total = (w[0] * r_pv_norm
+                 + w[1] * p_batt_deg_norm
+                 + w[2] * p_overload_norm
+                 + w4 * r_pq_norm
+                 + w[5] * p_ramp_norm
+                 + w[6] * p_voltage_slope_norm
+                 + w[7] * r_smooth_norm
+                 + w8_val * r_safety_override_norm
+                 + w9_val * r_overload_warning_norm
+                 + w10_val * r_soc_warning_norm
+                 + w11 * r_soc_balance_norm)
 
         info = {
             "r_pv_consumption": float(r_pv),        # v2.8 差异化弃光
@@ -781,6 +836,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "r_voltage_slope": float(r_voltage_slope),  # v2.6
             "r_smooth": float(r_smooth),            # v2.8 新增
             "r_safety_override": float(r_safety_override),  # v2.10 新增
+            "r_overload_warning": float(r_overload_warning),  # v2.12 R-02
+            "r_soc_warning": float(r_soc_warning),        # v2.12 R-02
+            "r_soc_balance": float(r_soc_balance),        # v2.12 R-03
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5
