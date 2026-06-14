@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.14 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.13 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.12 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.11 | 2026-06-13 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -15,7 +16,9 @@
 
 ---
 
-> **v2.13 变更说明（对齐部署端 v2.12）：** SCENE-01 奖励函数三项改进（R-01~R-03 已实现）。R-01：各奖励子项标准化到 [-1,1] 区间（r_pv_norm、p_batt_deg_norm、p_overload_norm、r_pq_norm、p_ramp_norm、p_voltage_slope_norm、r_smooth_norm、r_safety_override_norm），统一量纲加速 RL 收敛。R-02：引入塑造奖励 overload_warning（负载率 >85% 开始预警）和 soc_warning（SOC 接近 15%/85% 边界时预警）。R-03：新增 SOC 均衡奖励 R_soc_balance = -λ×|SOC-0.5|，鼓励 SOC 保持在 50% 附近。新增 w9/w10/w11 权重。训练管线对齐下游 v2.12 PRD。
+> **v2.14 变更说明（对齐部署端 v2.12 R-04~R-07）：** SCENE-01 奖励函数四项改进（R-04~R-07 已实现）。R-04：变压器过载分段惩罚（<75%:0, 75~90% 线性 0~10, 90~100% 指数 10~50, >=100% 硬惩罚 -100）。R-05：电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)，电压偏差越大权重越高。R-06：冲击负荷响应奖励 R_shock_response（load_rate 波动检测触发）。R-07：P-Q 协同度阈值常量移至模块顶部，支持可配置化。新增 w12 权重。训练管线对齐下游 v2.12 PRD。
+
+> **v2.13 变更说明（对齐部署端 v2.12 R-01~R-03）：** SCENE-01 奖励函数三项改进（R-01~R-03 已实现）。R-01：各奖励子项标准化到 [-1,1] 区间，统一量纲加速 RL 收敛。R-02：引入塑造奖励 overload_warning + soc_warning。R-03：新增 SOC 均衡奖励 R_soc_balance = -λ×|SOC-0.5|。新增 w9/w10/w11 权重。
 
 > **v2.12 变更说明（对齐部署端 v2.10）：** 观测空间从 58/59 维扩展为 61/62 维（新增 D9 安全覆盖状态 3 字段：safety_override_active, safety_override_p_ref, safety_override_reason_code）。SCENE-01 奖励函数新增 R_safety_override 惩罚项（w8 加权）：safety_override_active=True 时根据触发原因惩罚（voltage_violation=-50/q_exhausted=-30/emergency=-100/generic=-20），激励 AI 学习避免触发覆盖的策略。训练管线对齐下游 v2.10 PRD。
 

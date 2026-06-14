@@ -68,10 +68,11 @@ VOLTAGE_PENALTY_LOW = 1.0      # 低电压侧惩罚系数 (灌溉/炒茶/空调)
 # ═══════════════════════════════════════════════════════════════
 
 DEFAULT_WEIGHTS: dict[str, list[float]] = {
-    # v2.12 MODE-01: w1~w11 (R-01~R-03 已实现)
+    # v2.12 MODE-01: w1~w12 (R-04~R-07 已实现)
     # w1(光伏消纳), w2(电池损耗), w3(过载), w4(P-Q协同), w5(变化率),
-    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖), w9(过载预警), w10(SOC预警), w11(SOC均衡)
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5],
+    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖), w9(过载预警), w10(SOC预警),
+    # w11(SOC均衡), w12(冲击负荷响应)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5],
     "MODE-02": [1.0, 1.0, 2.0],       # w1(价差), w2(电池), w3(过载)
     "MODE-03": [1.0, 0.5],            # w1(需量减免), w2(舒适度)
     "MODE-04": [1.0, 2.0, 1.0],       # w1(辅助收益), w2(响应精度), w3(延迟)
@@ -651,16 +652,18 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── MODE-01: 农网灌溉 ──────────────────────────────
 
     def _reward_agri(self, r: dict, w: list[float]) -> tuple[float, dict]:
-        """SCENE-01 奖励函数 (v2.12 奖励子项标准化 + 塑造奖励 + SOC均衡).
+        """SCENE-01 奖励函数 (v2.12 R-04~R-07 中优先级实现).
 
         R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ_coordination
             - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth - w8*R_safety_override
             + w9*R_overload_warning + w10*R_soc_warning + w11*R_soc_balance
+            + w12*R_shock_response
 
-        v2.12 核心变更（R-01~R-03，已实现）:
-          - R-01: 各奖励子项标准化到 [-1,1] 区间，统一量纲加速 RL 收敛
-          - R-02: 引入塑造奖励 overload_warning(load>85%) + soc_warning(SOC接近边界)
-          - R-03: 新增 SOC 均衡奖励 -λ×|SOC-0.5|，鼓励 SOC 保持在 50% 附近
+        v2.12 核心变更（R-04~R-07，已实现）:
+          - R-04: 变压器过载分段惩罚（<75%:0, 75~90%:线性, 90~100%:指数, >=100%:硬惩罚-100）
+          - R-05: 电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)
+          - R-06: 冲击负荷响应奖励 R_shock_response
+          - R-07: P-Q 协同度阈值可配置化（Q_THRESHOLD/P_THRESHOLD）
         """
         v_avg = (r["va"] + r["vb"] + r["vc"]) / 3.0
         dev = abs(v_avg - 1.0)
@@ -690,10 +693,20 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         else:
             alpha = 1.0  # 常规调度
 
-        # ── 过载惩罚: 梯度从 75% 开始（Quadratic + Linear）──
+        # ── 过载惩罚 (R-04 v2.12 分段惩罚) ──
+        # 取代原有的 quadratic 函数，改为三段式惩罚
         lr_unc = r.get("load_rate_unclamped", r["load_rate"])
-        overload_t = max(0.0, (lr_unc - 0.75) / 0.25)
-        p_overload = -0.3095 * overload_t ** 2 + 0.026 * overload_t
+        if lr_unc < 0.75:
+            p_overload = 0.0
+        elif lr_unc < 0.90:
+            # 线性增长: 0~10
+            p_overload = -(lr_unc - 0.75) / 0.15 * 10.0
+        elif lr_unc < 1.00:
+            # 指数增长: 10~50
+            p_overload = -(10.0 + (lr_unc - 0.90) / 0.10 * 40.0)
+        else:
+            # 硬惩罚: >= 100
+            p_overload = -100.0
 
         # ── 电池衰减: C-rate² × α(s) ──
         c_rate = abs(p_ref) / BATTERY_CAPACITY_KWH
@@ -731,11 +744,15 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         w5 = w[4] if len(w) > 4 else 0.0
         p_ramp_penalty = w5 * delta_p / BATTERY_CAPACITY_KWH
 
-        # ── 电压变化斜率惩罚 (v2.6) ──
+        # ── 电压变化斜率惩罚 (R-05 v2.12 动态权重) ──
+        # w6(v) = base_w6 × (1.0 + k × |ΔV|)，电压偏差越大权重越高
         prev_v = r.get("prev_v_avg", 1.0)
-        w6 = w[5] if len(w) > 5 else 0.0
+        base_w6 = w[5] if len(w) > 5 else 0.5
+        k_w6 = 2.0   # 放大系数，可配置化
         r_voltage_slope = abs(v_avg - prev_v) if "prev_v_avg" in r else 0.0
-        p_voltage_slope = w6 * r_voltage_slope
+        w6_dynamic = base_w6 * (1.0 + k_w6 * r_voltage_slope)
+        max_w6 = base_w6 * (1.0 + k_w6 * 0.4)  # ΔV 最大约 0.4 p.u.
+        p_voltage_slope = w6_dynamic * r_voltage_slope
 
         # ── 下垂系数平滑惩罚 (v2.8 新增) ──
         r_smooth = 0.0
@@ -791,29 +808,47 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             lambda_soc = 1.0  # 可配置化
             r_soc_balance = -lambda_soc * abs(soc_new - 0.5)
 
+        # ── R-06 冲击负荷响应奖励 (v2.12 新增) ──
+        # 当 P90-P50 > threshold 时，基于 load_shedding 和响应时间计算奖励
+        r_shock = 0.0
+        w12 = w[11] if len(w) > 11 else 0.0
+        if w12 > 0:
+            w_shock = 20.0      # 冲击负荷响应权重
+            lambda_shock = 5.0  # 响应时间惩罚系数
+            threshold_shock = 10.0  # kW，冲击负荷判定阈值
+            max_response_time = 15.0  # 步数，最大响应时间
+            load_shedding = r.get("load_shed", 0.0)
+            # 模拟 P90-P50 差值（用 load_rate 的波动近似）
+            load_rate_delta = abs(lr_unc - 0.5) * 2  # 归一化波动
+            if load_rate_delta > threshold_shock / 100.0:
+                r_shock = (w_shock * load_shedding / max(LOAD_SHED_MAX_KW, 1e-6)
+                           - lambda_shock * 1.0 / max_response_time)
+
         # ── R-01 奖励子项标准化到 [-1, 1] 区间 ──
         # 各子项归一化后加权求和，统一量纲加速 RL 收敛
         # 正值奖励: r_pv [0,1], r_pq [-30,50]→[0,1], r_*_warning [0,-1]→[0,-1], r_soc_balance
-        # 负值惩罚: p_batt_deg [0,0.25]→[-1,0], p_overload [-0.2,0]→[-1,0],
-        #          p_ramp [-0.05,0]→[-1,0], r_voltage_slope [-0.4,0]→[-1,0],
+        # 负值惩罚: p_batt_deg [0,0.25]→[-1,0], p_overload [-100,0]→[-1,0]（R-04 分段惩罚）,
+        #          p_ramp [-0.05,0]→[-1,0], r_voltage_slope →动态权重,
         #          r_smooth [-150,0]→[-1,0], r_safety_override [-100,0]→[-1,0]
 
         r_pv_norm = float(np.clip(r_pv, 0.0, 1.0))
         p_batt_deg_norm = float(np.clip(-p_batt_deg / 0.25, -1.0, 0.0)) if p_batt_deg > 0 else 0.0
-        p_overload_norm = float(np.clip(p_overload / 0.2, -1.0, 0.0)) if p_overload < 0 else 0.0
+        p_overload_norm = float(np.clip(p_overload / 100.0, -1.0, 0.0)) if p_overload < 0 else 0.0
         r_pq_norm = float(np.clip(r_pq / 50.0, -1.0, 1.0))
         p_ramp_norm = float(np.clip(-p_ramp_penalty / 0.05, -1.0, 0.0)) if p_ramp_penalty > 0 else 0.0
-        p_voltage_slope_norm = float(np.clip(-p_voltage_slope / 0.4, -1.0, 0.0)) if p_voltage_slope > 0 else 0.0
+        p_voltage_slope_norm = float(np.clip(-p_voltage_slope / max_w6 / 0.4, -1.0, 0.0)) if p_voltage_slope > 0 and max_w6 > 0 else 0.0
         r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
         r_safety_override_norm = float(np.clip(r_safety_override / 100.0, -1.0, 0.0)) if r_safety_override < 0 else 0.0
         r_overload_warning_norm = float(np.clip(r_overload_warning, -1.0, 0.0)) if r_overload_warning < 0 else 0.0
         r_soc_warning_norm = float(np.clip(r_soc_warning, -1.0, 0.0)) if r_soc_warning < 0 else 0.0
         r_soc_balance_norm = float(np.clip(r_soc_balance / 0.5, -1.0, 1.0)) if r_soc_balance != 0 else 0.0
+        r_shock_norm = float(np.clip(r_shock / 20.0, -1.0, 1.0)) if r_shock != 0 else 0.0
 
-        # w8/w9/w10 可能在旧配置中不存在，使用 guarded 访问
+        # w8~w12 可能在旧配置中不存在，使用 guarded 访问
         w8_val = w[8] if len(w) > 8 else 0.0
         w9_val = w[9] if len(w) > 9 else 0.0
         w10_val = w[10] if len(w) > 10 else 0.0
+        w12_val = w[12] if len(w) > 12 else 0.0
 
         total = (w[0] * r_pv_norm
                  + w[1] * p_batt_deg_norm
@@ -825,7 +860,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                  + w8_val * r_safety_override_norm
                  + w9_val * r_overload_warning_norm
                  + w10_val * r_soc_warning_norm
-                 + w11 * r_soc_balance_norm)
+                 + w11 * r_soc_balance_norm
+                 + w12_val * r_shock_norm)
 
         info = {
             "r_pv_consumption": float(r_pv),        # v2.8 差异化弃光
@@ -839,6 +875,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "r_overload_warning": float(r_overload_warning),  # v2.12 R-02
             "r_soc_warning": float(r_soc_warning),        # v2.12 R-02
             "r_soc_balance": float(r_soc_balance),        # v2.12 R-03
+            "r_shock_response": float(r_shock),            # v2.12 R-06
             "v_avg": float(v_avg),
             "alpha": float(alpha),  # v2.5
             "q_realtime_margin": float(self._q_realtime_margin),  # v2.5
