@@ -1,14 +1,16 @@
 """
-MUPC 全状态强化学习环境 — 48/49 维观测, 2 维动作, 5 种场景奖励。
+MUPC 全状态强化学习环境 — 63/64 维观测, 3 维动作, 5 种场景奖励。
 
-对齐 MUPC AI 引擎 PRD v2.4:
-  - 状态空间: 21 字段序列化为 48/49 维向量
-  - 动作空间: [p_batt, load_shedding] (2 维) — Q 控制交由实时电压调节器闭环
+对齐 MUPC AI 引擎 PRD v2.14:
+  - 状态空间: 61 字段 + 2 维 D9 SafetyOverride 扩展 = 63/64 维向量
+  - 动作空间: [p_batt, load_shedding, pv_limit] (3 维) — Q 控制交由实时电压调节器闭环
   - 5 种预设场景 MODE-01~05 各独立奖励函数
   - 三相电压简化仿真 (Q-V 耦合，Q 由实时模块根据电压闭环给出)
   - 电压死区 (±5%) + 功率变化率惩罚，保护电池免受高频微循环损耗
   - 3 条动作约束规则 (ActionValidator): ACT-01(ΔP≤50kW), ACT-03(功率圆),
     ACT-05(调度约束) — Q/功率圆/pv_limit 相关约束由实时控制处理
+  - v2.14 SafetyOverride 精细化: D9 新增 override_consecutive/override_ratio 分层惩罚
+  - v2.14 P-Q 协同度与 SafetyOverride 互斥: safety_override_active=true 时跳过 P-Q 惩罚
 """
 
 import math
@@ -131,11 +133,11 @@ class VoltageSimulator:
 # ═══════════════════════════════════════════════════════════════
 
 class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
-    """MUPC 全状态 RL 环境 (v2.5 分层控制架构).
+    """MUPC 全状态 RL 环境 (v2.14 分层控制架构).
 
-    动作空间 2 维: [p_batt, load_shedding]
+    动作空间 3 维: [p_batt, load_shedding, pv_limit]
     Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
-    观测空间: Box(56,) 或 Box(57,) (多模式)
+    观测空间: Box(63,) 或 Box(64,) (多模式，含 D9 SafetyOverride 扩展 2 字段)
     """
 
     metadata = {"render_modes": []}
@@ -176,7 +178,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._voltage_sim = VoltageSimulator()
 
         # 观测/动作空间 (v2.10: 61维单模式, 62维多模式，含D9安全覆盖状态3字段)
-        obs_dim = 61 if mode != "all" else 62
+        obs_dim = 63 if mode != "all" else 64
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
@@ -227,6 +229,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._welford_count: int = 0
         # v2.13 新增: 状态改善率奖励
         self._prev_v_dev: float = 0.0   # 上一步的电压偏差绝对值
+        # v2.14 新增: SafetyOverride 精细化跟踪
+        self._override_count: int = 0     # 滑动窗口内累计覆盖次数
+        self._override_window: int = 0     # 滑动窗口总步数
+        self._override_ratio: float = 0.0  # 覆盖比例 override_count/override_window
+        self._override_consecutive: int = 0  # 连续触发次数
         # v2.5 新增字段
         self._q_realtime_margin: float = 0.5  # 实时模块剩余无功容量比例 [0.0, 1.0]
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)  # 季节 one-hot
@@ -277,7 +284,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._welford_mean = 0.0
         self._welford_m2 = 1.0
         self._welford_count = 0
-        self._prev_v_dev = 0.0  # v2.13: 状态改善率奖励
+        self._prev_v_dev = 0.0  # v2.13
+        # v2.14: SafetyOverride 精细化跟踪
+        self._override_count = 0
+        self._override_window = 0
+        self._override_ratio = 0.0
+        self._override_consecutive = 0
 
         # 随机起始索引 (保证至少还有 EPISODE_LENGTH 步)
         max_start = self._data_len - EPISODE_LENGTH - 16  # 16 为预测缓冲区
@@ -432,6 +444,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             prev_v_dev=prev_v_dev_for_reward,  # v2.13
             safety_override_active=self._safety_override_active,  # v2.10
             safety_override_p_ref=self._safety_override_p_ref,  # v2.10
+            override_consecutive=self._override_consecutive,  # v2.14
+            override_ratio=self._override_ratio,  # v2.14
         )
 
         # 12. 推进时间
@@ -503,9 +517,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── 观测构建 ────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
-        """构建 61 维观测向量 (多模式追加 mode_id 为 62 维)。
+        """构建 63 维观测向量 (多模式追加 mode_id 为 64 维)。
 
-        对齐下游 MUPC AI 引擎设计文档 v2.10 to_input_vector (59维基础+3维D9):
+        对齐下游 MUPC AI 引擎设计文档 v2.14 to_input_vector (61维基础+2维D9扩展):
 
         索引   内容                      字段数
         [0..9]  D1: 10 标量              (含 q_realtime_margin)
@@ -521,11 +535,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         [57]     D9 safety_override_active (bool→1.0/0.0)
         [58]     D9 safety_override_p_ref 1字段
         [59]     D9 safety_override_reason_code 1字段
-        [60]     (可选) mode_id           1字段
+        [60]     D9 override_consecutive  1字段 (v2.14 连续触发次数)
+        [61]     D9 override_ratio        1字段 (v2.14 滑动窗口覆盖比例)
+        [62]     (可选) mode_id           1字段
 
-        总维度: 10+15+15+3+3+2+1+1+6+1+3 = 61 (单模式)
+        总维度: 10+15+15+3+3+2+1+1+6+1+4+1 = 63 (单模式)
         """
-        obs_dim = 61 if self._mode != "all" else 62
+        obs_dim = 63 if self._mode != "all" else 64
         obs = np.zeros(obs_dim, dtype=np.float32)
         params = self._data.get("norm_params", {})
 
@@ -575,14 +591,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # ── D7 [56] time_period_encoding (1维) ──
         obs[56] = self._time_period_encoding[0]  # 0=夜间, 1=白天 (二进制编码)
 
-        # ── D9 [57..59] 安全覆盖状态 (v2.10 新增) ──
+        # ── D9 [57..61] 安全覆盖状态 (v2.10 新增, v2.14 扩展) ──
         obs[57] = 1.0 if self._safety_override_active else 0.0
         obs[58] = self._safety_override_p_ref
         obs[59] = 0.0  # reason_code: 0=none, 1=voltage_violation, 2=q_exhausted, 3=emergency
+        obs[60] = float(self._override_consecutive)  # v2.14: 连续触发次数
+        obs[61] = self._override_ratio             # v2.14: 滑动窗口覆盖比例
 
-        # ── mode_id [60/61] (可选) ──
+        # ── mode_id [62/63] (可选) ──
         if self._mode == "all":
-            obs[60] = MODE_ID_MAP[self._current_mode]
+            obs[62] = MODE_ID_MAP[self._current_mode]
 
         # ── 归一化 ──
         obs = self._normalize_obs(obs, params)
@@ -726,13 +744,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         c_rate = abs(p_ref) / BATTERY_CAPACITY_KWH
         p_batt_deg = alpha * (c_rate ** 2)
 
-        # ── P-Q 协同度奖励 (v2.13 Sigmoid平滑化) ──
+        # ── P-Q 协同度奖励 (v2.13 Sigmoid平滑化，v2.14 P-Q互斥) ──
         # 替代硬阈值，v2.13: w_save = sigmoid(k*(q_margin-q_threshold))
+        # v2.14: safety_override_active=true时跳过P-Q协同度惩罚（由SafetyOverride接管）
         r_pq = 0.0
         SIGMOID_K = 50.0   # 控制过渡陡峭程度
         Q_THRESHOLD = 0.10
         P_THRESHOLD = 5.0
-        if dev > VOLTAGE_DEADBAND:
+        safety_override_active = r.get("safety_override_active", False)
+        if dev > VOLTAGE_DEADBAND and not safety_override_active:
+            # v2.14: P-Q协同度与SafetyOverride互斥，仅在非安全覆盖时计算
             q_margin = self._q_realtime_margin
             # Sigmoid 平滑过渡
             w_save = 1.0 / (1.0 + math.exp(-SIGMOID_K * (q_margin - Q_THRESHOLD)))
@@ -784,20 +805,24 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             delta_k = abs(k_droop - prev_k) if k_droop != 0.0 or prev_k != 0.0 else 0.0
             r_smooth = -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
 
-        # ── 安全覆盖惩罚 (v2.10 新增) ──
+        # ── 安全覆盖惩罚 (v2.10 新增，v2.14 分层精细化) ──
+        # v2.14 分层设计:
+        #   - consecutive < 10: 固定惩罚 /15
+        #   - consecutive >= 10: (ratio + consecutive) 归一化到 [-1, 0]
         r_safety_override = 0.0
         w8 = w[7] if len(w) > 7 else 0.0
-        if w8 > 0 and r.get("safety_override_active", False):
-            # reason_code: 0=none, 1=voltage_violation, 2=q_exhausted, 3=emergency
-            reason_code = r.get("safety_override_reason_code", 0)
-            if reason_code == 1:       # voltage_violation
-                r_safety_override = -50.0
-            elif reason_code == 2:    # q_exhausted
-                r_safety_override = -30.0
-            elif reason_code == 3:    # emergency
-                r_safety_override = -100.0
-            else:                      # unknown/generic
-                r_safety_override = -20.0
+        if w8 > 0 and safety_override_active:
+            override_consecutive = r.get("override_consecutive", 0)
+            override_ratio = r.get("override_ratio", 0.0)
+            if override_consecutive < 10:
+                # 固定惩罚: -1/15 ≈ -0.067，归一化到 [-1, 0] 区间
+                r_safety_override = -1.0 / 15.0
+            else:
+                # 分层归一化: consecutive>=10 时 ratio×consecutive 归一化
+                # consecutive 范围 [10, 50]→[0,1], ratio 范围 [0,1]
+                # 归一化到 [-1, 0]: (ratio * consecutive / 50) → [-1, 0]
+                consecutive_norm = min(override_consecutive / 50.0, 1.0)
+                r_safety_override = -override_ratio * consecutive_norm
 
         # ── R-02 塑造奖励 (v2.12 新增) ──
         # overload_warning: 负载率 >85% 开始预警，逐步惩罚
