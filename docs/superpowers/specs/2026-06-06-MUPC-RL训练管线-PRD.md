@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.16 | 2026-06-15 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.15 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.14 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.13 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -13,9 +14,11 @@
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.13 (`[REVIEWED: PASS]`)（符号链接 → MUPC2/superpowers/specs/modules/）
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.14 (`[REVIEWED: PASS]`)（符号链接 → MUPC2/superpowers/specs/modules/）
 
 ---
+
+> **v2.16 变更说明（对齐部署端 v2.14）：** SafetyOverride精细化实现。D9新增safety_override_consecutive（连续触发次数）和safety_override_ratio（滑动窗口覆盖比例）两字段，观测空间从61/62维扩展为63/64维。SCENE-01奖励函数新增分层SafetyOverride惩罚：consecutive<10时固定惩罚/15，consecutive>=10时比例+次数归一化到[-1,0]区间。P-Q协同度与SafetyOverride互斥：safety_override_active=true时跳过P-Q惩罚（由SafetyOverride接管）。训练管线对齐下游v2.14 PRD。
 
 > **v2.15 变更说明（对齐部署端 v2.13）：** SCENE-01 奖励函数精细化设计。P-Q协同Sigmoid平滑化（k=50，平滑过渡替代硬阈值）。Welford动态自适应归一化（RunningStats状态更新，替代固定系数）。状态改善率奖励 R_state_improve（电压偏差实际改善才给正向反馈）。冲击负荷预备度奖励重构（R_readiness替代R_shock_response，保持SOC/放电缓冲空间）。新增 w12（预备度）、w13（状态改善率）权重。
 
@@ -218,9 +221,9 @@ VoltageSimulator 模式（降级）:
 
 #### 功能描述
 
-`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.5 完整规格的 Gymnasium 环境，支持 Grid2Op 电压仿真引擎。
+`mupc_env.py` 实现基于 MUPC AI 引擎 PRD v2.14 完整规格的 Gymnasium 环境，支持 Grid2Op 电压仿真引擎。
 
-**观测空间（58 维序列化向量，多模式 59 维）**：
+**观测空间（63 维序列化向量，多模式 64 维）**：
 
 遵循 MUPC AI 引擎设计文档 `to_input_vector()` 布局：
 
@@ -236,9 +239,11 @@ VoltageSimulator 模式（降级）:
 [50]      D7 q_realtime_margin       实时控制模块计算
 [51..56]  D7 season_encoding (6维)   合成（季节 one-hot）
 [57]      D7 time_period_encoding    合成（时段 one-hot，白天/夜间）
+[58..61]  D9 安全覆盖扩展 (4字段)    safety_override_active/p_ref/reason_code/consecutive (v2.14新增)
+[62]      (可选) mode_id              1字段
 ```
 
-多模式训练时追加 mode_id 为第 59 维。
+多模式训练时追加 mode_id 为第 64 维。
 
 **动作空间（3 维）**：
 
@@ -308,14 +313,14 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F2-01 | `mupc_env.py` 可独立运行随机动作循环 100 步 | `python mupc_env.py` 无错误 |
-| F2-02 | `observation_space.shape = (58,)` | 单元测试 |
+| F2-02 | `observation_space.shape = (63,)` 单模式 | 单元测试 |
 | F2-03 | `action_space.shape = (3,)` | 单元测试 |
 | F2-04 | SOC 硬约束不可突破 | 单元测试：连续充电 1000 步，验证 SOC ≤ 0.90 |
 | F2-05 | info dict 包含全部奖励分量原始值 + SOC + load_rate | 单元测试 |
 | F2-06 | Grid2Op 模式下三相电压在 [0.85, 1.15] 内 | 单元测试 |
 | F2-07 | VoltageSimulator 降级模式下三相电压在 [0.85, 1.15] 内 | 单元测试 |
 | F2-08 | 兼容 gymnasium.Env 和 _gym_stub 双重接口 | 集成测试 |
-| F2-09 | terminal_observation 包含完整 59 维观测 | 单元测试 |
+| F2-09 | terminal_observation 包含完整 63/64 维观测 | 单元测试 |
 | F2-10 | `use_grid2op=True` 时使用 Grid2Op电压仿真 | 集成测试 |
 | F2-11 | `use_grid2op=False` 时降级到 VoltageSimulator | 集成测试 |
 
