@@ -183,7 +183,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         try:
             net = create_mupc_network()
             chronics = NumpyChronics(self._data)
-            self._grid2op_pf = Grid2OpPowerFlow(net, chronics, storage_soc_init=0.5)
+            # 从配置读取电压不平衡度，默认 0.003
+            v_imbalance = 0.003
+            if self._cfg is not None:
+                try:
+                    v_imbalance = self._cfg.voltage_simulator.imbalance
+                except Exception:
+                    pass
+            self._grid2op_pf = Grid2OpPowerFlow(
+                net, chronics, storage_soc_init=0.5,
+                voltage_imbalance=v_imbalance)
             self._use_grid2op_active = True
         except Exception as e:
             print(f"[WARN] Grid2OpPowerFlow 初始化失败, 降级到 VoltageSimulator: {e}")

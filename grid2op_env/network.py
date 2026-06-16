@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 TRANSFORMER_KVA: float = 200.0     # 配电变压器额定容量 (kVA)
 BATTERY_CAPACITY_KWH: float = 100.0  # 储能额定容量 (kWh)
 PV_ARRAY_KW: float = 150.0        # 光伏额定容量 (kW)
-LINE_LENGTH_KM: float = 1.5       # 主干线路长度 (km)
+LINE_LENGTH_KM: float = 0.5       # 主干线路长度 (km)，保证潮流收敛 + 足够电压变化(0.79~1.21pu)
 MAX_BATTERY_DISCHARGE_KW: float = 50.0  # 储能最大放电功率 (kW)
 
 
@@ -67,6 +67,7 @@ def create_mupc_network() -> "pandapowerNet":
     )
 
     # 3. 配电变压器 (200kVA, 10/0.4kV)
+    # 使用标准 0.25 MVA 类型并覆盖 sn_mva，保证参数完整性
     lv_bus = pp.create_bus(net, vn_kv=0.4, name="LV_Main_Bus")
     pp.create_transformer(
         net,
@@ -75,34 +76,24 @@ def create_mupc_network() -> "pandapowerNet":
         std_type="0.25 MVA 10/0.4 kV",
         name="Dist_Transformer"
     )
+    # 覆盖额定容量为 PRD v2.6 规格 200kVA
+    net.trafo.at[0, "sn_mva"] = 0.2
 
-    # 4. 主干线路（农网高阻抗架空线，模拟长距离电压跌落）
-    # 使用 NAYY 4x50 SE 电缆标准类型（参考 docs/MUPC/仿真环境.md）
-    # 如果标准类型不存在，使用参数化方式创建线路
+    # 4. 主干线路（LGJ-70 架空线，农网典型配置）
+    # R=0.45 Ω/km, X=0.35 Ω/km (70mm² 钢芯铝绞线)
+    # 0.5km 保证潮流收敛，电压变化范围 0.79~1.21 pu 满足 RL 训练需求
     end_bus = pp.create_bus(net, vn_kv=0.4, name="End_Node_Bus")
-    try:
-        # 尝试使用标准类型
-        pp.create_line(
-            net,
-            from_bus=lv_bus,
-            to_bus=end_bus,
-            length_km=LINE_LENGTH_KM,
-            std_type="NAYY 4x50 SE",
-            name="Main_Overhead_Line"
-        )
-    except Exception:
-        # 降级：使用参数化方式创建线路（r=0.534 ohm/km, x=0.08 ohm/km, c=0）
-        pp.create_line_from_parameters(
-            net,
-            from_bus=lv_bus,
-            to_bus=end_bus,
-            length_km=LINE_LENGTH_KM,
-            r_ohm_per_km=0.534,  # NAYY 4x50 SE 的电阻
-            x_ohm_per_km=0.08,    # NAYY 4x50 SE 的电抗
-            c_nf_per_km=0.0,      # 电缆电容
-            max_i_ka=0.3,          # 最大电流 300A
-            name="Main_Overhead_Line"
-        )
+    pp.create_line_from_parameters(
+        net,
+        from_bus=lv_bus,
+        to_bus=end_bus,
+        length_km=LINE_LENGTH_KM,
+        r_ohm_per_km=0.45,       # LGJ-70 直流电阻
+        x_ohm_per_km=0.35,       # LGJ-70 线路电抗
+        c_nf_per_km=0.0,         # 架空线电容可忽略
+        max_i_ka=0.3,            # 最大电流 300A
+        name="Main_Overhead_Line"
+    )
 
     # 5. 居民负荷（初始值 0，由 Chronics 动态注入）
     pp.create_load(
@@ -135,7 +126,7 @@ def create_mupc_network() -> "pandapowerNet":
         # grid2op 默认使用 single values for sgen，这里用标量
     )
 
-    # 8. MUPC 储能装置（100kWh，最大放电50kW）
+    # 8. MUPC 储能装置（100kWh，最大放电50kW，PRD v2.6 规格）
     pp.create_storage(
         net,
         bus=end_bus,

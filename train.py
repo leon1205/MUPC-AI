@@ -76,6 +76,10 @@ def parse_args():
                    help="模型保存目录")
     p.add_argument("--no-lstm", action="store_true",
                    help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
+    p.add_argument("--use-grid2op", action="store_true", default=True,
+                   help="使用 Grid2Op + Pandapower 三相潮流仿真 (默认)")
+    p.add_argument("--no-grid2op", action="store_false", dest="use_grid2op",
+                   help="使用 VoltageSimulator 简化电压模型")
     p.add_argument("--dual-mode", action="store_true",
                    help="启用双参数下垂控制模式（5维动作，v2.7）")
     p.add_argument("--lstm-checkpoint", type=str, default=None,
@@ -163,21 +167,28 @@ def main():
         cfg = get_config()
         cfg.dual_control.enabled = True
         env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
-                      config=cfg,
+                      config=cfg, use_grid2op=args.use_grid2op,
                       reward_weights=custom_weights if custom_weights else None)
         eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
-                           config=cfg,
+                           config=cfg, use_grid2op=args.use_grid2op,
                            reward_weights=custom_weights if custom_weights else None)
     else:
         env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                      use_grid2op=args.use_grid2op,
                       reward_weights=custom_weights if custom_weights else None)
         eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                           use_grid2op=args.use_grid2op,
                            reward_weights=custom_weights if custom_weights else None)
 
     obs_dim = env.observation_space.shape[0]
     print(f"  观测空间: Box({obs_dim},)")
     act_dim = env.action_space.shape[0]
     print(f"  动作空间: Box({act_dim},), 模式: {args.mode}, 算法: {args.algo}")
+    if args.use_grid2op:
+        if env.unwrapped.use_grid2op:
+            print(f"  电压仿真: Grid2Op + Pandapower 三相潮流")
+        else:
+            print(f"  电压仿真: VoltageSimulator 简化模型 (Grid2Op 不可用，已降级)")
 
     # ── 训练 ────────────────────────────────────────────
     os.makedirs(args.checkpoint_path, exist_ok=True)

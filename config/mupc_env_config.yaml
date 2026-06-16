@@ -47,7 +47,7 @@ contract:
 voltage_simulator:
   k_p: 0.05                      # 有功灵敏度 (p.u. / S_BASE)
   k_q: 0.03                      # 无功灵敏度 (p.u. / S_BASE)
-  s_base: 500.0                  # 基准功率 (kVA)
+  s_base: 200.0                  # 基准功率 (kVA，匹配变压器 200kVA)
   v_min: 0.85                    # 电压下限 (p.u.)
   v_max: 1.15                    # 电压上限 (p.u.)
   noise_std: 0.005               # 测量噪声标准差
