@@ -177,7 +177,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 电压仿真器
         self._voltage_sim = VoltageSimulator()
 
-        # 观测/动作空间 (v2.10: 61维单模式, 62维多模式，含D9安全覆盖状态3字段)
+        # 观测/动作空间 (v2.14: 63维单模式, 64维多模式，D9=4字段对齐下游)
         obs_dim = 63 if mode != "all" else 64
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
@@ -519,10 +519,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     def _build_observation(self) -> np.ndarray:
         """构建 63 维观测向量 (多模式追加 mode_id 为 64 维)。
 
-        对齐下游 MUPC AI 引擎设计文档 v2.14 to_input_vector (61维基础+2维D9扩展):
+        对齐下游 MUPC AI 引擎设计文档 v2.14 to_input_vector:
 
-        索引   内容                      字段数
-        [0..9]  D1: 10 标量              (含 q_realtime_margin)
+        索引      内容                      字段数
+        [0..9]   D1: 10 标量              (含 q_realtime_margin)
         [10..24] D2 pv_forecast          15维
         [25..39] D2 load_forecast         15维
         [40..42] D3 电价                  3字段
@@ -531,15 +531,14 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         [48]     D6 dispatch_p_set        1字段
         [49]     D7 q_realtime_margin     1字段
         [50..55] D7 season_encoding       6字段
-        [56]     D7 time_period_encoding  1字段
-        [57]     D9 safety_override_active (bool→1.0/0.0)
-        [58]     D9 safety_override_p_ref 1字段
-        [59]     D9 safety_override_reason_code 1字段
-        [60]     D9 override_consecutive  1字段 (v2.14 连续触发次数)
-        [61]     D9 override_ratio        1字段 (v2.14 滑动窗口覆盖比例)
+        [56..57] D7 time_period_encoding  2字段 (v2.14 对齐下游，白天/夜间 one-hot)
+        [58]     D9 safety_override_active 1字段
+        [59]     D9 safety_override_p_ref 1字段
+        [60]     D9 override_consecutive  1字段 (v2.14)
+        [61]     D9 override_ratio        1字段 (v2.14)
         [62]     (可选) mode_id           1字段
 
-        总维度: 10+15+15+3+3+2+1+1+6+1+4+1 = 63 (单模式)
+        总维度: 10+15+15+3+3+2+1+1+6+2+4+1 = 63 (单模式)
         """
         obs_dim = 63 if self._mode != "all" else 64
         obs = np.zeros(obs_dim, dtype=np.float32)
@@ -588,17 +587,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # ── D7 [50..55] season_encoding (6维) ──
         obs[50:56] = self._season_encoding
 
-        # ── D7 [56] time_period_encoding (1维) ──
-        obs[56] = self._time_period_encoding[0]  # 0=夜间, 1=白天 (二进制编码)
+        # ── D7 [56..57] time_period_encoding (2维 one-hot, v2.14对齐下游) ──
+        obs[56] = self._time_period_encoding[0]  # 白天
+        obs[57] = self._time_period_encoding[1]  # 夜间
 
-        # ── D9 [57..61] 安全覆盖状态 (v2.10 新增, v2.14 扩展) ──
-        obs[57] = 1.0 if self._safety_override_active else 0.0
-        obs[58] = self._safety_override_p_ref
-        obs[59] = 0.0  # reason_code: 0=none, 1=voltage_violation, 2=q_exhausted, 3=emergency
+        # ── D9 [58..61] 安全覆盖状态 (v2.14, 4字段对齐下游) ──
+        obs[58] = 1.0 if self._safety_override_active else 0.0
+        obs[59] = self._safety_override_p_ref
         obs[60] = float(self._override_consecutive)  # v2.14: 连续触发次数
         obs[61] = self._override_ratio             # v2.14: 滑动窗口覆盖比例
 
-        # ── mode_id [62/63] (可选) ──
+        # ── mode_id [62] (可选) ──
         if self._mode == "all":
             obs[62] = MODE_ID_MAP[self._current_mode]
 
@@ -607,7 +606,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         return obs.astype(np.float32)
 
     def _normalize_obs(self, obs: np.ndarray, params: dict) -> np.ndarray:
-        """应用 MinMax 归一化 (v2.5: 56维)。"""
+        """应用 MinMax 归一化 (v2.14: 63维)。"""
         out = obs.copy()
         # D1 [0..9]
         out[0] = obs[0]  # SOC: identity
@@ -622,26 +621,27 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         out[9] = obs[9]  # q_realtime_margin: identity [0,1]
         # D2 pv [10..24]
         out[10:25] = self._minmax(obs[10:25], 0.0, PV_ARRAY_KW)
-        # D2 load [26..40]
-        out[26:41] = self._minmax(obs[26:41], 0.0, LOAD_PEAK_KW)
-        # D3 [41..43]
+        # D2 load [25..39]
+        out[25:40] = self._minmax(obs[25:40], 0.0, LOAD_PEAK_KW)
+        # D3 [40..42] 电价: identity pass-through
+        out[40] = self._minmax(obs[40], 0.0, 1.5)
         out[41] = self._minmax(obs[41], 0.0, 1.5)
-        out[42] = self._minmax(obs[42], 0.0, 1.5)
-        out[43] = self._minmax(obs[43], 0.0, 3.0)
-        # D4 [44..46]
+        out[42] = self._minmax(obs[42], 0.0, 3.0)
+        # D4 [43..45] 需量
+        out[43] = self._minmax(obs[43], 0.0, 500.0)
         out[44] = self._minmax(obs[44], 0.0, 500.0)
         out[45] = self._minmax(obs[45], 0.0, 500.0)
-        out[46] = self._minmax(obs[46], 0.0, 500.0)
-        # D5 [47..48]
-        out[47] = self._minmax(obs[47], 0.0, 1500.0)
-        out[48] = self._minmax(obs[48], -20.0, 60.0)
-        # D6 [49]
-        out[49] = self._minmax(obs[49], -500.0, 500.0)
-        # D7 [50] q_realtime_margin: identity
-        out[50] = obs[50]
-        # D7 [51..56] season_encoding: one-hot, identity
-        # D7 [57] time_period: binary, identity
-        # mode_id [58]: identity
+        # D5 [46..47] 气象
+        out[46] = self._minmax(obs[46], 0.0, 1500.0)
+        out[47] = self._minmax(obs[47], -20.0, 60.0)
+        # D6 [48] dispatch_p_set
+        out[48] = self._minmax(obs[48], -500.0, 500.0)
+        # D7 [49] q_realtime_margin: identity (v2.14修正)
+        out[49] = obs[49]
+        # D7 [50..55] season_encoding: one-hot, identity
+        # D7 [56..57] time_period: one-hot, identity
+        # D9 [58..61] safety_override: identity
+        # mode_id [62]: identity
         return out
 
     @staticmethod
