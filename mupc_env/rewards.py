@@ -211,7 +211,8 @@ def _compute_soc_balance(soc_new: float) -> float:
     return -abs(soc_new - 0.5)
 
 
-def _compute_shock_readiness(lr_unc: float, load_shed: float) -> float:
+def _compute_shock_readiness(lr_unc: float, load_shed: float,
+                             soc_new: float, p_ref: float) -> float:
     """冲击负荷响应奖励 (R-06 v2.12 + v2.13 重构)。"""
     load_rate_delta = abs(lr_unc - 0.5) * 2
     threshold_shock = 10.0
@@ -226,18 +227,25 @@ def _compute_shock_readiness(lr_unc: float, load_shed: float) -> float:
 
     # v2.13: 预备度奖励
     soc_reserve_target = 0.3
-    p_ref_reserve_target = 10.0
-    r_readiness = (0.5 * (soc_reserve_target - 0.5)  # dummy soc_new placeholder
-                   + 0.5 * max(0.0, p_ref_reserve_target - 0.0))
-    # NOTE: r_readiness is a stub — actual soc_new/p_ref injected in _reward_agri
+    p_ref_reserve_target = 10.0  # kW
+    r_readiness = ((soc_reserve_target - soc_new)
+                   + 0.5 * max(0.0, p_ref_reserve_target - abs(p_ref)))
     return r_shock + r_readiness
 
 
 def _compute_state_improve(dev: float, prev_v_dev: float, p_ref: float) -> float:
-    """状态改善率奖励 (R-14.4 v2.13)。"""
+    """状态改善率奖励 (R-14.4 v2.13)。
+
+    仅在电压偏差改善且动作方向与改善方向一致时奖励:
+    p_ref > 0 (放电→抬电压) 应配合电压从过高回落,
+    p_ref < 0 (充电→降电压) 应配合电压从过低回升。
+    """
     if dev <= VOLTAGE_DEADBAND or prev_v_dev <= dev:
         return 0.0
-    return (prev_v_dev - dev) * (1.0 if p_ref >= 0 else -1.0)
+    improvement = prev_v_dev - dev
+    if p_ref * improvement <= 0:
+        return 0.0
+    return improvement * (1.0 if p_ref >= 0 else -1.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -286,7 +294,8 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     r_ov_warn = _compute_overload_warning(load_rate_unc)
     r_soc_warn = _compute_soc_warning(soc_new)
     r_soc_bal = _compute_soc_balance(soc_new)
-    r_readiness = _compute_shock_readiness(load_rate_unc, r.get("load_shed", 0.0))
+    r_readiness = _compute_shock_readiness(load_rate_unc, r.get("load_shed", 0.0),
+                                           soc_new, p_ref)
     r_improve = _compute_state_improve(dev, r.get("prev_v_dev", 0.0), p_ref)
 
     # 权重提取
