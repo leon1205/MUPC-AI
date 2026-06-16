@@ -71,6 +71,6 @@ def get_backend_name() -> str:
 
 def is_grid2op_available() -> bool:
     """检查 Grid2Op 是否可用。"""
-    if _GRID2OP_AVAILABLE is None:
+    if _BACKEND_NAME == "unknown" and _BACKEND_CLASS is None:
         _select_backend()
     return _GRID2OP_AVAILABLE

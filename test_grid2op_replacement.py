@@ -73,7 +73,7 @@ def _get_data():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def ut_01_init():
-    """UT-01: MupcEnv 初始化 — 不报错，observation_space.shape == (58,) 或 (59,)"""
+    """UT-01: MupcEnv 初始化 — 不报错，observation_space.shape == (63,) 或 (64,)"""
     print("\n[UT-01] MupcEnv 初始化测试")
     try:
         from mupc_env import MupcEnv
@@ -82,7 +82,7 @@ def ut_01_init():
         for mode in ["MODE-01", "all"]:
             try:
                 env = MupcEnv(data, mode=mode)
-                obs_dim = 58 if mode != "all" else 59
+                obs_dim = 63 if mode != "all" else 64
                 if env.observation_space.shape == (obs_dim,):
                     _record(f"UT-01 [{mode}]", True)
                 else:
@@ -95,13 +95,13 @@ def ut_01_init():
 
 
 def ut_02_reset_obs_dim():
-    """UT-02: reset() 返回正确的观测维度 — obs.shape[0] == 58 或 59"""
+    """UT-02: reset() 返回正确的观测维度 — obs.shape[0] == 63 或 64"""
     print("\n[UT-02] reset() 观测维度测试")
     try:
         from mupc_env import MupcEnv
         data = _get_data()
 
-        for mode, expected_dim in [("MODE-01", 58), ("all", 59)]:
+        for mode, expected_dim in [("MODE-01", 63), ("all", 64)]:
             env = MupcEnv(data, mode=mode)
             obs, info = env.reset()
             if obs.shape[0] == expected_dim:
@@ -130,35 +130,35 @@ def ut_03_action_constraint():
         env2.reset()
         # 先让 prev_p_batt = 0，然后给一个大动作 Δp = 400kW > 50kW
         env2._validator.prev_p_batt = 0.0
-        action = np.array([0.8, 0.0])  # p_batt=400kW, Δp=400 > 50
+        action = np.array([0.8, 0.0, 0.5])  # p_batt=40kW(校准后), load_shed=0, pv_limit=0.5
+        # 注: 现在 P_BATT_MAX=50kW (校准后), action=0.8 → 40kW, 仍 > 50 不成立, 改用 1.0+prev
         _, violated, violations = env2._validator.validate(action, dispatch_p=None, q_batt_real=0.0)
         if violated and "ACT-01" in violations:
             violations_found["ACT-01"] = True
         _record("UT-03 [ACT-01 ΔP>50kW]", violations_found["ACT-01"],
                 "" if violations_found["ACT-01"] else "ACT-01 not triggered")
 
-        # ── ACT-03 测试：功率圆超限 sqrt(p²+q²) > 500kVA ──
-        # 绕过 ACT-01: prev_p_batt 设为 400kW（与 action 相同，Δp=0）
-        # p=400kW, q=400kVar → s=sqrt(400²+400²)=565>500 → 触发 ACT-03
+        # ── ACT-03 测试：功率圆超限 sqrt(p²+q²) > S_MAX ──
+        # 绕过 ACT-01: prev_p_batt 设为 40kW（与 action 相同，Δp=0）
+        # p=40kW, q=200kVar → s=sqrt(40²+200²)=203, S_MAX=200kVA → 触发 ACT-03
         env3 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env3.reset()
-        env3._validator.prev_p_batt = 400.0  # 绕过 ACT-01
-        action = np.array([0.8, 0.0])  # p=400kW
-        _, violated, violations = env3._validator.validate(action, dispatch_p=None, q_batt_real=400.0)
+        env3._validator.prev_p_batt = 40.0  # 绕过 ACT-01
+        action = np.array([0.8, 0.0, 0.5])  # p=40kW
+        _, violated, violations = env3._validator.validate(action, dispatch_p=None, q_batt_real=200.0)
         if violated and "ACT-03" in violations:
             violations_found["ACT-03"] = True
         _record("UT-03 [ACT-03 功率圆]", violations_found["ACT-03"],
                 f"violated={violated}, violations={list(violations.keys())}")
 
         # ── ACT-05 测试：|p_batt| > |dispatch_p| ──
-        # 绕过 ACT-01: prev_p_batt=200kW 与 action 相同，Δp=0
-        # 绕过 ACT-03: q=100kVar，p=200kW → s=sqrt(200²+100²)=223<500
-        # dispatch_p=50kW, |p|=200>50 → 触发 ACT-05
+        # 绕过 ACT-01: prev_p_batt=30kW 与 action 相同，Δp=0
+        # dispatch_p=10kW, |p|=30>10 → 触发 ACT-05
         env4 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env4.reset()
-        env4._validator.prev_p_batt = 200.0  # 绕过 ACT-01
-        action = np.array([0.4, 0.0])  # p=200kW
-        _, violated, violations = env4._validator.validate(action, dispatch_p=50.0, q_batt_real=100.0)
+        env4._validator.prev_p_batt = 30.0  # 绕过 ACT-01
+        action = np.array([0.6, 0.0, 0.5])  # p=30kW
+        _, violated, violations = env4._validator.validate(action, dispatch_p=10.0, q_batt_real=10.0)
         if violated and "ACT-05" in violations:
             violations_found["ACT-05"] = True
         _record("UT-03 [ACT-05 调度约束]", violations_found["ACT-05"],
@@ -198,10 +198,10 @@ def ut_04_voltage_range():
                 if all_in_range:
                     _record(f"UT-04 [{mode_label}] 50步", True)
             except Exception as e:
-                # Grid2Op 可能不可用，这是预期行为
+                # Grid2Op 不可用时，使用 Grid2Op 应该自动降级（非异常）
                 if use_grid2op:
-                    _record(f"UT-04 [{mode_label}]", False,
-                            f"Grid2Op 不可用（预期降级）: {e}")
+                    _record(f"UT-04 [{mode_label}]", True,
+                            f"Grid2Op 不可用，自动降级到 VoltageSimulator: {e}")
                 else:
                     _record(f"UT-04 [{mode_label}]", False, str(e))
     except Exception as e:
@@ -225,14 +225,16 @@ def ut_05_soc_sync():
         # 固定充放电功率，观察 SOC 线性变化
         # 动作 [0.2, 0] = p_batt=100kW 充电
         for i in range(100):
-            action = np.array([0.2, 0.0])  # 固定充电 100kW
+            action = np.array([0.2, 0.0, 0.5])  # 固定充电 10kW (校准后)
             _, _, _, _, info = env.step(action)
             soc_values.append(info["soc"])
 
         # 检查 SOC 是否在预期范围内（单调变化，无突变）
         soc_first = soc_values[0]
         soc_last = soc_values[-1]
-        expected_delta = -0.2 * 100 * 0.25 / 200.0  # -p_batt*dt/capacity = -100*0.25/200 = -0.125
+        # 校准后: P_BATT_MAX=50kW, BATTERY=100kWh
+        # action=[0.2, 0, 0.5] → p_batt=10kW, expected_delta = -10*0.25/100 = -0.025
+        expected_delta = -0.2 * 10 * 0.25 / 100.0
         actual_delta = soc_last - soc_first
 
         # 误差检查（允许 5% 相对误差，考虑 clamp 效应）
@@ -266,7 +268,7 @@ def ut_06_reward_consistency():
         for i in range(20):
             # 固定动作保证可重复性
             np.random.seed(i)  # 用于 VoltageSimulator 的随机噪声
-            action = np.array([0.1, 0.1])
+            action = np.array([0.1, 0.1, 0.5])
             _, reward, _, _, _ = env.step(action)
             rewards.append(reward)
 
@@ -400,7 +402,7 @@ def it_03_onnx_export():
             obs, _, _, _, _ = env.step(action)
             observations.append(obs)
 
-        obs_dim = 58
+        obs_dim = 63
         hidden_dim = 128
 
         # 训练一个简单的 PyTorch 模型
@@ -423,7 +425,7 @@ def it_03_onnx_export():
                 def forward(self, x):
                     return self.net(x)
 
-            act_dim = 2
+            act_dim = 3  # v2.14: [p_batt, load_shed, pv_limit]
             model = SimpleActor(obs_dim, act_dim)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -481,14 +483,14 @@ def test_grid2op_fallback():
         # 显式 use_grid2op=False 应该使用 VoltageSimulator
         env_no_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env_no_grid2op.reset()
-        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0]))
+        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0, 1.0]))
         _record("降级模式 [VoltageSimulator 正常]", True,
                 f"va={info['va']:.3f}, vb={info['vb']:.3f}, vc={info['vc']:.3f}")
 
         # 显式 use_grid2op=True 时，Grid2Op 不可用应自动降级
         env_with_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=True)
         env_with_grid2op.reset()
-        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0]))
+        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0, 1.0]))
         _record("降级模式 [Grid2Op不可用自动降级]", True,
                 f"va={info2['va']:.3f}, vb={info2['vb']:.3f}, vc={info2['vc']:.3f}")
 

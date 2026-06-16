@@ -50,7 +50,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     def __init__(self, data: dict, mode: str = "all",
                  lstm_predictor: Any = None,
                  reward_weights: Optional[dict[str, list[float]]] = None,
-                 config: Any = None):
+                 config: Any = None,
+                 use_grid2op: bool = False):
         """
         Args:
             data: SmartDSLoader 返回的 data dict
@@ -58,6 +59,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             lstm_predictor: LSTM 模型 (有 predict(step_idx)→(30,) 接口) 或 None→Oracle
             reward_weights: 自定义权重, e.g. {"MODE-01": [1.5, 0.3, 3.0]}
             config: MupcConfig 配置对象，None 则使用硬编码默认值
+            use_grid2op: 是否使用 Grid2Op + Pandapower 三相潮流仿真。
+                默认 False（使用 VoltageSimulator 降级）。
+                True 时尝试使用 grid2op_env；如不可用则自动降级到 VoltageSimulator。
         """
         self._data = data
         self._mode = mode
@@ -77,8 +81,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 动作校验器
         self._validator = ActionValidator()
 
-        # 电压仿真器
+        # 电压仿真器 (Grid2Op 优先，失败降级到 VoltageSimulator)
+        self._use_grid2op_requested = use_grid2op
+        self._use_grid2op_active = False
+        self._grid2op_pf: Optional[Any] = None
         self._voltage_sim = VoltageSimulator()
+        self._init_voltage_simulator(use_grid2op)
 
         # 观测/动作空间 (v2.14: 63维单模式, 64维多模式)
         obs_dim = 63 if mode != "all" else 64
@@ -149,6 +157,39 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 电压越限
         self._voltage_violation_count: int = 0
 
+    # ── 电压仿真器初始化 ─────────────────────────────────
+
+    def _init_voltage_simulator(self, use_grid2op: bool) -> None:
+        """初始化电压仿真器: Grid2Op 优先, 失败降级到 VoltageSimulator。
+
+        Args:
+            use_grid2op: 用户是否请求 Grid2Op 模式
+        """
+        if not use_grid2op:
+            return
+
+        try:
+            from grid2op_env import Grid2OpPowerFlow, NumpyChronics
+            from grid2op_env.network import create_mupc_network
+            from grid2op_env.backend import is_grid2op_available
+        except ImportError as e:
+            print(f"[WARN] grid2op_env 不可用, 降级到 VoltageSimulator: {e}")
+            return
+
+        if not is_grid2op_available():
+            print("[WARN] Grid2Op backend 不可用, 降级到 VoltageSimulator")
+            return
+
+        try:
+            net = create_mupc_network()
+            chronics = NumpyChronics(self._data)
+            self._grid2op_pf = Grid2OpPowerFlow(net, chronics, storage_soc_init=0.5)
+            self._use_grid2op_active = True
+        except Exception as e:
+            print(f"[WARN] Grid2OpPowerFlow 初始化失败, 降级到 VoltageSimulator: {e}")
+            self._grid2op_pf = None
+            self._use_grid2op_active = False
+
     # ── 模式管理 ────────────────────────────────────────
 
     def set_mode(self, mode: str) -> None:
@@ -165,6 +206,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     @property
     def mode(self) -> str:
         return self._mode
+
+    @property
+    def use_grid2op(self) -> bool:
+        """是否实际启用了 Grid2Op 模式（请求 + 可用 + 初始化成功）。"""
+        return self._use_grid2op_active
 
     # ── 辅助状态构建 ────────────────────────────────────
 
@@ -285,6 +331,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 计算季节时段编码
         self._update_season_time_encoding()
 
+        # 重置 Grid2Op 环境 (如启用)
+        if self._use_grid2op_active and self._grid2op_pf is not None:
+            try:
+                self._grid2op_pf.reset(initial_storage_soc=self._soc)
+            except Exception:
+                pass
+
         state = self._make_env_state()
         forecast = self._predictor.predict(self._step_idx)
         obs = observation.build_observation(state, forecast)
@@ -352,10 +405,22 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         load_rate = s_transformer / constants.TRANSFORMER_KVA
         load_rate_unclamped = load_rate
 
-        # 7. 电压更新
+        # 7. 电压更新 (Grid2Op 三相潮流 或 VoltageSimulator 降级)
         p_net = p_pv_eff - p_load_eff + p_batt
-        va, vb, vc = self._voltage_sim.step(
-            p_net, float(q_batt), self._va, self._vb, self._vc)
+        if self._use_grid2op_active and self._grid2op_pf is not None:
+            try:
+                # Grid2Op: 储能有功单位 kW → MW, 无功 kVar → MVar
+                va, vb, vc, has_illegal = self._grid2op_pf.step(
+                    p_batt / 1000.0, float(q_batt) / 1000.0)
+            except Exception as e:
+                # 潮流不收敛等异常, 降级到 VoltageSimulator
+                va, vb, vc = self._voltage_sim.step(
+                    p_net, float(q_batt), self._va, self._vb, self._vc)
+                has_illegal = True
+        else:
+            va, vb, vc = self._voltage_sim.step(
+                p_net, float(q_batt), self._va, self._vb, self._vc)
+            has_illegal = False
         v_avg = (va + vb + vc) / 3.0
 
         # 8. 电压越限计数器
@@ -442,6 +507,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "constraint_violated": violated,
             "violations": str(violations) if violations else "",
             "voltage_violation_count": self._voltage_violation_count,
+            "has_illegal": has_illegal,  # Grid2Op 潮流不收敛/电压越限标记
             **reward_info,
             "k_droop": float(k_droop) if self._dual_mode else 0.0,
             "p_ref": float(p_batt) if self._dual_mode else p_batt,
