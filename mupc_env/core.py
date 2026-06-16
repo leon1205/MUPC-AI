@@ -416,9 +416,11 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         p_net = p_pv_eff - p_load_eff + p_batt
         if self._use_grid2op_active and self._grid2op_pf is not None:
             try:
-                # Grid2Op: 储能有功单位 kW → MW, 无功 kVar → MVar
+                # 传递有效负荷和光伏到 pandapower (反映 load_shedding + pv_limit)
                 va, vb, vc, has_illegal = self._grid2op_pf.step(
-                    p_batt / 1000.0, float(q_batt) / 1000.0)
+                    p_batt / 1000.0, float(q_batt) / 1000.0,
+                    effective_load_mw=p_load_eff / 1000.0,
+                    effective_pv_mw=p_pv_eff / 1000.0)
             except Exception as e:
                 # 潮流不收敛等异常, 降级到 VoltageSimulator
                 va, vb, vc = self._voltage_sim.step(

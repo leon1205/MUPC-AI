@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 from typing import TYPE_CHECKING, Any
 
@@ -234,24 +235,45 @@ class Grid2OpPowerFlow:
         return va, vb, vc, has_illegal
 
     def _run_powerflow(
-        self, storage_p_mw: float, storage_q_mvar: float
+        self, storage_p_mw: float, storage_q_mvar: float,
+        effective_load_mw: float | None = None,
+        effective_pv_mw: float | None = None,
     ) -> bool:
         """执行单相等效潮流计算。
 
-        直接调用 pandapower runpp（Newton-Raphson），P-Q/V 灵敏度正确，
-        可满足 RL 训练对电压趋势精度的要求（误差 ≤ 2%）。
-        三相电压差异通过 _get_bus_voltages 中的人工不平衡度模拟。
+        先通过 chronics 注入原始数据（含冲击负荷、居民噪声等随机性），
+        再用 MupcEnv 计算的有效值覆盖负荷和光伏，确保 RL 动作
+        （load_shedding, pv_limit）真实作用于潮流。
 
         Args:
             storage_p_mw: 储能有功 MW（+充电/-放电）
             storage_q_mvar: 储能无功 MVar
+            effective_load_mw: 切负荷后的有效总负荷 MW (None=不覆盖)
+            effective_pv_mw: 弃光后的有效光伏 MW (None=不覆盖)
 
         Returns:
             bool: 潮流是否成功收敛
         """
-        # 注入当前帧数据到 pandapower net
+        # 注入当前帧原始数据到 pandapower net（推进时间、保留冲击噪声）
         if not self._inject_chronics_data():
             return False
+
+        # 用 MupcEnv 有效值覆盖负荷（反映 load_shedding 动作）
+        if effective_load_mw is not None:
+            q_total = effective_load_mw * math.tan(math.acos(0.90))
+            total_loads = len(self._net.load)
+            if total_loads > 0:
+                per_load_p = effective_load_mw / total_loads
+                per_load_q = q_total / total_loads
+                for i in range(total_loads):
+                    self._net.load.at[i, "p_mw"] = per_load_p
+                    self._net.load.at[i, "q_mvar"] = per_load_q
+
+        # 用 MupcEnv 有效值覆盖光伏（反映 pv_limit 动作）
+        if effective_pv_mw is not None:
+            for i in range(len(self._net.sgen)):
+                self._net.sgen.at[i, "p_mw"] = effective_pv_mw
+                self._net.sgen.at[i, "q_mvar"] = 0.0
 
         # 设置储能功率（直接修改 pandapower net）
         if self._storage_idx is not None and "storage" in self._net:
@@ -292,13 +314,17 @@ class Grid2OpPowerFlow:
             self.set_storage_soc(initial_storage_soc)
 
     def step(
-        self, storage_p_mw: float, storage_q_mvar: float
+        self, storage_p_mw: float, storage_q_mvar: float,
+        effective_load_mw: float | None = None,
+        effective_pv_mw: float | None = None,
     ) -> tuple[float, float, float, bool]:
         """执行一步潮流计算。
 
         Args:
             storage_p_mw: 储能有功 MW（+充电/-放电）
             storage_q_mvar: 储能无功 MVar
+            effective_load_mw: 切负荷后的有效负荷 MW (None=使用原始数据)
+            effective_pv_mw: 弃光后的有效光伏 MW (None=使用原始数据)
 
         Returns:
             tuple: (va, vb, vc, has_illegal)
@@ -306,7 +332,10 @@ class Grid2OpPowerFlow:
                 has_illegal: 是否有非法状态（电压越限/潮流不收敛）
         """
         # 执行单相等效潮流
-        success = self._run_powerflow(storage_p_mw, storage_q_mvar)
+        success = self._run_powerflow(
+            storage_p_mw, storage_q_mvar,
+            effective_load_mw, effective_pv_mw
+        )
 
         if not success or self._has_nan_voltage():
             # 回退到上一时刻电压（保持安全值）
