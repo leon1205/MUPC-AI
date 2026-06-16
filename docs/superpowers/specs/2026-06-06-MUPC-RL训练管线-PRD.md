@@ -18,7 +18,7 @@
 
 ---
 
-> **v2.16 变更说明（对齐部署端 v2.14）：** SafetyOverride精细化实现。D9新增safety_override_consecutive（连续触发次数）和safety_override_ratio（滑动窗口覆盖比例）两字段，观测空间从61/62维扩展为63/64维。SCENE-01奖励函数新增分层SafetyOverride惩罚：consecutive<10时固定惩罚/15，consecutive>=10时比例+次数归一化到[-1,0]区间。P-Q协同度与SafetyOverride互斥：safety_override_active=true时跳过P-Q惩罚（由SafetyOverride接管）。训练管线对齐下游v2.14 PRD。
+> **v2.16 变更说明（对齐部署端 v2.14）：** SafetyOverride精细化实现。D9新增safety_override_consecutive（连续触发次数）和safety_override_ratio（滑动窗口覆盖比例），移除safety_override_reason_code（下游v2.14已移除），D9从5字段缩减为4字段对齐下游。time_period_encoding从1维binary改为2维one-hot对齐下游。观测空间保持63/64维。SCENE-01奖励函数新增分层SafetyOverride惩罚。P-Q协同度与SafetyOverride互斥。修正_normalize_obs索引偏移bug（q_realtime_margin归属D7 identity，load预测归一化索引[25..40]）。训练管线对齐下游v2.14 PRD。
 
 > **v2.15 变更说明（对齐部署端 v2.13）：** SCENE-01 奖励函数精细化设计。P-Q协同Sigmoid平滑化（k=50，平滑过渡替代硬阈值）。Welford动态自适应归一化（RunningStats状态更新，替代固定系数）。状态改善率奖励 R_state_improve（电压偏差实际改善才给正向反馈）。冲击负荷预备度奖励重构（R_readiness替代R_shock_response，保持SOC/放电缓冲空间）。新增 w12（预备度）、w13（状态改善率）权重。
 
@@ -232,14 +232,17 @@ VoltageSimulator 模式（降级）:
 [0..9]    D1 实时数据 (10标量)      SMART-DS + 环境仿真（含 q_realtime_margin）
 [10..24]  D2 pv_forecast (15维)     LSTM 输出
 [25..39]  D2 load_forecast (15维)   LSTM 输出
-[41..43]  D3 电价 (3字段)           TOU 合成
-[44..46]  D4 需量 (3字段)           合成
-[47..48]  D5 气象 (2字段)           SMART-DS
-[49]      D6 dispatch_p_set (1维)      合成 (None→0.0)
-[50]      D7 q_realtime_margin       实时控制模块计算
-[51..56]  D7 season_encoding (6维)   合成（季节 one-hot）
-[57]      D7 time_period_encoding    合成（时段 one-hot，白天/夜间）
-[58..61]  D9 安全覆盖扩展 (4字段)    safety_override_active/p_ref/reason_code/consecutive (v2.14新增)
+[40..42]  D3 电价 (3字段)           TOU 合成
+[43..45]  D4 需量 (3字段)           合成
+[46..47]  D5 气象 (2字段)           SMART-DS
+[48]      D6 dispatch_p_set (1维)      合成 (None→0.0)
+[49]      D7 q_realtime_margin       实时控制模块计算
+[50..55]  D7 season_encoding (6维)   合成（季节 one-hot）
+[56..57]  D7 time_period_encoding    合成（2维 one-hot，白天/夜间）
+[58]      D9 safety_override_active   安全覆盖激活
+[59]      D9 safety_override_p_ref   安全覆盖设定值
+[60]      D9 override_consecutive    连续触发次数 (v2.14)
+[61]      D9 override_ratio          滑动窗口覆盖比例 (v2.14)
 [62]      (可选) mode_id              1字段
 ```
 
