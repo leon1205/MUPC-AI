@@ -85,12 +85,13 @@ class CommConfig:
 
 @dataclass
 class DualControlConfig:
-    """双参数下垂控制配置 (v2.7)"""
-    enabled: bool = False
-    k_droop_min: float = -100.0
-    k_droop_max: float = 100.0
+    """双参数下垂控制配置 (对齐下游 v2.13, 5 维动作空间)"""
+    enabled: bool = True
+    k_droop_min: float = 0.0
+    k_droop_max: float = 30.0
     p_ref_ramp_limit_kw: float = 50.0
-    pv_limit_min: float = 0.1
+    k_droop_ramp_limit: float = 10.0
+    pv_limit_min: float = 0.0
 
 
 @dataclass
@@ -118,12 +119,16 @@ class ActionConstraintConfig:
 
 @dataclass
 class ActionSpaceConfig:
-    p_batt_norm_min: float = -1.0
-    p_batt_norm_max: float = 1.0
+    p_ref_norm_min: float = -1.0
+    p_ref_norm_max: float = 1.0
+    k_droop_norm_min: float = -1.0
+    k_droop_norm_max: float = 1.0
     load_shed_norm_min: float = 0.0
     load_shed_norm_max: float = 1.0
     pv_limit_min: float = 0.0
     pv_limit_max: float = 1.0
+    confidence_min: float = 0.0
+    confidence_max: float = 1.0
 
 
 @dataclass

@@ -42,16 +42,14 @@ def _ensure_export_deps():
 def _build_rl_export_model(obs_dim: int = 58,
                            hidden: list[int] | None = None,
                            pv_array_kw: float = 150.0,
-                           load_peak_kw: float = 60.0,
-                           dual_mode: bool = False):
-    """构建仅用于 ONNX 导出的策略网络壳。
+                           load_peak_kw: float = 60.0):
+    """构建仅用于 ONNX 导出的策略网络壳 (5 维, 对齐下游 v2.13)。
 
     Args:
         obs_dim: 观测维度 (default 58)
         hidden: 隐藏层维度列表
         pv_array_kw: 光伏容量 (用于动作缩放)
         load_peak_kw: 负荷峰值 (用于动作缩放)
-        dual_mode: 启用双参数下垂模式 (5维动作)
     """
     import torch
     import torch.nn as nn
@@ -59,7 +57,7 @@ def _build_rl_export_model(obs_dim: int = 58,
     if hidden is None:
         hidden = [128, 128]
 
-    act_dim = 5 if dual_mode else 3
+    act_dim = 5  # v2.13: 5 维统一动作空间
 
     class RLExportModelWithNorm(nn.Module):
         def __init__(self):
@@ -95,20 +93,13 @@ def _build_rl_export_model(obs_dim: int = 58,
             latent = self.shared(x_norm)
             action = self.actor(latent)
 
-            if dual_mode:
-                # 5 维: p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)
-                a1 = torch.tanh(action[:, :1])      # p_ref: [-1, 1]
-                a2 = torch.tanh(action[:, 1:2])     # k_droop: [-1, 1]
-                a3 = torch.sigmoid(action[:, 2:3])  # load_shedding: [0, 1]
-                a4 = torch.sigmoid(action[:, 3:4])   # pv_limit: [0, 1]
-                a5 = torch.sigmoid(action[:, 4:5]) # confidence: [0, 1]
-                return torch.cat([a1, a2, a3, a4, a5], dim=-1)
-            else:
-                # 3 维: p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)
-                a1 = torch.tanh(action[:, :1])
-                a2 = torch.sigmoid(action[:, 1:2])
-                a3 = torch.sigmoid(action[:, 2:3])
-                return torch.cat([a1, a2, a3], dim=-1)
+            # 5 维: p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)
+            a1 = torch.tanh(action[:, :1])      # p_ref: [-1, 1]
+            a2 = torch.tanh(action[:, 1:2])     # k_droop: [-1, 1]
+            a3 = torch.sigmoid(action[:, 2:3])  # load_shedding: [0, 1]
+            a4 = torch.sigmoid(action[:, 3:4])  # pv_limit: [0, 1]
+            a5 = torch.sigmoid(action[:, 4:5])  # confidence: [0, 1]
+            return torch.cat([a1, a2, a3, a4, a5], dim=-1)
 
     return RLExportModelWithNorm()
 

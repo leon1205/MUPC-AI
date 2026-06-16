@@ -80,8 +80,6 @@ def parse_args():
                    help="使用 Grid2Op + Pandapower 三相潮流仿真 (默认)")
     p.add_argument("--no-grid2op", action="store_false", dest="use_grid2op",
                    help="使用 VoltageSimulator 简化电压模型")
-    p.add_argument("--dual-mode", action="store_true",
-                   help="启用双参数下垂控制模式（5维动作，v2.7）")
     p.add_argument("--lstm-checkpoint", type=str, default=None,
                    help="预训练 LSTM 模型路径")
     p.add_argument("--export-onnx", action="store_true",
@@ -162,30 +160,21 @@ def main():
     custom_weights = parse_custom_weights(args.reward_weights)
 
     from mupc_env import MupcEnv
-    if args.dual_mode:
-        from config.config_manager import get_config
-        cfg = get_config()
-        cfg.dual_control.enabled = True
-        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
-                      config=cfg, use_grid2op=args.use_grid2op,
-                      reward_weights=custom_weights if custom_weights else None)
-        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
-                           config=cfg, use_grid2op=args.use_grid2op,
-                           reward_weights=custom_weights if custom_weights else None)
-    else:
-        env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
-                      use_grid2op=args.use_grid2op,
-                      reward_weights=custom_weights if custom_weights else None)
-        eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
-                           use_grid2op=args.use_grid2op,
-                           reward_weights=custom_weights if custom_weights else None)
+    from config.config_manager import get_config
+    cfg = get_config()
+    env = MupcEnv(train_data, mode=args.mode, lstm_predictor=predictor,
+                  config=cfg, use_grid2op=args.use_grid2op,
+                  reward_weights=custom_weights if custom_weights else None)
+    eval_env = MupcEnv(val_data, mode=args.mode, lstm_predictor=predictor,
+                       config=cfg, use_grid2op=args.use_grid2op,
+                       reward_weights=custom_weights if custom_weights else None)
 
     obs_dim = env.observation_space.shape[0]
     print(f"  观测空间: Box({obs_dim},)")
     act_dim = env.action_space.shape[0]
     print(f"  动作空间: Box({act_dim},), 模式: {args.mode}, 算法: {args.algo}")
     if args.use_grid2op:
-        if env.unwrapped.use_grid2op:
+        if env.use_grid2op:
             print(f"  电压仿真: Grid2Op + Pandapower 三相潮流")
         else:
             print(f"  电压仿真: VoltageSimulator 简化模型 (Grid2Op 不可用，已降级)")
@@ -194,11 +183,8 @@ def main():
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.tensorboard_log, exist_ok=True)
 
-    # dual_mode 需要使用 NumPy PPO（SB3 MlpPolicy 不支持双参数动作空间）
-    if has_sb3 and has_gym and not args.dual_mode:
-        _train_sb3(env, eval_env, args)
-    else:
-        _train_numpy_ppo(env, eval_env, args, obs_dim)
+    # 5 维异构激活函数 (Tanh+Sigmoid)，SB3 MlpPolicy 不支持，统一使用 NumPy PPO
+    _train_numpy_ppo(env, eval_env, args, obs_dim)
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
@@ -289,13 +275,10 @@ def _train_sb3(env, eval_env, args):
 def _train_numpy_ppo(env, eval_env, args, obs_dim):
     from _ppo_core import NumPyPPO
 
-    print(f"\n── NumPy PPO 训练 (SB3 不可用) ──")
+    print(f"\n── NumPy PPO 训练 ──")
     print(f"  总步数: {args.total_timesteps}, 模式: {args.mode}")
 
-    ppo_config = {}
-    if args.dual_mode:
-        ppo_config["dual_mode"] = True
-    model = NumPyPPO(env, obs_dim=obs_dim, config=ppo_config)
+    model = NumPyPPO(env, obs_dim=obs_dim)
 
     try:
         log = model.learn(args.total_timesteps)

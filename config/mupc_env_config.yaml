@@ -83,15 +83,19 @@ action_constraints:
   delta_p_max: 50.0              # kW/步（电池变化率保护）
 
 # ═══════════════════════════════════════════════════════════════
-# 动作空间定义（归一化空间，RL 输出范围）
+# 动作空间定义（5 维归一化空间，对齐下游 v2.13）
 # ═══════════════════════════════════════════════════════════════
 action_space:
-  p_batt_norm_min: -1.0           # p_batt 归一化下限 → 物理值 [-50, 50] kW
-  p_batt_norm_max: 1.0            # p_batt 归一化上限
+  p_ref_norm_min: -1.0            # p_ref 归一化下限 → 物理值 [-50, 50] kW
+  p_ref_norm_max: 1.0             # p_ref 归一化上限
+  k_droop_norm_min: -1.0          # k_droop 归一化下限 → 物理值 [0, 30] kW/V
+  k_droop_norm_max: 1.0           # k_droop 归一化上限
   load_shed_norm_min: 0.0         # load_shedding 归一化下限 → [0, 60] kW
   load_shed_norm_max: 1.0          # load_shedding 归一化上限
   pv_limit_min: 0.0               # 光伏限功率比例下限 (无量纲)
   pv_limit_max: 1.0               # 光伏限功率比例上限
+  confidence_min: 0.0             # 置信度下限
+  confidence_max: 1.0             # 置信度上限
 
 # ═══════════════════════════════════════════════════════════════
 # 观测空间归一化参数（与 reward_thresholds.VOLTAGE_* 联动）
@@ -123,11 +127,12 @@ comm:
   action_delay_steps_max: 3        # 最大延迟步数（模拟 RTU 轮询周期 15~45min）
 
 # ═══════════════════════════════════════════════════════════════
-# 双参数下垂控制配置 (v2.7 新增)
+# 双参数下垂控制配置（对齐下游 v2.13，5 维动作空间）
 # ═══════════════════════════════════════════════════════════════
 dual_control:
-  enabled: false                  # 启用双参数下垂模式（替代标准 3 维动作）
-  k_droop_min: -100.0            # 下垂系数下限 (kW/V)
-  k_droop_max: 100.0             # 下垂系数上限 (kW/V)
+  enabled: true                   # 5 维动作空间（p_ref + k_droop + load_shedding + pv_limit + confidence）
+  k_droop_min: 0.0               # 下垂系数下限 (kW/V)，对齐下游 [0, 30]
+  k_droop_max: 30.0              # 下垂系数上限 (kW/V)
   p_ref_ramp_limit_kw: 50.0      # P_ref 变化率限制 (kW/步)
-  pv_limit_min: 0.1              # 光伏限功率下限（防逆流场景除外）
+  k_droop_ramp_limit: 10.0       # k_droop 变化率限制 (kW/V/步)，ACT-02
+  pv_limit_min: 0.0              # 光伏限功率下限（对齐下游无非零下限）

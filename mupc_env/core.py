@@ -94,25 +94,33 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # v2.7 下垂模式检测
-        self._dual_mode = False
-        self._dual_validator: Optional[Any] = None
-        if config is not None and getattr(config.dual_control, 'enabled', False):
-            self._dual_mode = True
-            from action_validator import DualActionValidator
-            self._dual_validator = DualActionValidator(
-                p_batt_max=constants.P_BATT_MAX_KW,
-                k_droop_min=self._cfg.dual_control.k_droop_min,
-                k_droop_max=self._cfg.dual_control.k_droop_max,
-                p_ref_ramp_limit_kw=self._cfg.dual_control.p_ref_ramp_limit_kw,
-                load_shed_max=constants.LOAD_SHED_MAX_KW,
-                pv_limit_min=self._cfg.dual_control.pv_limit_min,
-            )
-            low_act = np.array([-1.0, -1.0, 0.0, 0.0], dtype=np.float32)
-            high_act = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-        else:
-            low_act = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
-            high_act = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        # v2.13: 统一 5 维动作空间 [p_ref, k_droop, load_shedding, pv_limit, confidence]
+        # 对齐下游 MUPC AI 引擎 PRD v2.13 Section 6.3
+        k_droop_min = constants.K_DROOP_MIN
+        k_droop_max = constants.K_DROOP_MAX
+        delta_p_max = constants.P_REF_RAMP_LIMIT_KW
+        delta_k_max = constants.K_DROOP_RAMP_LIMIT
+        pv_limit_min = 0.0
+        if config is not None:
+            try:
+                k_droop_min = config.dual_control.k_droop_min
+                k_droop_max = config.dual_control.k_droop_max
+                delta_p_max = config.dual_control.p_ref_ramp_limit_kw
+                delta_k_max = config.dual_control.k_droop_ramp_limit
+                pv_limit_min = config.dual_control.pv_limit_min
+            except Exception:
+                pass
+        self._validator = ActionValidator(
+            p_batt_max=constants.P_BATT_MAX_KW,
+            k_droop_min=k_droop_min,
+            k_droop_max=k_droop_max,
+            load_shed_max=constants.LOAD_SHED_MAX_KW,
+            delta_p_max=delta_p_max,
+            delta_k_droop_max=delta_k_max,
+            pv_limit_min=pv_limit_min,
+        )
+        low_act = np.array([-1.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        high_act = np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # ── 内部状态 ──
@@ -334,8 +342,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # 重置校验器
         self._validator.reset()
-        if self._dual_validator is not None:
-            self._dual_validator.reset()
 
         # 计算季节时段编码
         self._update_season_time_encoding()
@@ -371,28 +377,20 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 季节时段编码
         self._update_season_time_encoding()
 
-        # 2. 动作约束校验
+        # 2. 动作约束校验 (5维统一, ACT-01~07)
         dispatch_p = self._data["dispatch_p_set"][self._step_idx]
         dispatch_p_use = float(dispatch_p) if abs(dispatch_p) >= 1e-6 else None
 
-        if self._dual_mode:
-            clamped_dual, violated, violations = self._dual_validator.validate(
-                action, dispatch_p_use, is_anti_reverse=False)
-            p_ref = clamped_dual[0] * constants.P_BATT_MAX_KW
-            k_droop = clamped_dual[1] * (self._cfg.dual_control.k_droop_max -
-                                          self._cfg.dual_control.k_droop_min) / 2.0 + \
-                      (self._cfg.dual_control.k_droop_max +
-                       self._cfg.dual_control.k_droop_min) / 2.0
-            load_shed = clamped_dual[2] * constants.LOAD_SHED_MAX_KW
-            pv_limit = clamped_dual[3] * 1.0
-            p_batt = p_ref
-        else:
-            clamped, violated, violations = self._validator.validate(
-                action, dispatch_p_use, q_batt_real=q_batt)
-            p_batt = clamped[0] * constants.P_BATT_MAX_KW
-            load_shed = clamped[1] * constants.LOAD_SHED_MAX_KW
-            pv_limit = clamped[2] * 1.0 if len(clamped) > 2 else 1.0
-            k_droop = 0.0
+        clamped, violated, violations = self._validator.validate(
+            action, dispatch_p_use)
+        p_ref = float(clamped[0] * constants.P_BATT_MAX_KW)
+        k_droop = float(clamped[1] * (constants.K_DROOP_MAX -
+                                       constants.K_DROOP_MIN) / 2.0 +
+                        (constants.K_DROOP_MAX + constants.K_DROOP_MIN) / 2.0)
+        load_shed = float(clamped[2] * constants.LOAD_SHED_MAX_KW)
+        pv_limit = float(clamped[3])
+        confidence = float(clamped[4])
+        p_batt = p_ref
 
         # 3. 有效负荷与光伏
         p_load_raw = float(self._data["load_power"][self._step_idx])
@@ -503,10 +501,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "mode": self._current_mode,
             "soc": self._soc,
             "load_rate": self._load_rate,
+            "p_ref": float(p_ref),
             "p_batt": p_batt,
             "q_batt": float(q_batt),
+            "k_droop": float(k_droop),
             "load_shedding": load_shed,
             "pv_limit": float(pv_limit),
+            "confidence": float(confidence),
             "grid_power": grid_power,
             "va": va, "vb": vb, "vc": vc,
             "v_avg": float(v_avg),
@@ -518,8 +519,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "voltage_violation_count": self._voltage_violation_count,
             "has_illegal": has_illegal,  # Grid2Op 潮流不收敛/电压越限标记
             **reward_info,
-            "k_droop": float(k_droop) if self._dual_mode else 0.0,
-            "p_ref": float(p_batt) if self._dual_mode else p_batt,
         }
         if terminated or truncated:
             state = self._make_env_state()
