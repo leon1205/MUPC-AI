@@ -20,6 +20,9 @@ exported_models/
 .DS_Store
 Thumbs.db
 
+# Claude worktrees
+.claude/worktrees/
+
 # Temp / debugging scripts
 *.tmp
 *.log

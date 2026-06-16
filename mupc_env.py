@@ -1108,7 +1108,7 @@ if __name__ == "__main__":
     print("\n── 多模式测试 (all) ──")
     env2 = MupcEnv(train, mode="all")
     obs2, info2 = env2.reset()
-    print(f"  观测形状: {obs2.shape}  (应为 59 维)")
+    print(f"  观测形状: {obs2.shape}  (应为 64 维)")
     print(f"  初始模式: {info2['mode']}")
 
     modes_seen = set()
