@@ -179,11 +179,11 @@ def _compute_voltage_slope(v_avg: float, prev_v_avg: float,
 
 
 def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
-    """下垂系数平滑惩罚 (v2.8)。"""
+    """下垂系数平滑惩罚 (v2.17 对齐下游 Rust K_MAX=30, lambda=10)。"""
     if k_droop == 0.0 and prev_k_droop == 0.0:
         return 0.0
-    K_MAX = 50.0
-    lambda_smooth = 1.0
+    K_MAX = 30.0           # v2.17: 50→30 (对齐下游)
+    lambda_smooth = 10.0   # v2.17: 1→10 (对齐下游)
     delta_k = abs(k_droop - prev_k_droop)
     return -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
 
@@ -329,7 +329,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     max_w6 = w[5] * (1.0 + 2.0 * 0.4) if len(w) > 5 else 0.5 * (1.0 + 2.0 * 0.4)
     p_vs_norm = float(np.clip(-p_voltage / max_w6 / 0.4, -1.0, 0.0)) if p_voltage > 0 and max_w6 > 0 else 0.0
 
-    r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
+    r_smooth_norm = float(np.clip(r_smooth / 130.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
     # v2.17 修正: _compute_safety_override 已返回 [-1,0], 不再除 100
     r_safety_norm = float(np.clip(r_safety, -1.0, 0.0)) if r_safety < 0 else 0.0
 

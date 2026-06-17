@@ -114,19 +114,18 @@ def ut_02_reset_obs_dim():
 
 
 def ut_03_action_constraint():
-    """UT-03: step() 动作约束校验 — 违反 ACT-01/03/05 时 violated == True"""
-    print("\n[UT-03] 动作约束校验测试 (ACT-01/03/05)")
+    """UT-03: step() 动作约束校验 — 违反 ACT-01/04/05 时 violated == True"""
+    print("\n[UT-03] 动作约束校验测试 (ACT-01/04/05, v2.17)")
     try:
         from mupc_env import MupcEnv
         data = _get_data()
 
-        env = MupcEnv(data, mode="MODE-01", use_grid2op=False)  # 降级模式，避免 Grid2Op 依赖
+        env = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env.reset()
 
-        violations_found = {"ACT-01": False, "ACT-03": False, "ACT-04": False, "ACT-05": False}
+        violations_found = {"ACT-01": False, "ACT-04": False, "ACT-05": False}
 
         # ── ACT-01 测试：Δp_ref > 50kW/步 ──
-        # prev_p_ref=-50kW, 新p_ref=+50kW → Δ=100 > 50 → 触发
         env2 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env2.reset()
         env2._validator.prev_p_ref = -50.0
@@ -137,17 +136,16 @@ def ut_03_action_constraint():
         _record("UT-03 [ACT-01 ΔP>50kW]", violations_found["ACT-01"],
                 f"violated={violated}, violations={list(violations.keys())}" if not violations_found["ACT-01"] else "")
 
-        # ── ACT-03 测试：p_ref 越界 (超出 ±50kW) ──
-        # p_ref=120%→60kW > 50kW → 触发 ACT-03
+        # ── ACT-04 测试：k_droop 越界 (v2.17: [-100,100], k=-1→-100 临界/越界) ──
         env3 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env3.reset()
-        # 旁路 ACT-01: prev_p_ref=50 → Δp=10 < 50
-        env3._validator.prev_p_ref = 50.0
-        action = np.array([1.2, -1.0])  # p_ref=60kW(旁路ACT-01), k_droop=0
+        env3._validator.prev_p_ref = 0.0
+        # k_droop ∈ [-1,1]→[-100,100], k=-1.1→-110 < -100 → ACT-04
+        action = np.array([0.0, -1.1])
         _, violated, violations = env3._validator.validate(action, dispatch_p=None)
-        if violated and "ACT-03" in violations:
-            violations_found["ACT-03"] = True
-        _record("UT-03 [ACT-03 p_ref越界]", violations_found["ACT-03"],
+        if violated and "ACT-04" in violations:
+            violations_found["ACT-04"] = True
+        _record("UT-03 [ACT-04 k_droop越界]", violations_found["ACT-04"],
                 f"violated={violated}, violations={list(violations.keys())}")
 
         # ── ACT-01 增强测试：Δp_ref > 50kW ──

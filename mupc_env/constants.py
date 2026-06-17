@@ -16,11 +16,12 @@ LOAD_SHED_MAX_KW = 60.0          # 最大切负荷 (kW) — 对齐规格
 PV_ARRAY_KW = 150.0              # 光伏容量 (kW) — 对齐规格
 LOAD_PEAK_KW = 60.0              # 负荷峰值 (kW) — 对齐规格
 
-# 下垂控制常量 (对齐下游 v2.13)
-K_DROOP_MIN = 0.0                # 下垂系数下限 (kW/V)
-K_DROOP_MAX = 30.0               # 下垂系数上限 (kW/V)
-K_DROOP_RAMP_LIMIT = 10.0        # 下垂系数变化率限制 (kW/V/步)，ACT-02
+# 下垂控制常量 (v2.17 对齐下游 v2.15 Dual 模式)
+K_DROOP_MIN = -100.0             # 下垂系数下限 (kW/V)
+K_DROOP_MAX = 100.0              # 下垂系数上限 (kW/V)
+K_DROOP_RAMP_LIMIT = 30.0        # 下垂系数变化率限制 (kW/V/步)，ACT-02 (v2.17: 10→30)
 P_REF_RAMP_LIMIT_KW = 50.0       # p_ref 变化率限制 (kW/步)，ACT-01
+MAX_APPARENT_POWER_KVA = 200.0   # 视在功率上限 (kVA)，ACT-03 S-circle (v2.17)
 
 SOC_MIN = 0.10                   # SAFETY: SOC 下限硬约束
 SOC_MAX = 0.90                   # SAFETY: SOC 上限硬约束

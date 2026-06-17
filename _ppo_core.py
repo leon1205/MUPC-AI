@@ -503,7 +503,7 @@ if __name__ == "__main__":
     print(f"  deterministic: p_ref={act_det[0]:.3f}, k={act_det[1]:.3f} [OK]")
     print(f"  stochastic:   p_ref={act_stoch[0]:.3f}, k={act_stoch[1]:.3f} [OK]")
 
-    # 3. ActionValidator 4 条约束规则 (v2.15: ACT-01/02/03/04 + ACT-05)
+    # 3. ActionValidator 4+1 条约束规则 (v2.17: ACT-01/02/03/04 + ACT-05)
     print("[3] ActionValidator 约束规则...")
     from action_validator import ActionValidator
     v = ActionValidator()
