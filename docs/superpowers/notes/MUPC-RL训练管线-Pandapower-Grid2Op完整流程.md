@@ -155,28 +155,93 @@ $$
 ```python
 env = MupcEnv(data, mode="MODE-01", use_grid2op=True)
 obs, info = env.reset()
-# obs 是 63 维向量, 例子:
-# obs[0]   = SOC = 0.5           (50% 充电状态)
-# obs[1]   = 光伏 = 20kW          (当前光伏出力)
-# obs[2]   = 负荷 = 40kW          (当前负荷)
-# obs[6,7,8] = va, vb, vc = 0.98 (三相电压, 偏低)
-# obs[58..61] = D9 safety override (4 维)
+# obs 是 78 维向量 (v2.14 单模式), 已经归一化到 [-10, 10] 范围内
+# 示例值:
+# obs[0]   = SOC = 0.567           (57% 充电状态)
+# obs[1]   = 光伏 = 0.398          (归一化后)
+# obs[2]   = 负荷 = 0.346          (归一化后)
+# obs[6]   = A相电压 = 0.596       (归一化后, 原始 ~0.98 p.u.)
+# obs[46]  = 温度 = 0.547          (归一化后, 原始 ~16°C)
 # ... 等等
 ```
 
-**63 维观测的构成**：
-- [0..9] D1: 10 标量 (SOC, 光伏, 负荷, 电网功率, 变压器负载, 电池功率, 三相电压, Q 裕度)
-- [10..24] D2: 15 维光伏预测
-- [25..39] D2: 15 维负荷预测
-- [40..42] D3: 电价 (3 维)
-- [43..45] D4: 需量 (3 维)
-- [46..47] D5: 气象 (2 维)
-- [48] D6: 调度指令
-- [49] D7: Q 裕度
-- [50..55] D7: 季节编码 (6 维 one-hot)
-- [56..57] D7: 时段编码 (2 维 one-hot)
-- [58..61] D9: SafetyOverride (4 维)
-- (可选) [62] mode_id: 仅多模式训练
+#### 完整 78 维观测向量 (v2.14，对齐下游 AI 引擎 PRD)
+
+| 索引 | 数据组 | 字段名 | 含义 | 数据来源 | 归一化 |
+|------|--------|--------|------|----------|--------|
+| 0 | **D1 实时** | `battery_soc` | 电池荷电状态 | 环境内部状态 (SOCOne) | Identity [0,1] |
+| 1 | D1 | `pv_power` | 光伏有功出力 (kW) | SMART-DS/中国合成数据 | MinMax [0,150] |
+| 2 | D1 | `load_power` | 负荷有功功率 (kW) | SMART-DS/中国合成数据 | MinMax [0,60] |
+| 3 | D1 | `grid_power` | 电网交换有功 (kW) | MupcEnv 计算: `P_load_eff-P_pv_eff+P_batt` | MinMax [-200,200] |
+| 4 | D1 | `transformer_load` | 变压器负载率 (p.u.) | MupcEnv 计算: `S/200kVA` | Identity [0,~2] |
+| 5 | D1 | `battery_power_prev` | 上一周期电池有功 (kW) | 上一步动作 p_ref 的反归一化值 | MinMax [-50,50] |
+| 6 | D1 | `voltage_phase_a` | A 相电压 (p.u.) | **Grid2Op**: `pp.runpp()` → end_bus vm_pu | MinMax [0.85,1.15] |
+| 7 | D1 | `voltage_phase_b` | B 相电压 (p.u.) | **Grid2Op**: va×(1-0.003) 人工不平衡 | MinMax [0.85,1.15] |
+| 8 | D1 | `voltage_phase_c` | C 相电压 (p.u.) | **Grid2Op**: va×(1+0.003) 人工不平衡 | MinMax [0.85,1.15] |
+| 9~23 | **D2 预测** | `pv_forecast_15min` | 光伏 15 分钟预测 (15 维) | **LSTM 模型** / Oracle (真实值+噪声) | MinMax [0,150] |
+| 24~38 | D2 | `load_forecast_15min` | 负荷 15 分钟预测 (15 维) | **LSTM 模型** / Oracle (真实值+噪声) | MinMax [0,60] |
+| 39 | **D3 电价** | `current_electricity_price` | 当前电价 (元/kWh) | TOU 电价生成器 (谷0.4/平0.8/峰1.2/尖峰1.5) | MinMax [0,1.5] |
+| 40 | D3 | `next_period_price` | 下时段电价 (元/kWh) | TOU 电价生成器查表 | MinMax [0,1.5] |
+| 41 | D3 | `price_tariff_id` | 时段枚举编码 | TOU 电价生成器 {0=谷,1=平,2=峰,3=尖峰} | MinMax [0,3] |
+| 42 | **D4 需量** | `current_demand` | 当前需量 (kW) | 最近 4 步负荷滑动均值 (≥合同需量×0.3) | MinMax [0,500] |
+| 43 | D4 | `contract_demand` | 合同需量 (kW) | 配置文件常量 (默认 300kW) | MinMax [0,500] |
+| 44 | D4 | `peak_demand_this_month` | 本月峰值需量 (kW) | 滑动窗口跟踪累积最大值 | MinMax [0,500] |
+| 45 | **D5 气象** | `solar_irradiance` | 太阳辐照度 (W/m²) | SMART-DS/中国合成数据 | MinMax [0,1500] |
+| 46 | D5 | `temperature` | 环境温度 (°C) | SMART-DS/中国合成数据 | MinMax [-20,60] |
+| 47 | **D6 调度** | `dispatch_p_set` | 调度有功指令 (kW) | 合成: 非VPP=0，VPP=随机 | MinMax [-200,200] |
+| 48 | **D7** | `q_realtime_margin` | 实时模块无功裕度 | MupcEnv: `1.0 - abs(q_batt)/300` | Identity [0,1] |
+| 49 | **D8 季节** | `season_irrigation` (灌溉季) | 3~4 月 one-hot | MupcEnv: 小时/月份推算 | One-hot |
+| 50 | D8 | `season_tea` (炒茶季) | 5 月 one-hot | 同上 | One-hot |
+| 51 | D8 | `season_ac` (空调季) | 6~8 月 one-hot | 同上 | One-hot |
+| 52 | D8 | `season_normal` (常规季) | 其他月份 one-hot | 同上 | One-hot |
+| 53 | D8 | `season_reserved_1` | 保留位 1 | 始终 0 | One-hot |
+| 54 | D8 | `season_reserved_2` | 保留位 2 | 始终 0 | One-hot |
+| 55 | **D8 时段** | `time_day` (白天) | 06:00~18:00 one-hot | MupcEnv: 小时判断 | One-hot |
+| 56 | D8 | `time_night` (夜间) | 18:00~06:00 one-hot | 同上 | One-hot |
+| 57 | **D9 安全** | `safety_override_active` | 安全覆盖是否激活 | RobustnessManager (训练中常为False) | Bool→float |
+| 58 | D9 | `safety_override_p_ref` | 安全覆盖 P 基准 (kW) | 同上 (训练中常为0) | MinMax [-50,50] |
+| 59 | D9 | `override_consecutive` | 连续触发次数 | 同上 (训练中常为0) | Identity |
+| 60 | D9 | `override_ratio` | 滑动窗口覆盖比例 | 同上 (训练中常为0) | Identity [0,1] |
+| 61~75 | **D10 概率** | `load_forecast_quantiles` | 分位数负荷预测 P10/P30/P50/P70/P90 (15维) | **LSTM 模型** (D10头) / 合成 | MinMax [0,500] |
+| 76 | D10 | `shock_load_probability` | 冲击负荷发生概率 | **LSTM 模型** (D10头) / P90-P50差值法 | Identity [0,1] |
+| 77 | D10 | `base_load` | 基荷 P50 分位数 (kW) | **LSTM 模型** (D10头) / 合成 | MinMax [0,500] |
+| 78* | (可选) | `mode_id` | 多模式场景 ID | MupcEnv: `MODE_ID_MAP[current_mode]` | Identity [0,1] |
+
+> **注：** 索引 78 仅在多模式训练 (`--mode all`) 时追加，单模式为 78 维。
+
+#### 各维度数据来源流程
+
+```
+SMART-DS/中国合成数据 (CSV)
+  ├── pv_power, load_power, ghi, temperature  ──→  D1/D5 (直接填充)
+  ├── pv_power[t+1..t+15], load_power[t+1..t+15] ──→ LSTM训练 target
+  │
+LSTM 模型 (lstm_model.py)
+  ├── predict(step_idx) → pv_forecast(15) + load_forecast(15)  ──→  D2
+  └── predict_numpy() → D10 quantiles + shock_prob + base_load ──→  D10
+      (D10 仅在 with_d10=True 时输出, 训练LSTM后可用)
+  │
+MupcEnv 内部状态 (core.py)
+  ├── _soc (电池递推) ──→  D1[0]
+  ├── _grid_power (计算) ──→  D1[3]
+  ├── _load_rate (计算) ──→  D1[4]
+  ├── q_batt (电压环) → q_realtime_margin ──→  D7[48]
+  ├── season_encoding (月份推算) ──→  D8[49..54]
+  └── time_period_encoding (小时判断) ──→  D8[55..56]
+  │
+Grid2Op + Pandapower (grid2op_env/)
+  └── pp.runpp(net) → net.res_bus[2].vm_pu
+       └── ±voltage_imbalance → va, vb, vc ──→  D1[6..8]
+  │
+TOU 合成 (data_loader.py: _generate_tou_prices)
+  ├── current_price, next_price, tariff_id ──→  D3[39..41]
+  │
+需量合成 (data_loader.py: _generate_demand)
+  ├── current_demand, contract_demand, peak_demand ──→  D4[42..44]
+  │
+调度合成 (data_loader.py: _generate_dispatch)
+  └── dispatch_p_set ──→  D6[47]
+```
 
 ### 4.2 第 2 步：AI 输出动作 (2 维, v2.15)
 
