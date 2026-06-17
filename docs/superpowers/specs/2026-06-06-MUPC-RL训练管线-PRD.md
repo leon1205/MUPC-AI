@@ -25,7 +25,7 @@
 
 > **v2.16 变更说明（对齐部署端 v2.14）：** SafetyOverride精细化实现。D9新增safety_override_consecutive（连续触发次数）和safety_override_ratio（滑动窗口覆盖比例），移除safety_override_reason_code（下游v2.14已移除），D9从5字段缩减为4字段对齐下游。time_period_encoding从1维binary改为2维one-hot对齐下游。观测空间保持63/64维。SCENE-01奖励函数新增分层SafetyOverride惩罚。P-Q协同度与SafetyOverride互斥。修正_normalize_obs索引偏移bug（q_realtime_margin归属D7 identity，load预测归一化索引[25..40]）。训练管线对齐下游v2.14 PRD。
 
-> **v2.15 变更说明（对齐部署端 v2.13）：** SCENE-01 奖励函数精细化设计。P-Q协同Sigmoid平滑化（k=50，平滑过渡替代硬阈值）。Welford动态自适应归一化（RunningStats状态更新，替代固定系数）。状态改善率奖励 R_state_improve（电压偏差实际改善才给正向反馈）。冲击负荷预备度奖励重构（R_readiness替代R_shock_response，保持SOC/放电缓冲空间）。新增 w12（预备度）、w13（状态改善率）权重。
+> **v2.15 变更说明（对齐部署端 v2.13，SCENE-01 奖励函数精细化）：** SCENE-01 奖励函数精细化设计。P-Q协同Sigmoid平滑化（k=50，平滑过渡替代硬阈值）。Welford动态自适应归一化（RunningStats状态更新，替代固定系数）。状态改善率奖励 R_state_improve（电压偏差实际改善才给正向反馈）。冲击负荷预备度奖励重构（R_readiness替代R_shock_response，保持SOC/放电缓冲空间）。新增 w12（预备度）、w13（状态改善率）权重。
 
 > **v2.14 变更说明（对齐部署端 v2.12 R-04~R-07）：** SCENE-01 奖励函数四项改进（R-04~R-07 已实现）。R-04：变压器过载分段惩罚（<75%:0, 75~90% 线性 0~10, 90~100% 指数 10~50, >=100% 硬惩罚 -100）。R-05：电压斜率惩罚动态权重 w6(v) = base_w6×(1+k×|ΔV|)，电压偏差越大权重越高。R-06：冲击负荷响应奖励 R_shock_response（load_rate 波动检测触发）。R-07：P-Q 协同度阈值常量移至模块顶部，支持可配置化。新增 w12 权重。训练管线对齐下游 v2.12 PRD。
 
@@ -393,7 +393,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | SCENE-B3: 工商业模式-虚拟电厂 (MODE-04) | `MODE-04` | 辅助服务收益 + 响应精度 | `R = w1·R_ancillary_service + w2·R_response_accuracy - w3·P_deadline_deviation` |
 | SCENE-B5: 工商业模式-极致绿色 (MODE-05) | `MODE-05` | 最大化绿电消纳 + 最小化碳排放 | `R = w1·R_green_consumption + w2·R_carbon_reduction` |
 
-> 各场景奖励公式的完整定义见 MUPC AI 引擎 PRD 第 6.2~6.6 节。本环境在 `mupc_env.py` 中逐项实现。
+> 各场景奖励公式的完整定义见 MUPC AI 引擎 PRD 第 7.2~7.6 节。本环境在 `mupc_env.py` 中逐项实现。
 
 **多模式训练策略**：
 - `--mode all`（默认）：每个 episode 随机选择一种场景，mode_id 编码追加到观测向量（64 维），训练单一模型覆盖全部 5 种场景
@@ -443,7 +443,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 
 #### 功能描述
 
-遵循 MUPC AI 引擎 PRD 第 5.4 节的 4 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+遵循 MUPC AI 引擎 PRD 第 6.5 节的 4 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
 
 > **v2.15 变更：** 动作空间精简为 2 维 (`[p_ref, k_droop]`)，约束规则由 5 条精简为 4 条。ACT-04 由 pv_limit 改为 k_droop 范围约束，ACT-05 (load_shedding) 移除（load_shedding 已下沉至 strategy-engine）。Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。
 
