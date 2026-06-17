@@ -253,6 +253,17 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
     def _make_env_state(self) -> observation.EnvState:
         """从当前 self._* 状态构建 EnvState 快照 (用于观测构建)。"""
+        # D10 概率负荷预测: 优先使用 data 中的合成数据, fallback 到当前 load_power
+        if "load_forecast_quantiles" in self._data:
+            quantiles = self._data["load_forecast_quantiles"][self._step_idx].astype(np.float32)
+        else:
+            base = float(self._data["load_power"][self._step_idx])
+            quantiles = (base * np.linspace(0.85, 1.27, 15)).astype(np.float32)
+        shock_prob = float(self._data["shock_load_probability"][self._step_idx]) \
+            if "shock_load_probability" in self._data else 0.0
+        base_load = float(self._data["base_load"][self._step_idx]) \
+            if "base_load" in self._data else float(self._data["load_power"][self._step_idx])
+
         return observation.EnvState(
             soc=self._soc,
             pv_power=float(self._data["pv_power"][self._step_idx]),
@@ -265,17 +276,26 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             current_price=float(self._data["current_electricity_price"][self._step_idx]),
             next_price=float(self._data["next_period_price"][self._step_idx]),
             tariff_id=float(self._data["price_tariff_id"][self._step_idx]),
+            peak_price=float(self._data.get("peak_price",
+                np.array([1.5]))[self._step_idx] if "peak_price" in self._data else 1.5),
+            valley_price=float(self._data.get("valley_price",
+                np.array([0.40]))[self._step_idx] if "valley_price" in self._data else 0.40),
             current_demand=self._current_demand,
             peak_demand=self._peak_demand,
             solar_irradiance=float(self._data["solar_irradiance"][self._step_idx]),
             temperature=float(self._data["temperature"][self._step_idx]),
             dispatch_p_set=float(self._data["dispatch_p_set"][self._step_idx]),
+            dispatch_q_set=float(self._data["dispatch_q_set"][self._step_idx])
+                if "dispatch_q_set" in self._data else 0.0,
             season_encoding=self._season_encoding,
             time_period_encoding=self._time_period_encoding,
             safety_override_active=self._safety_override_active,
             safety_override_p_ref=self._safety_override_p_ref,
             override_consecutive=self._override_consecutive,
             override_ratio=self._override_ratio,
+            load_forecast_quantiles=quantiles,
+            shock_load_probability=shock_prob,
+            base_load=base_load,
             current_mode=self._current_mode,
             is_multi_mode=(self._mode == "all"),
         )
@@ -437,7 +457,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         if self._use_grid2op_active and self._grid2op_pf is not None:
             try:
                 # 传递有效负荷和光伏到 pandapower (反映 load_shedding + pv_limit)
-                # 同时传递 k_droop 和 v_actual 触发下垂公式 P_output = P_ref + k_droop × ΔV
+                # 同时传递 k_droop 和 v_actual 触发下垂公式 P_output = P_ref - k_droop × ΔV
                 # v_actual 使用上一步末端电压 (v_avg of self._va/_vb/_vc)
                 v_actual_prev = (self._va + self._vb + self._vc) / 3.0
                 va, vb, vc, has_illegal = self._grid2op_pf.step(
@@ -641,7 +661,7 @@ if __name__ == "__main__":
     print("\n── 多模式测试 (all) ──")
     env2 = MupcEnv(train, mode="all")
     obs2, info2 = env2.reset()
-    print(f"  观测形状: {obs2.shape}  (应为 64 维)")
+    print(f"  观测形状: {obs2.shape}  (应为 79 维, v2.14 78 + 1 mode_id)")
     print(f"  初始模式: {info2['mode']}")
 
     modes_seen = set()

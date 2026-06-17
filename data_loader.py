@@ -169,8 +169,16 @@ class SmartDSLoader:
         demand = self._generate_demand(load_data["load_power"][:n_steps])
 
         # Step 5: 调度指令合成
-        print("[5/5] 合成调度指令...")
+        print("[5/7] 合成调度指令...")
         dispatch = self._generate_dispatch(n_steps)
+
+        # Step 6: D10 概率负荷预测合成
+        print("[6/7] 合成 D10 概率负荷预测 (15 维分位数 + 冲击概率 + 基荷)...")
+        d10_forecast = self._generate_load_forecast_quantiles(
+            load_data["load_power"][:n_steps], hours,
+        )
+
+        # Step 7: 天气 (solar_irradiance, temperature 已在 Step 1 加载)
 
         # 截断各数组到 n_steps
         result = {
@@ -183,12 +191,19 @@ class SmartDSLoader:
             "current_electricity_price": prices["current"],
             "next_period_price": prices["next"],
             "price_tariff_id": prices["tariff_id"],
+            "peak_price": prices["peak"],
+            "valley_price": prices["valley"],
             # D4: 需量
             "current_demand": demand["current_demand"],
             "contract_demand": demand["contract_demand"],
             "peak_demand_this_month": demand["peak_demand"],
             # D6: 调度
             "dispatch_p_set": dispatch["dispatch_p_set"],
+            "dispatch_q_set": dispatch["dispatch_q_set"],
+            # D10: 概率负荷预测 (v2.14, 17 维)
+            "load_forecast_quantiles": d10_forecast["load_forecast_quantiles"],
+            "shock_load_probability": d10_forecast["shock_load_probability"],
+            "base_load": d10_forecast["base_load"],
             # 辅助
             "timestamps": timestamps,
             "hour_encoded": hour_encoded,
@@ -320,11 +335,17 @@ class SmartDSLoader:
 
     def _generate_tou_prices(self, hours: np.ndarray,
                              months: np.ndarray) -> dict[str, np.ndarray]:
-        """TOU 电价生成。"""
+        """TOU 电价生成。
+
+        额外返回 peak_price (tariff_id=2/3 时段最高价) 和 valley_price
+        (tariff_id=0 时段最低价), 供 D3 观测和奖励函数使用。
+        """
         n = len(hours)
         current = np.zeros(n, dtype=np.float32)
         next_p = np.zeros(n, dtype=np.float32)
         tariff = np.zeros(n, dtype=np.int32)
+        peak = np.zeros(n, dtype=np.float32)
+        valley = np.zeros(n, dtype=np.float32)
 
         for i in range(n):
             h = int(hours[i]) % 24
@@ -333,8 +354,17 @@ class SmartDSLoader:
             current[i] = price
             next_p[i] = nprice
             tariff[i] = tid
+            # peak_price: 当时段制夏/冬季表中 峰/尖峰 最高价
+            schedule = TOU_SCHEDULE_SUMMER if m in (6, 7, 8, 9) else TOU_SCHEDULE_WINTER
+            peak_prices = [p for (_, _, t, p) in schedule if t in (2, 3)]
+            valley_prices = [p for (_, _, t, p) in schedule if t == 0]
+            peak[i] = max(peak_prices) if peak_prices else 1.5
+            valley[i] = min(valley_prices) if valley_prices else 0.40
 
-        return {"current": current, "next": next_p, "tariff_id": tariff}
+        return {
+            "current": current, "next": next_p, "tariff_id": tariff,
+            "peak": peak, "valley": valley,
+        }
 
     # ── 需量合成 ─────────────────────────────────────────
 
@@ -363,9 +393,55 @@ class SmartDSLoader:
     # ── 调度指令合成 ─────────────────────────────────────
 
     def _generate_dispatch(self, n_steps: int) -> dict[str, np.ndarray]:
-        """默认无调度 (全为 0.0)，VPP 场景运行时动态生成。"""
+        """默认无调度 (全为 0.0)，VPP 场景运行时动态生成。
+
+        v2.14: 新增 dispatch_q_set 字段, 当前默认 0.0.
+        """
         return {
             "dispatch_p_set": np.zeros(n_steps, dtype=np.float32),
+            "dispatch_q_set": np.zeros(n_steps, dtype=np.float32),
+        }
+
+    # ── D10 概率负荷预测合成 ────────────────────────────
+
+    def _generate_load_forecast_quantiles(self, load_power: np.ndarray,
+                                          hours: np.ndarray) -> dict[str, np.ndarray]:
+        """D10 概率负荷预测合成 (v2.14 对齐下游 AI 引擎)。
+
+        生成 15 维分位数预测 (P3.3/P10/P16.7/.../P96.7, 等距 15 步) +
+        冲击负荷发生概率 + 基荷 (50% 分位数).
+
+        简化策略:
+        - 分位数 = base * 缩放因子 (按分位水平线性扩展)
+        - 冲击负荷概率按小时段分布: 早高峰/晚高峰更高
+        - 基荷 = 50% 分位数 (中位数)
+        """
+        n = len(load_power)
+        quantiles = np.zeros((n, 15), dtype=np.float32)
+        shock_prob = np.zeros(n, dtype=np.float32)
+        base_load = np.zeros(n, dtype=np.float32)
+
+        for i in range(n):
+            base = float(load_power[i])  # 当前负荷作为中位数
+            base_load[i] = base
+            # 15 个分位数: P3.3, P10, P16.7, ..., P96.7 (步进 ~6.67%)
+            # 缩放因子: 0.85, 0.88, 0.91, 0.94, 0.97, 1.00, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21, 1.24, 1.27
+            # 即 P3.3=0.85, P50=1.00, P96.7=1.27 (近似正态分布 ±20%)
+            scale_factors = np.linspace(0.85, 1.27, 15)
+            quantiles[i] = base * scale_factors
+            # 冲击概率: 早高峰 (7-9) 和晚高峰 (18-21) 较高
+            h = int(hours[i]) % 24
+            if 7 <= h < 9 or 18 <= h < 21:
+                shock_prob[i] = 0.3
+            elif 6 <= h < 10 or 17 <= h < 22:
+                shock_prob[i] = 0.15
+            else:
+                shock_prob[i] = 0.05
+
+        return {
+            "load_forecast_quantiles": quantiles,
+            "shock_load_probability": shock_prob,
+            "base_load": base_load,
         }
 
     # ── 归一化参数 ───────────────────────────────────────
@@ -992,6 +1068,12 @@ class ChinaDataLoader:
 
         hours = (np.arange(n_steps, dtype=np.float32) * 15 / 60) % 24
 
+        # 合成 peak/valley_price + dispatch_q_set + D10 (v2.14 对齐下游 AI 引擎)
+        peak_price, valley_price = self._compute_peak_valley(prices["current"][:n_steps])
+        d10_forecast = self._generate_load_forecast_quantiles(
+            load_data["load_power"][:n_steps], hours,
+        )
+
         result = {
             "pv_power": solar_data["pv_power"][:n_steps],
             "load_power": load_data["load_power"][:n_steps],
@@ -1000,10 +1082,16 @@ class ChinaDataLoader:
             "current_electricity_price": prices["current"][:n_steps],
             "next_period_price": prices["next"][:n_steps],
             "price_tariff_id": prices["tariff_id"][:n_steps],
+            "peak_price": peak_price,
+            "valley_price": valley_price,
             "current_demand": demand["current_demand"],
             "contract_demand": demand["contract_demand"],
             "peak_demand_this_month": demand["peak_demand"],
             "dispatch_p_set": dispatch["dispatch_p_set"],
+            "dispatch_q_set": dispatch["dispatch_q_set"],
+            "load_forecast_quantiles": d10_forecast["load_forecast_quantiles"],
+            "shock_load_probability": d10_forecast["shock_load_probability"],
+            "base_load": d10_forecast["base_load"],
             "timestamps": np.arange(n_steps, dtype=np.float64),
             "hour_encoded": np.sin(hours * 2 * math.pi / 24).astype(np.float32),
             "hours": hours,
@@ -1129,7 +1217,36 @@ class ChinaDataLoader:
         }
 
     def _generate_dispatch(self, n_steps: int) -> dict:
-        return {"dispatch_p_set": np.zeros(n_steps, dtype=np.float32)}
+        return {
+            "dispatch_p_set": np.zeros(n_steps, dtype=np.float32),
+            "dispatch_q_set": np.zeros(n_steps, dtype=np.float32),
+        }
+
+    @staticmethod
+    def _compute_peak_valley(current_prices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """从 current_prices 时间序列中计算 peak_price 和 valley_price (v2.14)。
+
+        peak_price = 序列前 20% 分位均值 (高价时段)
+        valley_price = 序列后 20% 分位均值 (低价时段)
+
+        简化策略: 实际项目应按 tariff_id 提取, 这里用 percentile 近似.
+        """
+        peak_threshold = np.percentile(current_prices, 80)
+        valley_threshold = np.percentile(current_prices, 20)
+        peak_price = np.where(
+            current_prices >= peak_threshold,
+            current_prices, peak_threshold,
+        )
+        valley_price = np.where(
+            current_prices <= valley_threshold,
+            current_prices, valley_threshold,
+        )
+        return peak_price.astype(np.float32), valley_price.astype(np.float32)
+
+    def _generate_load_forecast_quantiles(self, load_power: np.ndarray,
+                                          hours: np.ndarray) -> dict[str, np.ndarray]:
+        """D10 概率负荷预测合成 (复用 SmartDSLoader 逻辑)."""
+        return SmartDSLoader._generate_load_forecast_quantiles(self, load_power, hours)
 
 
 # ═══════════════════════════════════════════════════════════════

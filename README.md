@@ -22,7 +22,7 @@ data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/�
         ↓
 lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
         ↓
-mupc_env/            → Gymnasium 环境：63/64维观测 + 2维动作 + 5场景奖励
+mupc_env/            → Gymnasium 环境：78/79维观测 + 2维动作 + 5场景奖励 (v2.14)
 │ └── grid2op_env/ → Grid2Op + Pandapower 三相潮流电压仿真（可选）
         ↓
 train.py → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
@@ -144,24 +144,24 @@ python data_loader.py --unified --lat 31.23 --lon 121.47
 | `--reward-weights` | 按场景默认 | 自定义奖励权重 |
 | `--seed` | `42` | 随机种子 |
 
-## 观测空间（63维单模式，64维多模式，v2.16）
+## 观测空间（78维单模式，79维多模式，v2.14 对齐下游 AI 引擎）
 
 ```
-[0..9]    D1 实时数据 (10标量)         SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压/实时模块Q裕度
-[10..24]  D2 光伏预测 (15维)          LSTM或Oracle
-[25..39]  D2 负荷预测 (15维)          LSTM或Oracle
-[40..42]  D3 电价 (3字段)             当前价/下时段价/时段ID
-[43..45]  D4 需量 (3字段)             当前需量/合同值/本月峰值
-[46..47]  D5 气象 (2字段)             辐照/温度
-[48]      D6 调度指令                  dispatch_p_set
-[49]      D7 Q裕度                    q_realtime_margin
-[50..55]  D7 季节one-hot (6维)        灌溉季/炒茶季/空调季/常规季/保留/保留
-[56..57]  D7 时段one-hot (2维)        白天/夜间 (v2.16 由 1 维升级为 2 维)
-[58]      D9 safety_override_active   安全覆盖激活
-[59]      D9 safety_override_p_ref    安全覆盖设定值
-[60]      D9 override_consecutive     连续触发次数 (v2.16)
-[61]      D9 override_ratio           滑动窗口覆盖比例 (v2.16)
-[62]      (可选) mode_id              多模式训练追加 (多模式为第63位)
+[0..8]    D1 实时数据 (9标量)         SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压 (q_margin 移至 D7)
+[9..23]   D2 光伏预测 (15维)          LSTM或Oracle
+[24..38]  D2 负荷预测 (15维)          LSTM或Oracle
+[39..41]  D3 电价 (3字段)             当前价/下时段价/时段ID (peak/valley_price 仅日志, 不入向量)
+[42..44]  D4 需量 (3字段)             当前需量/合同值/本月峰值
+[45..46]  D5 气象 (2字段)             辐照/温度
+[47]      D6 调度有功指令              dispatch_p_set (dispatch_q_set 仅日志, 不入向量)
+[48]      D7 Q裕度                    q_realtime_margin (v2.14 移至 D7)
+[49..54]  D8 季节one-hot (6维)        灌溉季/炒茶季/空调季/常规季/保留/保留
+[55..56]  D8 时段one-hot (2维)        白天/夜间
+[57..60]  D9 安全覆盖 (4字段)         active/p_ref/consecutive/ratio
+[61..75]  D10 分位数负荷预测 (15维)   P3.3~P96.7 等距 15 步
+[76]      D10 冲击负荷概率 (0~1)
+[77]      D10 基荷 (50% 分位数)
+[78]      (可选) mode_id              多模式训练追加 (多模式为第79位)
 ```
 
 ## 动作空间（2维，v2.15 精简）
@@ -235,7 +235,7 @@ confidence 改为 ModelOutput 元数据（不在 RL 动作空间）。
 MUPC-AI2/
 ├── data_loader.py              # SMART-DS 数据加载 + 状态合成
 ├── mupc_env.py               # 兼容重定向 (→ mupc_env/ 包)
-├── mupc_env/                 # Gymnasium 环境 (63/64维, 2维动作, Grid2Op集成, v2.15 模块化)
+├── mupc_env/                 # Gymnasium 环境 (78/79维, 2维动作, Grid2Op集成, v2.15 模块化)
 │   ├── __init__.py           # 仅导出 MupcEnv
 │   ├── constants.py          # 物理常数 + 归一化边界 + 权重配置
 │   ├── voltage_sim.py        # VoltageSimulator (Grid2Op 优先, 自动降级)

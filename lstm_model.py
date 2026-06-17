@@ -37,11 +37,14 @@ _ensure_torch()
 # ── 模型定义 ──────────────────────────────────────────────────
 
 class LSTMForecast:
-    """LSTM 时序预测模型 (PyTorch)。"""
+    """LSTM 时序预测模型 (PyTorch)。
+
+    v2.14 扩展: 增加 D10 概率负荷预测输出 (17 维), 总输出 47 维.
+    """
 
     def __init__(self, input_dim: int = 7, hidden_dim: int = 64,
                  num_layers: int = 2, forecast_steps: int = 15,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, with_d10: bool = True):
         """
         Args:
             input_dim: 输入特征维度（默认 7）
@@ -50,13 +53,17 @@ class LSTMForecast:
             num_layers: LSTM 层数
             forecast_steps: 预测步数 (默认 15 = 15 分钟)
             dropout: dropout 比率
+            with_d10: 是否启用 D10 概率负荷预测头 (v2.14, 默认 True)
         """
         _ensure_torch()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.forecast_steps = forecast_steps
-        self.output_dim = forecast_steps * 2  # pv(15) + load(15)
+        self.with_d10 = with_d10
+        # 30 维 (D2 pv+load) + 17 维 (D10) = 47 维 (启用 D10)
+        # 或 30 维 (D2 only) (向后兼容)
+        self.output_dim = forecast_steps * 2 + (17 if with_d10 else 0)
 
         self.lstm = _nn.LSTM(
             input_dim, hidden_dim, num_layers,
@@ -64,6 +71,11 @@ class LSTMForecast:
         )
         self.head_pv = _nn.Linear(hidden_dim, forecast_steps)
         self.head_load = _nn.Linear(hidden_dim, forecast_steps)
+        # D10 预测头 (v2.14): 15 维分位数 + 1 维冲击概率 + 1 维基荷
+        if with_d10:
+            self.head_d10_quantiles = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_d10_shock = _nn.Linear(hidden_dim, 1)
+            self.head_d10_base = _nn.Linear(hidden_dim, 1)
 
         self.device = "cpu"
         self._initialized = True
@@ -72,31 +84,53 @@ class LSTMForecast:
         self.lstm.to(device)
         self.head_pv.to(device)
         self.head_load.to(device)
+        if self.with_d10:
+            self.head_d10_quantiles.to(device)
+            self.head_d10_shock.to(device)
+            self.head_d10_base.to(device)
         self.device = device
         return self
 
     def parameters(self):
-        return list(self.lstm.parameters()) + \
-               list(self.head_pv.parameters()) + \
-               list(self.head_load.parameters())
+        params = list(self.lstm.parameters()) + \
+                 list(self.head_pv.parameters()) + \
+                 list(self.head_load.parameters())
+        if self.with_d10:
+            params += list(self.head_d10_quantiles.parameters()) + \
+                      list(self.head_d10_shock.parameters()) + \
+                      list(self.head_d10_base.parameters())
+        return params
 
     def state_dict(self) -> dict:
-        return {
+        d = {
             "lstm": self.lstm.state_dict(),
             "head_pv": self.head_pv.state_dict(),
             "head_load": self.head_load.state_dict(),
         }
+        if self.with_d10:
+            d["head_d10_quantiles"] = self.head_d10_quantiles.state_dict()
+            d["head_d10_shock"] = self.head_d10_shock.state_dict()
+            d["head_d10_base"] = self.head_d10_base.state_dict()
+        return d
 
     def load_state_dict(self, d: dict) -> None:
         self.lstm.load_state_dict(d["lstm"])
         self.head_pv.load_state_dict(d["head_pv"])
         self.head_load.load_state_dict(d["head_load"])
+        if self.with_d10 and "head_d10_quantiles" in d:
+            self.head_d10_quantiles.load_state_dict(d["head_d10_quantiles"])
+            self.head_d10_shock.load_state_dict(d["head_d10_shock"])
+            self.head_d10_base.load_state_dict(d["head_d10_base"])
 
     def eval(self) -> "LSTMForecast":
         """切换到评估模式。"""
         self.lstm.eval()
         self.head_pv.eval()
         self.head_load.eval()
+        if self.with_d10:
+            self.head_d10_quantiles.eval()
+            self.head_d10_shock.eval()
+            self.head_d10_base.eval()
         return self
 
     def train(mode: bool = True) -> "LSTMForecast":
@@ -104,6 +138,10 @@ class LSTMForecast:
         self.lstm.train(mode)
         self.head_pv.train(mode)
         self.head_load.train(mode)
+        if self.with_d10:
+            self.head_d10_quantiles.train(mode)
+            self.head_d10_shock.train(mode)
+            self.head_d10_base.train(mode)
         return self
 
     def forward(self, x) -> "torch.Tensor":
@@ -111,18 +149,23 @@ class LSTMForecast:
         Args:
             x: (batch, seq_len, input_dim) = (batch, 8, 7)
         Returns:
-            (batch, forecast_steps * 2) = (batch, 30)
-            前 15 维 = pv_forecast, 后 15 维 = load_forecast
-            使用 ReLU 保证输出非负（PV/load 均应为 >= 0）
+            (batch, 47) 启用 D10: [pv(15) + load(15) + quantiles(15) + shock_prob(1) + base_load(1)]
+            (batch, 30) 不启用 D10: [pv(15) + load(15)]
+            使用 ReLU 保证 PV/load/分位数/基荷输出非负。
         """
         out, (h_n, _) = self.lstm(x)
         last_hidden = h_n[-1]  # (batch, hidden_dim)
         pv_pred = _torch.relu(self.head_pv(last_hidden))   # 非负约束
         load_pred = _torch.relu(self.head_load(last_hidden))  # 非负约束
+        if self.with_d10:
+            q_pred = _torch.relu(self.head_d10_quantiles(last_hidden))  # 15 维分位数, 非负
+            shock_pred = _torch.sigmoid(self.head_d10_shock(last_hidden))  # 1 维概率, [0,1]
+            base_pred = _torch.relu(self.head_d10_base(last_hidden))  # 1 维基荷, 非负
+            return _torch.cat([pv_pred, load_pred, q_pred, shock_pred, base_pred], dim=-1)
         return _torch.cat([pv_pred, load_pred], dim=-1)
 
     def predict_numpy(self, x: np.ndarray) -> np.ndarray:
-        """NumPy 接口: 输入 (batch, 4, 6) → 输出 (batch, 30)。"""
+        """NumPy 接口: 输入 (batch, 4, 6) → 输出 (batch, 47) 或 (batch, 30)。"""
         _ensure_torch()
         self.lstm.eval()
         with _torch.no_grad():
@@ -142,13 +185,10 @@ class LSTMForecast:
         self._data = data
 
     def predict(self, step_idx: int) -> np.ndarray:
-        """LSTM 预测接口 (30,) = [pv_15_forecast, load_15_forecast]。
+        """LSTM 预测接口 (向后兼容, 返回 30 维)。
 
-        从历史 4 步构建输入序列，调用 predict_numpy。
-        与 OraclePredictor.predict(step_idx) 接口兼容。
-
-        Args:
-            step_idx: 当前时间步索引
+        v2.14: 模型本身输出 47 维 (pv15+load15+D10_17), 但 predict() 接口
+        保持 30 维向后兼容 (D10 由 data_loader 合成, 不通过 forecast 传递).
 
         Returns:
             (30,) ndarray, 前15维=pv预测, 后15维=load预测
@@ -179,8 +219,9 @@ class LSTMForecast:
             x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
 
         # predict_numpy 期望 (batch, seq_len, 6)
-        out = self.predict_numpy(x[np.newaxis, :, :])  # (1, 30)
-        return out[0]
+        out = self.predict_numpy(x[np.newaxis, :, :])  # (1, 47) 或 (1, 30)
+        # 向后兼容: 只返回前 30 维 (D2), D10 由 EnvState 从 data 读取
+        return out[0, :30]
 
 
 # ── 训练器 ─────────────────────────────────────────────────────

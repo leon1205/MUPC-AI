@@ -39,15 +39,17 @@ def _ensure_export_deps():
 
 # ── RL 策略导出模型 ────────────────────────────────────────────
 
-def _build_rl_export_model(obs_dim: int = 58,
+def _build_rl_export_model(obs_dim: int = 78,
                            hidden: list[int] | None = None):
     """构建仅用于 ONNX 导出的策略网络壳 (2 维动作, 对齐下游 v2.15)。
 
     下游 MUPC AI 引擎 PRD v2.15: 动作空间精简为 2 维 [p_ref, k_droop]。
     load_shedding/pv_limit 下沉至 strategy-engine，confidence 移至 ModelOutput。
 
+    v2.14 观测空间: 78 维单模式 (D1~D10) / 79 维多模式 (+mode_id).
+
     Args:
-        obs_dim: 观测维度 (default 58, 兼容旧 checkpoint)
+        obs_dim: 观测维度 (default 78, v2.14 单模式)
         hidden: 隐藏层维度列表
     """
     import torch
@@ -127,7 +129,7 @@ def _load_npz_weights(npz_path: str, obs_dim: int) -> dict:
 def export_rl_policy(
     checkpoint_dir: str = "./checkpoints/",
     output_dir: str = "./exported_models/",
-    obs_dim: int = 58,
+    obs_dim: int = 78,
     checkpoint_path: str | None = None,
     dual_mode: bool = False,
 ) -> str:
@@ -381,8 +383,8 @@ def main():
                         help="checkpoint 目录 (default: ./checkpoints/)")
     parser.add_argument("--output-dir", type=str, default="./exported_models/",
                         help="输出目录 (default: ./exported_models/)")
-    parser.add_argument("--obs-dim", type=int, default=48,
-                        help="观测维度 (default: 48, 多模式用 49)")
+    parser.add_argument("--obs-dim", type=int, default=78,
+                        help="观测维度 (default: 78, v2.14 单模式; 多模式用 79)")
     parser.add_argument("--lstm", type=str, default=None,
                         help="导出 LSTM 模型 (提供 checkpoint 路径)")
     parser.add_argument("--to-rknn", action="store_true",

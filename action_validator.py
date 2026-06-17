@@ -6,10 +6,10 @@
   ACT-02: |Δk_droop| <= DeltaK_Max kW/V/步
   ACT-03: p_ref ∈ [p_ref_min, p_ref_max] → [-50, 50] kW
   ACT-04: k_droop ∈ [k_droop_min, k_droop_max] → [0, 30] kW/V
-  ACT-07: |p_ref| <= |dispatch_p| (当调度指令有效时)
+  ACT-05: |p_ref| <= |dispatch_p| (当调度指令有效时)
 
-v2.15: ACT-05(load_shedding)/ACT-06(pv_limit) 下沉至 strategy-engine,
-       confidence 移至 ModelOutput 元数据，不再经 RL 动作空间。
+v2.15 重命名: 旧版本 ACT-07(dispatch_p) 合并为 ACT-05
+(下游 v2.15 精简后, ACT-05/06 已下沉, 原 ACT-07 dispatch 约束被重编号为 ACT-05).
 """
 
 import numpy as np
@@ -78,7 +78,7 @@ class ActionValidator:
     def validate(self, action_norm: np.ndarray,
                  dispatch_p: float | None = None,
                  ) -> tuple[np.ndarray, bool, dict[str, bool]]:
-        """执行 4 条约束校验 (ACT-01~04, ACT-07)。
+        """执行 4 条约束校验 (ACT-01~04, ACT-05)。
 
         Args:
             action_norm: 归一化动作 [p_ref, k_droop] (2维)
@@ -120,12 +120,12 @@ class ActionValidator:
             k_droop = self.K_DROOP_MAX
             violations["ACT-04"] = True
 
-        # ACT-07: |p_ref| <= |dispatch_p| (调度权限约束)
+        # ACT-05: |p_ref| <= |dispatch_p| (调度权限约束, v2.15 重编号)
         if dispatch_p is not None and abs(dispatch_p) > 1e-6:
             limit = abs(dispatch_p)
             if abs(p_ref) > limit:
                 p_ref = max(-limit, min(limit, p_ref))
-                violations["ACT-07"] = True
+                violations["ACT-05"] = True
 
         # 更新历史
         self.prev_p_ref = p_ref

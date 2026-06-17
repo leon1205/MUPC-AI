@@ -242,18 +242,21 @@ class Grid2OpPowerFlow:
         k_droop: float = 0.0,
         v_actual: float = 1.0,
     ) -> bool:
-        """执行单相等效潮流计算（含下垂公式 P_output = P_ref + k_droop × ΔV）。
+        """执行单相等效潮流计算（含下垂公式 P_output = P_ref - k_droop × ΔV）。
 
         先通过 chronics 注入原始数据（含冲击负荷、居民噪声等随机性），
         再用 MupcEnv 计算的有效值覆盖负荷和光伏，确保 RL 动作
         （load_shedding, pv_limit）真实作用于潮流。
 
-        下垂控制:
-            P_storage_final = P_ref + k_droop × (V_actual - 1.0)
+        下垂控制 (v2.15 物理正确表述):
+            P_storage_final = P_ref - k_droop × (V_actual - 1.0)
             ΔV = V_actual - 1.0  (末端电压偏差, p.u.)
             k_droop 单位 kW/V, 即每 1V 电压偏差对应的功率调整
             V_actual = 上一步末端电压 (p.u., 如 0.97 表示 3% 压降)
             V_target = 1.0 p.u.
+
+        物理意义: 电压偏低 (ΔV<0) → -k_droop×ΔV 为正 → 增发功率抬升电压。
+                  电压偏高 (ΔV>0) → -k_droop×ΔV 为负 → 减发功率回落电压。
 
         Args:
             storage_p_mw: 储能有功 MW（p_ref, +充电/-放电）
@@ -287,15 +290,14 @@ class Grid2OpPowerFlow:
                 self._net.sgen.at[i, "p_mw"] = effective_pv_mw
                 self._net.sgen.at[i, "q_mvar"] = 0.0
 
-        # ── P0 修复: 下垂公式 ──
-        # P_output = P_ref + k_droop × ΔV
+        # ── 下垂公式 (v2.15 物理正确) ──
+        # P_output = P_ref - k_droop × ΔV
         # ΔV = V_actual - V_target, V_target = 1.0 p.u.
         # k_droop 在 0.4kV 侧：单位 kW/V, 含义每 1V 偏差补偿
         # 实际物理上, k_droop 通常较小 (e.g. 1-10 kW/V)
         # P_storage_final (MW) 限制在 ±P_BATT_MAX (防止越界)
         if k_droop != 0.0:
-            # 标准下垂公式: P_output = P_ref - k_droop × (V_actual - V_target)
-            # 物理意义: 电压低 → 偏差负 → 减负负得正 → 增发功率抬升电压
+            # 物理意义: 电压低 → 偏差负 → -k_droop×ΔV 为正 → 增发功率抬升电压
             dv = v_actual - 1.0  # 电压偏差 p.u. (V_actual < 1.0 时为负)
             # ΔV 实际电压差 (V): dv * V_base (V_base = 0.4 kV, 即 400V)
             # k_droop (kW/V) × (-dv) × 400V = droop 调整 (kW)

@@ -4,8 +4,21 @@ MUPC 观测构建与归一化模块 (提取自 mupc_env.py)
 包含:
 - EnvState: 环境状态数据载体
 - update_season_time_encoding(): 季节/时段编码
-- build_observation(): 构建 63/64 维观测向量
+- build_observation(): 构建 78/79 维观测向量 (v2.14 对齐下游)
 - normalize_obs(): MinMax 归一化
+
+观测维度构成 (78 维单模式, 79 维多模式, 对齐下游 v2.14 PRD 6.2):
+  D1  [0..9]   10 维 实时数据 (SOC/光伏/负荷/电网/变压器/电池/三相电压/q_margin)
+  D2  [10..39] 30 维 预测数据 (pv_forecast 15 + load_forecast 15)
+  D3  [40..44]  5 维 电价 (current/next/tariff_id/peak_price/valley_price, v2.14)
+  D4  [45..47]  3 维 需量 (current/contract/peak_demand_this_month)
+  D5  [48..49]  2 维 气象 (solar_irradiance/temperature)
+  D6  [50..51]  2 维 调度 (dispatch_p_set/dispatch_q_set, v2.14)
+  D7  [52]      1 维 q_realtime_margin
+  D8  [53..60]  8 维 季节时段 (season_encoding 6 + time_period_encoding 2)
+  D9  [61..64]  4 维 安全覆盖 (active/p_ref/consecutive/ratio)
+  D10 [65..81] 17 维 概率负荷预测 (quantiles 15 + shock_probability + base_load, v2.14)
+  [82]          1 维 mode_id (仅多模式训练, mode == 'all')
 """
 
 from dataclasses import dataclass
@@ -29,6 +42,11 @@ from .constants import (
     NORM_IRRADIANCE,
     NORM_TEMPERATURE,
     NORM_DISPATCH,
+    NORM_DISPATCH_Q,
+    NORM_QUANTILE_LOAD,
+    NORM_SHOCK_PROBABILITY,
+    NORM_BASE_LOAD,
+    NORM_QUANTILES,
 )
 
 
@@ -53,6 +71,8 @@ class EnvState:
     current_price: float
     next_price: float
     tariff_id: float
+    peak_price: float                # v2.14 新增
+    valley_price: float              # v2.14 新增
 
     current_demand: float
     peak_demand: float
@@ -61,6 +81,7 @@ class EnvState:
     temperature: float
 
     dispatch_p_set: float
+    dispatch_q_set: float            # v2.14 新增
 
     season_encoding: np.ndarray       # (6,)
     time_period_encoding: np.ndarray  # (2,)
@@ -69,6 +90,11 @@ class EnvState:
     safety_override_p_ref: float
     override_consecutive: int
     override_ratio: float
+
+    # D10 概率负荷预测 (v2.14 新增, 17 维)
+    load_forecast_quantiles: np.ndarray   # (15,) 分位数负荷预测 P10/P50/P90...
+    shock_load_probability: float          # 冲击负荷发生概率
+    base_load: float                       # 基荷 (50% 分位数)
 
     current_mode: str
     is_multi_mode: bool               # True if training mode == "all"
@@ -119,21 +145,41 @@ def update_season_time_encoding(hour: float, month: float
 
 def build_observation(state: EnvState,
                       forecast: np.ndarray) -> np.ndarray:
-    """构建 63 维观测向量 (多模式追加 mode_id 为 64 维)。
+    """构建 78 维观测向量 (多模式追加 mode_id 为 79 维)。
 
-    对齐下游 MUPC AI 引擎设计文档 v2.14 to_input_vector.
+    对齐下游 MUPC AI 引擎设计文档 v2.14 §3.6 to_input_vector().
+
+    布局 (v2.14, 78 维单模式):
+      D1  [0..8]    9 维 实时数据 (soc/pv/load/grid/transformer/battery/3相电压)
+      D2  [9..23]  15 维 pv_forecast_15min
+      D2  [24..38] 15 维 load_forecast_15min
+      D3  [39..41]  3 维 电价 (current/next/tariff_id, 不含 peak/valley)
+      D4  [42..44]  3 维 需量 (current/contract/peak_this_month)
+      D5  [45..46]  2 维 气象 (irradiance/temperature)
+      D6  [47]      1 维 调度 dispatch_p_set (不含 dispatch_q_set)
+      D7  [48]      1 维 q_realtime_margin (实时模块无功裕度)
+      D8  [49..54]  6 维 season_encoding (灌溉/炒茶/空调/常规/保留/保留)
+      D8  [55..56]  2 维 time_period_encoding (白天/夜间)
+      D9  [57..60]  4 维 safety_override (active/p_ref/consecutive/ratio)
+      D10 [61..75] 15 维 load_forecast_quantiles (P10..P90 步进)
+      D10 [76]      1 维 shock_load_probability
+      D10 [77]      1 维 base_load (50% 分位数)
+      [78]          1 维 mode_id (仅 is_multi_mode=True)
+
+    注: EnvState 中保留 peak_price/valley_price/dispatch_q_set 字段供
+    奖励函数和审计使用, 但**不进入** to_input_vector() (与下游 Rust 端一致).
 
     Args:
         state: 环境状态快照
         forecast: 预测器输出 (30,) = [pv_forecast(15), load_forecast(15)]
 
     Returns:
-        归一化后的观测向量 (63,) 或 (64,) 当 is_multi_mode=True
+        归一化后的观测向量 (78,) 或 (79,) 当 is_multi_mode=True
     """
-    obs_dim = 64 if state.is_multi_mode else 63
+    obs_dim = 79 if state.is_multi_mode else 78
     obs = np.zeros(obs_dim, dtype=np.float32)
 
-    # ── D1 [0..9]: 10 标量 ──
+    # ── D1 [0..8]: 9 标量 (不含 q_realtime_margin, 移至 D7) ──
     obs[0] = state.soc
     obs[1] = state.pv_power
     obs[2] = state.load_power
@@ -143,50 +189,58 @@ def build_observation(state: EnvState,
     obs[6] = state.va
     obs[7] = state.vb
     obs[8] = state.vc
-    obs[9] = state.q_realtime_margin
 
-    # ── D2 [10..24] pv_forecast (15维) ──
-    obs[10:25] = forecast[:15]
+    # ── D2 [9..23] pv_forecast (15维) ──
+    obs[9:24] = forecast[:15]
 
-    # ── D2 [25..39] load_forecast (15维) ──
-    obs[25:40] = forecast[15:30]
+    # ── D2 [24..38] load_forecast (15维) ──
+    obs[24:39] = forecast[15:30]
 
-    # ── D3 [40..42] 电价 ──
-    obs[40] = state.current_price
-    obs[41] = state.next_price
-    obs[42] = state.tariff_id
+    # ── D3 [39..41] 电价 (3 维, 不含 peak/valley) ──
+    obs[39] = state.current_price
+    obs[40] = state.next_price
+    obs[41] = state.tariff_id
 
-    # ── D4 [43..45] 需量 ──
-    obs[43] = state.current_demand
-    obs[44] = CONTRACT_DEMAND_KW
-    obs[45] = state.peak_demand
+    # ── D4 [42..44] 需量 (3 维) ──
+    obs[42] = state.current_demand
+    obs[43] = CONTRACT_DEMAND_KW
+    obs[44] = state.peak_demand
 
-    # ── D5 [46..47] 气象 ──
-    obs[46] = state.solar_irradiance
-    obs[47] = state.temperature
+    # ── D5 [45..46] 气象 (2 维) ──
+    obs[45] = state.solar_irradiance
+    obs[46] = state.temperature
 
-    # ── D6 [48] 调度 ──
-    obs[48] = state.dispatch_p_set if abs(state.dispatch_p_set) > 1e-6 else 0.0
+    # ── D6 [47] dispatch_p_set (1 维, 不含 dispatch_q_set) ──
+    obs[47] = state.dispatch_p_set if abs(state.dispatch_p_set) > 1e-6 else 0.0
 
-    # ── D7 [49] q_realtime_margin ──
-    obs[49] = state.q_realtime_margin
+    # ── D7 [48] q_realtime_margin (1 维) ──
+    obs[48] = state.q_realtime_margin
 
-    # ── D7 [50..55] season_encoding (6维) ──
-    obs[50:56] = state.season_encoding
+    # ── D8 [49..54] season_encoding (6 维 one-hot) ──
+    obs[49:55] = state.season_encoding
 
-    # ── D7 [56..57] time_period_encoding (2维 one-hot, v2.14对齐下游) ──
-    obs[56] = state.time_period_encoding[0]  # 白天
-    obs[57] = state.time_period_encoding[1]  # 夜间
+    # ── D8 [55..56] time_period_encoding (2 维 one-hot) ──
+    obs[55] = state.time_period_encoding[0]  # 白天
+    obs[56] = state.time_period_encoding[1]  # 夜间
 
-    # ── D9 [58..61] 安全覆盖状态 (v2.14, 4字段对齐下游) ──
-    obs[58] = 1.0 if state.safety_override_active else 0.0
-    obs[59] = state.safety_override_p_ref
-    obs[60] = float(state.override_consecutive)
-    obs[61] = state.override_ratio
+    # ── D9 [57..60] safety_override (4 维) ──
+    obs[57] = 1.0 if state.safety_override_active else 0.0
+    obs[58] = state.safety_override_p_ref
+    obs[59] = float(state.override_consecutive)
+    obs[60] = state.override_ratio
 
-    # ── mode_id [62] (可选) ──
+    # ── D10 [61..75] load_forecast_quantiles (15 维) ──
+    obs[61:76] = state.load_forecast_quantiles[:15]
+
+    # ── D10 [76] shock_load_probability (1 维) ──
+    obs[76] = state.shock_load_probability
+
+    # ── D10 [77] base_load (1 维, 50% 分位数) ──
+    obs[77] = state.base_load
+
+    # ── mode_id [78] (可选, 多模式训练) ──
     if state.is_multi_mode:
-        obs[62] = MODE_ID_MAP.get(state.current_mode, 0.0)
+        obs[78] = MODE_ID_MAP.get(state.current_mode, 0.0)
 
     return normalize_obs(obs)
 
@@ -196,20 +250,20 @@ def build_observation(state: EnvState,
 # ═══════════════════════════════════════════════════════════════
 
 def normalize_obs(obs: np.ndarray) -> np.ndarray:
-    """应用 MinMax 归一化 (v2.14: 63维)。
+    """应用 MinMax 归一化 (v2.14: 78 维单模式 / 79 维多模式)。
 
     归一化范围使用 constants.py 中的命名常量，
     归一化范围随物理常量修正同步更新 (例如 NORM_GRID_POWER 由 ±500kW 改为 ±200kW)。
 
     Args:
-        obs: 原始观测向量 (63,) 或 (64,)
+        obs: 原始观测向量 (78,) 或 (79,)
 
     Returns:
         归一化观测向量，dtype=float32
     """
     out = obs.copy()
 
-    # D1 [0..9]
+    # D1 [0..8] 9 维 (q_realtime_margin 已移至 D7 [48])
     out[0] = _minmax(obs[0], *NORM_SOC)
     out[1] = _minmax(obs[1], *NORM_PV_POWER)
     out[2] = _minmax(obs[2], *NORM_LOAD_POWER)
@@ -219,38 +273,47 @@ def normalize_obs(obs: np.ndarray) -> np.ndarray:
     out[6] = _minmax(obs[6], *NORM_VOLTAGE)
     out[7] = _minmax(obs[7], *NORM_VOLTAGE)
     out[8] = _minmax(obs[8], *NORM_VOLTAGE)
-    out[9] = obs[9]                      # q_realtime_margin: identity [0,1]
 
-    # D2 pv [10..24]
-    out[10:25] = _minmax(obs[10:25], *NORM_PV_POWER)
+    # D2 pv [9..23] 15 维
+    out[9:24] = _minmax(obs[9:24], *NORM_PV_POWER)
 
-    # D2 load [25..39]
-    out[25:40] = _minmax(obs[25:40], *NORM_LOAD_POWER)
+    # D2 load [24..38] 15 维
+    out[24:39] = _minmax(obs[24:39], *NORM_LOAD_POWER)
 
-    # D3 [40..42] 电价
+    # D3 [39..41] 3 维 (不含 peak/valley_price)
+    out[39] = _minmax(obs[39], *NORM_PRICE)
     out[40] = _minmax(obs[40], *NORM_PRICE)
-    out[41] = _minmax(obs[41], *NORM_PRICE)
-    out[42] = _minmax(obs[42], *NORM_TARIFF)
+    out[41] = _minmax(obs[41], *NORM_TARIFF)
 
-    # D4 [43..45] 需量
+    # D4 [42..44] 3 维
+    out[42] = _minmax(obs[42], *NORM_DEMAND)
     out[43] = _minmax(obs[43], *NORM_DEMAND)
     out[44] = _minmax(obs[44], *NORM_DEMAND)
-    out[45] = _minmax(obs[45], *NORM_DEMAND)
 
-    # D5 [46..47] 气象
-    out[46] = _minmax(obs[46], *NORM_IRRADIANCE)
-    out[47] = _minmax(obs[47], *NORM_TEMPERATURE)
+    # D5 [45..46] 2 维
+    out[45] = _minmax(obs[45], *NORM_IRRADIANCE)
+    out[46] = _minmax(obs[46], *NORM_TEMPERATURE)
 
-    # D6 [48] dispatch_p_set
-    out[48] = _minmax(obs[48], *NORM_DISPATCH)
+    # D6 [47] dispatch_p_set
+    out[47] = _minmax(obs[47], *NORM_DISPATCH)
 
-    # D7 [49] q_realtime_margin: identity (v2.14修正)
-    out[49] = obs[49]
+    # D7 [48] q_realtime_margin: identity
+    out[48] = obs[48]
 
-    # D7 [50..55] season_encoding: one-hot, identity
-    # D7 [56..57] time_period: one-hot, identity
-    # D9 [58..61] safety_override: identity
-    # mode_id [62]: identity
+    # D8 [49..54] season_encoding: one-hot, identity
+    # D8 [55..56] time_period: one-hot, identity
+    # D9 [57..60] safety_override: identity
+
+    # D10 [61..75] load_forecast_quantiles 15 维
+    out[61:76] = _minmax(obs[61:76], *NORM_QUANTILE_LOAD)
+
+    # D10 [76] shock_load_probability: identity [0,1]
+    out[76] = obs[76]
+
+    # D10 [77] base_load: scale to [0,1] by LOAD_PEAK_KW
+    out[77] = _minmax(obs[77], *NORM_BASE_LOAD)
+
+    # mode_id [78] (可选): identity
 
     return out.astype(np.float32)
 
