@@ -227,7 +227,7 @@ confidence 改为 ModelOutput 元数据（不在 RL 动作空间）。
 
 - SOC 硬限制：10%~90%（不可突破）
 - 变压器容量：200 kVA，过载阈值 85%
-- 动作约束 (v2.15): ACT-01 (Δp_ref ≤ 50kW/步) / ACT-02 (Δk_droop ≤ 10kW/V/步) / ACT-03 (p_ref ∈ [-50,50] kW) / ACT-04 (k_droop ∈ [0,30] kW/V) / ACT-07 (|p_ref| ≤ |dispatch_p|)
+- 动作约束 (v2.15): ACT-01 (Δp_ref ≤ 50kW/步) / ACT-02 (Δk_droop ≤ 10kW/V/步) / ACT-03 (p_ref ∈ [-50,50] kW) / ACT-04 (k_droop ∈ [0,30] kW/V) / ACT-05 (|p_ref| ≤ |dispatch_p|)
 
 ## 项目结构
 
@@ -244,7 +244,7 @@ MUPC-AI2/
 │   └── core.py               # MupcEnv 主类
 ├── lstm_model.py             # LSTM 预测模型 / Oracle 后备
 ├── train.py                  # SB3 PPO/SAC 主入口 (NumPy PPO 后备)
-├── action_validator.py        # 动作约束 (ACT-01/02/03/04 + ACT-07, v2.15 4+1 条)
+├── action_validator.py        # 动作约束 (ACT-01/02/03/04 + ACT-05, v2.15 4+1 条)
 ├── export_onnx.py           # ONNX 导出 (RL 策略 act_dim=2)
 ├── _ppo_core.py             # 纯 NumPy PPO 后备 (v2.15 act_dim=2)
 ├── _gym_stub.py            # Gymnasium 桩模块
@@ -284,6 +284,6 @@ Grid2Op 模式训练速度下降约 2~13 倍（相比 VoltageSimulator），但�
 ## 代码规范
 
 - 安全相关代码标注 `SAFETY`
-- 动作 clamp 标注约束规则 ID (v2.15: ACT-01/02/03/04 + ACT-07)
+- 动作 clamp 标注约束规则 ID (v2.15: ACT-01/02/03/04 + ACT-05)
 - 所有函数包含 Type Hints 和 Docstrings
 - `mupc_env.py`/`mupc_env/` 不依赖 RL 框架，可独立运行

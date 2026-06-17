@@ -123,7 +123,7 @@ def ut_03_action_constraint():
         env = MupcEnv(data, mode="MODE-01", use_grid2op=False)  # 降级模式，避免 Grid2Op 依赖
         env.reset()
 
-        violations_found = {"ACT-01": False, "ACT-03": False, "ACT-04": False, "ACT-07": False}
+        violations_found = {"ACT-01": False, "ACT-03": False, "ACT-04": False, "ACT-05": False}
 
         # ── ACT-01 测试：Δp_ref > 50kW/步 ──
         # prev_p_ref=-50kW, 新p_ref=+50kW → Δ=100 > 50 → 触发
@@ -157,9 +157,9 @@ def ut_03_action_constraint():
         env4._validator.prev_p_ref = 0.0
         action = np.array([0.8, 0.0])  # p_ref=40kW
         _, violated, violations = env4._validator.validate(action, dispatch_p=10.0)
-        if violated and "ACT-07" in violations:
-            violations_found["ACT-07"] = True
-        _record("UT-03 [ACT-07 调度约束]", violations_found["ACT-07"],
+        if violated and "ACT-05" in violations:
+            violations_found["ACT-05"] = True
+        _record("UT-03 [ACT-05 调度约束]", violations_found["ACT-05"],
                 f"violated={violated}, violations={list(violations.keys())}")
 
     except Exception as e:

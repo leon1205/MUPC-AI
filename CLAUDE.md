@@ -167,7 +167,7 @@ train.py
 ## 代码规范
 
 1. 安全相关代码标注 `SAFETY`
-2. 动作 clamp 标注约束规则 ID (v2.15: ACT-01/02/03/04 + ACT-07)
+2. 动作 clamp 标注约束规则 ID (v2.15: ACT-01/02/03/04 + ACT-05)
 3. 所有函数包含 Type Hints 和 Docstrings
 4. `mupc_env/` 包不依赖 RL 框架，可独立运行
 

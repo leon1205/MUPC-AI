@@ -503,7 +503,7 @@ if __name__ == "__main__":
     print(f"  deterministic: p_ref={act_det[0]:.3f}, k={act_det[1]:.3f} [OK]")
     print(f"  stochastic:   p_ref={act_stoch[0]:.3f}, k={act_stoch[1]:.3f} [OK]")
 
-    # 3. ActionValidator 4 条约束规则 (v2.15: ACT-01/02/03/04 + ACT-07)
+    # 3. ActionValidator 4 条约束规则 (v2.15: ACT-01/02/03/04 + ACT-05)
     print("[3] ActionValidator 约束规则...")
     from action_validator import ActionValidator
     v = ActionValidator()
@@ -513,13 +513,13 @@ if __name__ == "__main__":
     v.validate(act_init, dispatch_p=None)
     _, violated, _ = v.validate(np.array([0.1, 0.0]), dispatch_p=None)
     assert not violated, f"small delta should not trigger ACT-01: {violated}"
-    # ACT-07: 调度约束 (p_ref=30kW > dispatch=20kW)
+    # ACT-05: 调度约束 (p_ref=30kW > dispatch=20kW)
     v.reset()
     v.validate(act_init, dispatch_p=None)
     _, violated, violations = v.validate(np.array([0.6, 0.0]), dispatch_p=20.0)
-    assert violated and "ACT-07" in violations, f"ACT-07 not triggered: {violations}"
+    assert violated and "ACT-05" in violations, f"ACT-05 not triggered: {violations}"
     print("  ACT-01 (delta p_ref <= 50kW) [OK]")
-    print("  ACT-07 (|p_ref| <= |dispatch|) [OK]")
+    print("  ACT-05 (|p_ref| <= |dispatch|) [OK]")
 
     # 4. NumPyPPO 训练一步
     print("[4] NumPyPPO 训练一步...")

@@ -90,7 +90,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._voltage_sim = VoltageSimulator()
         self._init_voltage_simulator(use_grid2op)
 
-        # 观测/动作空间 (v2.14: 63维单模式, 64维多模式)
+        # 观测/动作空间 (v2.14: 78维单模式, 79维多模式)
         obs_dim = 63 if mode != "all" else 64
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
