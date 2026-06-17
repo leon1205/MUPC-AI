@@ -252,6 +252,58 @@ def _compute_shock_readiness(soc: float, p_ref: float,
     return r_soc + r_p
 
 
+def _compute_overload_warning(load_rate: float) -> float:
+    """变压器过载提前预警 (v2.17 对齐下游 Rust overload_warning).
+
+    在过载前提供负向信号, 鼓励 AI 提前调整策略.
+    负载率 > 85% 时: penalty = -10 × (load_rate - 0.85)
+    """
+    if load_rate <= 0.85:
+        return 0.0
+    return -10.0 * (load_rate - 0.85)
+
+
+def _compute_soc_warning(soc: float) -> float:
+    """SOC 边界提前预警 (v2.17 对齐下游 Rust soc_warning).
+
+    当 SOC 接近 [0.15, 0.85] 边界时提供负向信号.
+    """
+    critical_low = 0.15
+    critical_high = 0.85
+    if soc < critical_low:
+        return -5.0 * (critical_low - soc) / critical_low
+    elif soc > critical_high:
+        return -5.0 * (soc - critical_high) / (1.0 - critical_high)
+    else:
+        return 0.0
+
+
+def _compute_soc_balance(soc: float) -> float:
+    """SOC 均衡奖励 (v2.17 对齐下游 Rust soc_balance_reward).
+
+    鼓励 SOC 保持在 50% 附近: R = -5.0 × |soc - 0.5|
+    """
+    return -5.0 * abs(soc - 0.5)
+
+
+def _compute_state_improvement(v_avg: float, prev_v_avg: float,
+                                p_ref: float) -> float:
+    """状态改善率奖励 (v2.17 对齐下游 Rust calc_state_improvement_reward).
+
+    建立"动作-效果"因果链: R = 10.0 × (V_dev_prev - V_dev_curr) × sign(p_ref)
+    - 放电且电压偏差减小 → 正奖励 (动作改善了电压)
+    - 放电但电压偏差增大 → 负奖励 (放电没效果)
+    - 充电且电压偏差减小 → 负奖励 (不该充电)
+    """
+    if abs(prev_v_avg) < 1e-6:
+        return 0.0  # 首次调用无奖励
+    v_dev_curr = abs(v_avg - 1.0)
+    v_dev_prev = abs(prev_v_avg - 1.0)
+    delta_v_dev = v_dev_prev - v_dev_curr
+    sign_p = 1.0 if p_ref > 0.0 else -1.0
+    return 10.0 * delta_v_dev * sign_p
+
+
 # ═══════════════════════════════════════════════════════════════
 # MODE-01: 农网灌溉 (主调度函数)
 # ═══════════════════════════════════════════════════════════════
@@ -268,11 +320,12 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
       - w7·R_smooth
       - w8·R_safety_override
       + w9·R_shock_readiness
+      + R_shaping (overload_warning + soc_warning, 未归一化)
+      + R_soc_balance (未归一化)
+      + R_state_improve (未归一化)
 
-    v2.17 新增: w9 冲击负荷预备度奖励 (对齐下游 v2.13 shock_readiness_reward).
+    v2.17 新增: w9 冲击负荷预备度 + 塑造/SOC均衡/状态改善回补.
     下游重构原因: 1Hz 决策无法感知 ms 级冲击, 应奖励"预备度"而非"响应速度".
-    v2.15 精简: 移除 v2.13/v2.14 时期的 r_overload_warning, r_soc_warning,
-    r_soc_balance, r_state_improve (下游未实现).
 
     纯函数: 所有状态从 r dict 读取, 不访问 self。
     Welford 原始奖励通过 info["welford_raw"] 回传。
@@ -287,7 +340,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     q_margin = r.get("q_realtime_margin", 1.0)
     safety_override_active = r.get("safety_override_active", False)
 
-    # 9 项子奖励计算 (v2.17: 8 项基础 + 1 项 D10 预备度)
+    # 子奖励计算 (v2.17: 9 项基础 + 3 项未归一化附加)
     r_pv = _compute_pv_consumption(r["p_pv_raw"], r["p_load_raw"], p_ref, v_avg)
     alpha = _compute_alpha(soc_new, q_margin, r.get("voltage_violation_count", 0))
     p_overload = _compute_overload(r.get("load_rate_unclamped", r["load_rate"]))
@@ -303,11 +356,19 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         safety_override_active,
         r.get("override_consecutive", 0),
         r.get("override_ratio", 0.0))
-    # v2.17: D10 冲击负荷预备度奖励
+    # D10 冲击负荷预备度奖励
     r_readiness = _compute_shock_readiness(
         soc_new, p_ref,
         r.get("base_load", 0.0),
         r.get("load_forecast_quantiles", np.zeros(15, dtype=np.float32)))
+    # v2.17 回补: 塑造/SOC均衡/状态改善 (对齐下游 Rust, 未归一化直接加在 total 上)
+    r_overload_warn = _compute_overload_warning(
+        r.get("load_rate_unclamped", r["load_rate"]))
+    r_soc_warn = _compute_soc_warning(soc_new)
+    r_shaping = r_overload_warn + r_soc_warn
+    r_soc_balance = _compute_soc_balance(soc_new)
+    r_state_improve = _compute_state_improvement(
+        v_avg, r.get("prev_v_avg", 1.0), p_ref)
 
     # 权重提取 (v2.17: w1~w9)
     w4 = w[3] if len(w) > 3 else 0.0
@@ -333,7 +394,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     # v2.17 修正: _compute_safety_override 已返回 [-1,0], 不再除 100
     r_safety_norm = float(np.clip(r_safety, -1.0, 0.0)) if r_safety < 0 else 0.0
 
-    # 加权求和 (v2.17: 9 项)
+    # 加权求和 (v2.17: 9 项归一化 + 3 项未归一化附加, 对齐下游)
     total = (w[0] * r_pv_norm
              + w[1] * p_batt_deg_norm
              + w[2] * p_overload_norm
@@ -342,7 +403,10 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
              + w[5] * p_vs_norm
              + w7 * r_smooth_norm
              + w8 * r_safety_norm
-             + w9 * r_readiness)
+             + w9 * r_readiness
+             + r_shaping
+             + r_soc_balance
+             + r_state_improve)
 
     info = {
         "r_pv_consumption": float(r_pv),
@@ -354,6 +418,9 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         "r_smooth": float(r_smooth),
         "r_safety_override": float(r_safety),
         "r_shock_readiness": float(r_readiness),
+        "r_shaping": float(r_shaping),
+        "r_soc_balance": float(r_soc_balance),
+        "r_state_improve": float(r_state_improve),
         "v_avg": float(v_avg),
         "alpha": float(alpha),
         "q_realtime_margin": float(q_margin),
