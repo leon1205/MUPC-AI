@@ -137,10 +137,12 @@ def main():
     predictor = None
     if not args.no_lstm and args.lstm_checkpoint:
         from lstm_model import LSTMForecast
+        import torch as _torch_lstm
         print(f"\n── LSTM 模型加载 ──")
         model = LSTMForecast()
-        model.load_state_dict(torch.load(args.lstm_checkpoint, map_location="cpu"))
+        model.load_state_dict(_torch_lstm.load(args.lstm_checkpoint, map_location="cpu"))
         model.lstm.eval()
+        model.set_data(train_data)
         predictor = model
     elif not args.no_lstm and has_torch:
         print("\n── LSTM 模型训练 ──")
@@ -148,6 +150,7 @@ def main():
         trainer = LSTMTrainer({"epochs": 50, "batch_size": 64})
         result = trainer.train(train_data, val_data)
         predictor = result["model"]
+        predictor.set_data(train_data)  # 绑定 data 引用供 predict(step_idx) 使用
         # 保存 LSTM checkpoint
         lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
         os.makedirs(args.checkpoint_path, exist_ok=True)

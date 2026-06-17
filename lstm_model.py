@@ -287,8 +287,18 @@ class LSTMTrainer:
         n_samples = len(balanced)
         print(f"  样本平衡: 白天={n_day}, 夜间={n_night}, 总计={n_samples}")
 
+        # D2: pv(15) + load(15) = 30
+        # D10: quantiles(15) + shock_prob(1) + base_load(1) = 17
+        # 总计 47 维
+        d10_dim = 17
+        total_output = forecast * 2 + d10_dim  # 30 + 17 = 47
         X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
-        y = np.zeros((n_samples, forecast * 2), dtype=np.float32)
+        y = np.zeros((n_samples, total_output), dtype=np.float32)
+
+        # D10 分位数索引: 5个分位点 × 3个预测步 = 15维
+        # 分位点: P10, P30, P50, P70, P90
+        # 预测步: step_5, step_10, step_15 (forecast horizon的1/3, 2/3, 3/3)
+        d10_horizon_steps = [forecast // 3, forecast * 2 // 3, forecast - 1]
 
         for out_i, src_i in enumerate(balanced):
             for j in range(seq_len):
@@ -303,10 +313,33 @@ class LSTMTrainer:
                 # 第7维: 昨日同时段 PV（周期性特征，96步=24小时前）
                 X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
 
+            # D2: PV(15) + Load(15)
             for k in range(forecast):
                 target_idx = src_i + seq_len + k
                 y[out_i, k] = pv[target_idx]
                 y[out_i, k + forecast] = load[target_idx]
+
+            # D10: 分位数 + 冲击概率 + 基荷
+            d10_start = forecast * 2  # = 30
+            for qi, hs in enumerate(d10_horizon_steps):
+                target_idx = src_i + seq_len + hs
+                actual_load = load[target_idx]
+                # 5个分位点: P10, P30, P50, P70, P90
+                spread = max(actual_load * 0.15, 5.0)  # 最小 5kW 展宽
+                y[out_i, d10_start + qi * 5 + 0] = actual_load - spread * 1.0   # P10
+                y[out_i, d10_start + qi * 5 + 1] = actual_load - spread * 0.5   # P30
+                y[out_i, d10_start + qi * 5 + 2] = actual_load                 # P50
+                y[out_i, d10_start + qi * 5 + 3] = actual_load + spread * 0.5   # P70
+                y[out_i, d10_start + qi * 5 + 4] = actual_load + spread * 1.0   # P90
+
+            # 冲击负荷概率: 基于 P90-P50 差值
+            p90_last = y[out_i, d10_start + 2 * 5 + 4]  # 最后一个 horizon 的 P90
+            p50_last = y[out_i, d10_start + 2 * 5 + 2]  # 最后一个 horizon 的 P50
+            shock_spread = (p90_last - p50_last) / max(p50_last, 1e-6)
+            y[out_i, d10_start + 15] = float(np.clip(shock_spread / 0.2, 0.0, 1.0))
+
+            # 基荷: 中间 horizon 的 P50
+            y[out_i, d10_start + 16] = y[out_i, d10_start + 1 * 5 + 2]
 
         return X, y
 
