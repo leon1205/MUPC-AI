@@ -147,7 +147,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | F2 | MUPC 全状态环境仿真 | P0 | 78/79 维观测 + 2 维动作 + 5 种场景奖励的 Gymnasium 环境 |
 | F3 | LSTM 时序预测模型训练 | P0 | 光伏/负荷预测，输出 15 分钟预测向量 |
 | F4 | 多模式 RL 训练 | P0 | SB3 PPO/SAC 主路径（NumPy PPO 后备），多模式单模型，78/79 维输入 (v2.17) |
-| F5 | 动作约束校验 | P0 | 4 条约束规则（ACT-01/02/03/04 + ACT-05），环境内 clamp (v2.17 编号统一) |
+| F5 | 动作约束校验 | P0 | 5 条约束规则（ACT-01/02/03/04 + ACT-05），环境内 clamp (v2.17 编号统一) |
 | F6 | 模型导出 | P0 | LSTM + RL 策略网络 → ONNX，含 onnxruntime 验证 |
 | F7 | 训练监控 | P1 | TensorBoard + CSV 日志，21 字段各自可追踪 |
 | F8 | Grid2Op 电压仿真 | P0 | 三相潮流计算（可切换简化 VoltageSimulator） |
@@ -258,7 +258,7 @@ VoltageSimulator 模式（降级）:
 | 维度 | 字段名 | 训练值域 | 单位 | 说明 |
 |------|--------|----------|------|------|
 | 0 | p_ref | [-1, 1] → [-50, 50] kW | kW | 电池有功功率基准点（RL 控制） |
-| 1 | k_droop | [-1, 1] → [0, 30] kW/V | kW/V | 电压-有功下垂系数（RL 控制） |
+| 1 | k_droop | [-1, 1] → [-100, 100] kW/V | kW/V | 电压-有功下垂系数（RL 控制，v2.17 对齐下游 Dual 模式） |
 
 > **v2.15 分层控制架构：** load_shedding/pv_limit 已下沉至 strategy-engine 本地策略（不在 RL 动作空间），confidence 改为 ModelOutput 元数据（不在 RL 动作空间）。RL 仅输出 P-Q 协同控制的核心 2 维动作 `[p_ref, k_droop]`（全 tanh 同质激活）。Q_batt 由实时电压调节器闭环给出，不经过 RL 动作空间。下沉维度默认值：`load_shed=0.0`、`pv_limit=1.0`、`confidence=0.5`。
 
@@ -314,7 +314,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F2-01 | `mupc_env.py` 可独立运行随机动作循环 100 步 | `python mupc_env.py` 无错误 |
-| F2-02 | `observation_space.shape = (63,)` 单模式, `(64,)` 多模式 | 单元测试 |
+| F2-02 | `observation_space.shape = (78,)` 单模式, `(79,)` 多模式 (v2.17) | 单元测试 |
 | F2-03 | `action_space.shape = (2,)` (v2.15: [p_ref, k_droop]) | 单元测试 |
 | F2-04 | SOC 硬约束不可突破 | 单元测试：连续充电 1000 步，验证 SOC ≤ 0.90 |
 | F2-05 | info dict 包含全部奖励分量原始值 + SOC + load_rate | 单元测试 |
@@ -337,9 +337,9 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 
 | 项目 | 规格 |
 |------|------|
-| 输入窗口 | 过去 60 分钟 (4 步 × 15分钟) |
+| 输入窗口 | 过去 120 分钟 (8 步 × 15分钟, v2.14 4→8) |
 | 输出窗口 | 未来 15 分钟 (1 步 × 15分钟)（默认，可配置至 30 分钟） |
-| 输入特征 | [pv_power, load_power, solar_irradiance, temperature, hour_sin, hour_cos] (6 维) |
+| 输入特征 | [pv_power, load_power, solar_irradiance, temperature, hour_sin, hour_cos, yesterday_pv] (7 维, v2.14 新增周期性特征) |
 | 输出 | [pv_forecast_1..15, load_forecast_1..15] (30 维，15+15) |
 | 模型架构 | 2 层 LSTM (hidden=64) + Linear head |
 | 精度要求 | 光伏 MAPE ≤ 10%，负荷 MAPE ≤ 15% |
@@ -443,7 +443,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 
 #### 功能描述
 
-遵循 MUPC AI 引擎 PRD 第 6.5 节的 4 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+遵循 MUPC AI 引擎 PRD 第 6.5 节的 5 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
 
 > **v2.15 变更：** 动作空间精简为 2 维 (`[p_ref, k_droop]`)，约束规则由 5 条精简为 4 条。ACT-04 由 pv_limit 改为 k_droop 范围约束，ACT-05 (load_shedding) 移除（load_shedding 已下沉至 strategy-engine）。Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。
 
