@@ -68,6 +68,18 @@ TOU_SCHEDULE_WINTER = [
 ]
 
 
+def _compute_months_from_hours(hours: np.ndarray, n_steps: int) -> np.ndarray:
+    """从小时数组计算月份（假设 1月1日从 step 0 开始，365天/年）。"""
+    days = np.arange(n_steps) * 15 / 60 / 24  # 累积天数
+    months = (days % 365).astype(np.float32)
+    # 累积天数映射到月份: Jan=0..30, Feb=31..58, Mar=59..89, ...
+    cum_days = np.array([0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365])
+    month_arr = np.ones(n_steps, dtype=np.float32)
+    for m in range(12):
+        month_arr[(months >= cum_days[m]) & (months < cum_days[m + 1])] = float(m + 1)
+    return month_arr
+
+
 def _get_tou(hour: int, month: int) -> tuple[int, float, float]:
     """返回 (tariff_id, current_price, next_period_price)。"""
     current = _tou_for_hour(hour, month)
@@ -1095,7 +1107,7 @@ class ChinaDataLoader:
             "timestamps": np.arange(n_steps, dtype=np.float64),
             "hour_encoded": np.sin(hours * 2 * math.pi / 24).astype(np.float32),
             "hours": hours,
-            "months": np.ones(n_steps, dtype=np.float32) * 7,
+            "months": _compute_months_from_hours(hours, n_steps),
             "n_steps": n_steps,
         }
         result["norm_params"] = SmartDSLoader._compute_norm_params_static(result)
@@ -1183,6 +1195,12 @@ class ChinaDataLoader:
     def _load_pricing_files(self, n_steps: int) -> dict[str, np.ndarray]:
         d = self.data_dir / "pricing"
         csv_files = sorted(d.glob("*.csv"))
+        if not csv_files:
+            # 无定价文件 → 合成 TOU 电价
+            print("  合成 TOU 电价 (无 pricing CSV)")
+            hours = (np.arange(n_steps) * 15 / 60) % 24
+            months = np.ones(n_steps, dtype=np.int32) * 7  # 默认7月(含尖峰电价)
+            return SmartDSLoader()._generate_tou_prices(hours, months)
         current_list, next_list, tariff_list = [], [], []
         for fp in csv_files:
             try:

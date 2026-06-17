@@ -86,6 +86,9 @@ def parse_args():
                         "sb3=强制 SB3; numpy=强制 NumPy PPO (默认 auto)")
     p.add_argument("--lstm-checkpoint", type=str, default=None,
                    help="预训练 LSTM 模型路径")
+    p.add_argument("--data-source", type=str, default="smartds",
+                   choices=["smartds", "china", "unified"],
+                   help="数据源: smartds/china/unified (default: smartds)")
     p.add_argument("--export-onnx", action="store_true",
                    help="训练完成后自动导出 ONNX")
     return p.parse_args()
@@ -128,8 +131,18 @@ def main():
 
     # ── 数据加载 ────────────────────────────────────────
     print("\n── 数据加载 ──")
-    from data_loader import SmartDSLoader
-    loader = SmartDSLoader()
+    if args.data_source == "china":
+        from data_loader import UnifiedDataLoader
+        loader = UnifiedDataLoader(lat=31.23, lon=121.47, auto_generate=True)
+        print("  数据源: 中国合成数据 (上海)")
+    elif args.data_source == "unified":
+        from data_loader import UnifiedDataLoader
+        loader = UnifiedDataLoader(lat=31.23, lon=121.47, auto_generate=True)
+        print("  数据源: 统一自动检测")
+    else:
+        from data_loader import SmartDSLoader
+        loader = SmartDSLoader()
+        print("  数据源: SMART-DS")
     data = loader.load_all()
     train_data, val_data = loader.split(data)
 

@@ -357,8 +357,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._battery_power_prev = 0.0
         self._grid_power = 0.0
         self._load_rate = 0.5
-        self._current_demand = 200.0
-        self._peak_demand = 200.0
+        # 从 episode 起始位置初始化需量 (4步滑动窗口)
+        demand_start = max(0, self._step_idx - 3)
+        demand_slice = self._data["load_power"][demand_start:self._step_idx + 1]
+        initial_demand = max(float(np.mean(demand_slice)),
+                            constants.CONTRACT_DEMAND_KW * 0.3)
+        self._current_demand = initial_demand
+        self._peak_demand = initial_demand
         self._prev_p_batt = 0.0
         self._prev_q_batt = 0.0
         self._prev_k_droop = 0.0
