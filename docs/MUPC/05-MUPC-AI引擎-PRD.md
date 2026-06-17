@@ -728,9 +728,16 @@ if safety_override_active {
 ```
 R_arbitrage = w1 * R_price_spread - w2 * P_battery_degradation
 
-R_price_spread = sum(P_batt_set * delta_t * (price_sell - price_buy)) * conversion_factor
-P_battery_degradation = beta * sum(|P_batt_set| * delta_t) / E_battery_total * 100
+R_price_spread = sum(p_ref * delta_t * (price_sell - price_buy)) * conversion_factor
+P_battery_degradation = beta * (|p_ref| / E_battery_total)²    # C-rate² × β
 ```
+
+> **v2.15 修正：** `P_battery_degradation` 公式由 v2.13 累积能量模型改为 C-rate² 应力模型。
+> - **原公式（v2.13）：** `β · Σ(|P_batt_set| · Δt) / E_battery_total · 100`（累积绝对能量，梯度信号弱）
+> - **新公式（v2.15）：** `β · (|p_ref| / E_battery_total)²`（瞬时 C-rate²，符合电池应力疲劳物理模型，与上游训练管线对齐）
+> - 与 §5.3 SCENE-01 子项定义、`reward_calculator.rs` 实现、上游训练管线三处保持一致
+> - REWARD-A3 验收（delta_SOC=0 → P_batt_deg=0）仍满足：`|p_ref|=0` 时 C-rate²=0
+> - SCENE-01 还引入了自适应系数 α(s)（SOC 极低时=3.0 强化保护，电压支撑时=0.2 放宽），SCENE-B1 可选启用（β 即此处 α）
 
 ### 7.4 SCENE-B2：需量控制模式
 
