@@ -225,7 +225,8 @@ def ut_05_soc_sync():
         # 固定充放电功率，观察 SOC 线性变化
         # 动作 [0.2, 0] = p_batt=100kW 充电
         for i in range(100):
-            action = np.array([0.2, 0.0, 0.5])  # 固定充电 10kW (校准后)
+            # 5D action: [p_ref, k_droop, load_shed, pv_limit, confidence]
+            action = np.array([0.2, 0.0, 0.0, 0.5, 0.5])  # 固定充电 10kW
             _, _, _, _, info = env.step(action)
             soc_values.append(info["soc"])
 
@@ -268,7 +269,7 @@ def ut_06_reward_consistency():
         for i in range(20):
             # 固定动作保证可重复性
             np.random.seed(i)  # 用于 VoltageSimulator 的随机噪声
-            action = np.array([0.1, 0.1, 0.5])
+            action = np.array([0.1, 0.1, 0.1, 0.5, 0.5])  # 5D: [p_ref, k_droop, load_shed, pv_limit, confidence]
             _, reward, _, _, _ = env.step(action)
             rewards.append(reward)
 
@@ -483,14 +484,15 @@ def test_grid2op_fallback():
         # 显式 use_grid2op=False 应该使用 VoltageSimulator
         env_no_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env_no_grid2op.reset()
-        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0, 1.0]))
+        # 5D action: [p_ref, k_droop, load_shed, pv_limit, confidence]
+        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0, 0.0, 1.0, 0.5]))
         _record("降级模式 [VoltageSimulator 正常]", True,
                 f"va={info['va']:.3f}, vb={info['vb']:.3f}, vc={info['vc']:.3f}")
 
         # 显式 use_grid2op=True 时，Grid2Op 不可用应自动降级
         env_with_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=True)
         env_with_grid2op.reset()
-        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0, 1.0]))
+        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0, 0.0, 1.0, 0.5]))
         _record("降级模式 [Grid2Op不可用自动降级]", True,
                 f"va={info2['va']:.3f}, vb={info2['vb']:.3f}, vc={info2['vc']:.3f}")
 

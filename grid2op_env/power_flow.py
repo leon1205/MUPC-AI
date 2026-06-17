@@ -15,6 +15,7 @@ import numpy as np
 from typing import TYPE_CHECKING, Any
 
 from .backend import _select_backend, is_grid2op_available
+from mupc_env.constants import P_BATT_MAX_KW
 
 if TYPE_CHECKING:
     import pandapower as pp
@@ -238,18 +239,29 @@ class Grid2OpPowerFlow:
         self, storage_p_mw: float, storage_q_mvar: float,
         effective_load_mw: float | None = None,
         effective_pv_mw: float | None = None,
+        k_droop: float = 0.0,
+        v_actual: float = 1.0,
     ) -> bool:
-        """执行单相等效潮流计算。
+        """执行单相等效潮流计算（含下垂公式 P_output = P_ref + k_droop × ΔV）。
 
         先通过 chronics 注入原始数据（含冲击负荷、居民噪声等随机性），
         再用 MupcEnv 计算的有效值覆盖负荷和光伏，确保 RL 动作
         （load_shedding, pv_limit）真实作用于潮流。
 
+        下垂控制:
+            P_storage_final = P_ref + k_droop × (V_actual - 1.0)
+            ΔV = V_actual - 1.0  (末端电压偏差, p.u.)
+            k_droop 单位 kW/V, 即每 1V 电压偏差对应的功率调整
+            V_actual = 上一步末端电压 (p.u., 如 0.97 表示 3% 压降)
+            V_target = 1.0 p.u.
+
         Args:
-            storage_p_mw: 储能有功 MW（+充电/-放电）
+            storage_p_mw: 储能有功 MW（p_ref, +充电/-放电）
             storage_q_mvar: 储能无功 MVar
             effective_load_mw: 切负荷后的有效总负荷 MW (None=不覆盖)
             effective_pv_mw: 弃光后的有效光伏 MW (None=不覆盖)
+            k_droop: 下垂系数 kW/V (default 0 = 纯 p_ref 控制)
+            v_actual: 上一时刻末端电压 p.u. (default 1.0 = 无偏差)
 
         Returns:
             bool: 潮流是否成功收敛
@@ -274,6 +286,27 @@ class Grid2OpPowerFlow:
             for i in range(len(self._net.sgen)):
                 self._net.sgen.at[i, "p_mw"] = effective_pv_mw
                 self._net.sgen.at[i, "q_mvar"] = 0.0
+
+        # ── P0 修复: 下垂公式 ──
+        # P_output = P_ref + k_droop × ΔV
+        # ΔV = V_actual - V_target, V_target = 1.0 p.u.
+        # k_droop 在 0.4kV 侧：单位 kW/V, 含义每 1V 偏差补偿
+        # 实际物理上, k_droop 通常较小 (e.g. 1-10 kW/V)
+        # P_storage_final (MW) 限制在 ±P_BATT_MAX (防止越界)
+        if k_droop != 0.0:
+            dv = v_actual - 1.0  # 电压偏差 p.u.
+            # ΔV 实际电压差: dv * V_base (V_base = 0.4 kV, 即 400V)
+            # k_droop (kW/V) × dv × 400V = droop 调整 (kW)
+            # 转换为 MW 后加入 storage_p_mw
+            droop_adjustment_kw = k_droop * dv * 0.4 * 1000.0  # kW
+            droop_adjustment_mw = droop_adjustment_kw / 1000.0  # MW
+            storage_p_mw = storage_p_mw + droop_adjustment_mw
+            # 限制在电池物理约束内
+            storage_p_mw = float(np.clip(
+                storage_p_mw,
+                -constants.P_BATT_MAX_KW / 1000.0,
+                constants.P_BATT_MAX_KW / 1000.0
+            ))
 
         # 设置储能功率（直接修改 pandapower net）
         if self._storage_idx is not None and "storage" in self._net:
@@ -317,24 +350,29 @@ class Grid2OpPowerFlow:
         self, storage_p_mw: float, storage_q_mvar: float,
         effective_load_mw: float | None = None,
         effective_pv_mw: float | None = None,
+        k_droop: float = 0.0,
+        v_actual: float = 1.0,
     ) -> tuple[float, float, float, bool]:
         """执行一步潮流计算。
 
         Args:
-            storage_p_mw: 储能有功 MW（+充电/-放电）
+            storage_p_mw: 储能有功 MW（+充电/-放电，p_ref 部分）
             storage_q_mvar: 储能无功 MVar
             effective_load_mw: 切负荷后的有效负荷 MW (None=使用原始数据)
             effective_pv_mw: 弃光后的有效光伏 MW (None=使用原始数据)
+            k_droop: 下垂系数 kW/V (default 0 = 无下垂)
+            v_actual: 上一时刻末端电压 p.u. (用于下垂公式 ΔV)
 
         Returns:
             tuple: (va, vb, vc, has_illegal)
                 va/vb/vc: 三相电压标幺值 (p.u.)
                 has_illegal: 是否有非法状态（电压越限/潮流不收敛）
         """
-        # 执行单相等效潮流
+        # 执行单相等效潮流（含下垂公式）
         success = self._run_powerflow(
             storage_p_mw, storage_q_mvar,
-            effective_load_mw, effective_pv_mw
+            effective_load_mw, effective_pv_mw,
+            k_droop=k_droop, v_actual=v_actual,
         )
 
         if not success or self._has_nan_voltage():

@@ -417,10 +417,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         if self._use_grid2op_active and self._grid2op_pf is not None:
             try:
                 # 传递有效负荷和光伏到 pandapower (反映 load_shedding + pv_limit)
+                # 同时传递 k_droop 和 v_actual 触发下垂公式 P_output = P_ref + k_droop × ΔV
+                # v_actual 使用上一步末端电压 (v_avg of self._va/_vb/_vc)
+                v_actual_prev = (self._va + self._vb + self._vc) / 3.0
                 va, vb, vc, has_illegal = self._grid2op_pf.step(
                     p_batt / 1000.0, float(q_batt) / 1000.0,
                     effective_load_mw=p_load_eff / 1000.0,
-                    effective_pv_mw=p_pv_eff / 1000.0)
+                    effective_pv_mw=p_pv_eff / 1000.0,
+                    k_droop=k_droop,
+                    v_actual=v_actual_prev,
+                )
             except Exception as e:
                 # 潮流不收敛等异常, 降级到 VoltageSimulator
                 va, vb, vc = self._voltage_sim.step(
