@@ -333,6 +333,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "prev_p_batt_raw": self._prev_p_batt,
             "dispatch_p_set": float(self._data["dispatch_p_set"][self._step_idx]),
             "current_price": float(self._data["current_electricity_price"][self._step_idx]),
+            # v2.17: D10 冲击负荷预备度奖励所需字段
+            "base_load": float(self._data["base_load"][self._step_idx])
+                if "base_load" in self._data else float(self._data["load_power"][self._step_idx]),
+            "load_forecast_quantiles": self._data["load_forecast_quantiles"][self._step_idx].astype(np.float32)
+                if "load_forecast_quantiles" in self._data
+                else (float(self._data["load_power"][self._step_idx]) * np.linspace(0.85, 1.27, 15)).astype(np.float32),
         }
         return r
 

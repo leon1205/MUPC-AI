@@ -28,6 +28,11 @@ from .constants import (
     CONTRACT_DEMAND_KW,
     GRID_EMISSION_FACTOR,
     DT_HOURS,
+    SHOCK_THRESHOLD_KW,
+    SOC_RESERVE_TARGET,
+    P_REF_RESERVE_TARGET,
+    SHOCK_READINESS_W_SOC,
+    SHOCK_READINESS_W_P,
 )
 
 
@@ -69,10 +74,10 @@ def compute_reward(mode: str, weights: dict, r: dict,
 
 # 模块内默认权重 (与 constants.py 保持一致，用作调度器 fallback)
 DEFAULT_WEIGHTS_MAP = {
-    # v2.15 MODE-01: w1~w8 (对齐下游 v2.15 PRD 7.2)
+    # v2.17 MODE-01: w1~w9 (对齐下游 v2.13 冲击负荷预备度)
     # w1(光伏消纳), w2(电池损耗), w3(过载), w4(P-Q协同), w5(变化率),
-    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖)
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0],
+    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖), w9(冲击预备度)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 1.0],
     "MODE-02": [1.0, 1.0, 2.0],
     "MODE-03": [1.0, 0.5],
     "MODE-04": [1.0, 2.0, 1.0],
@@ -205,12 +210,56 @@ def _compute_safety_override(active: bool, consecutive: int,
         return (-5.0 * ratio - 10.0 * consecutive_clamped) / 15.0
 
 
+def _compute_shock_readiness(soc: float, p_ref: float,
+                              base_load: float,
+                              quantiles: np.ndarray) -> float:
+    """冲击负荷预备度奖励 (v2.17 对齐下游 v2.13 shock_readiness_reward).
+
+    下游重构原因: 1Hz 决策无法感知 ms 级冲击, 应奖励"预备度"而非"响应速度".
+
+    公式:
+      spread = P90 - P50  (从 quantiles[13] 和 base_load 提取)
+      若 spread <= SHOCK_THRESHOLD_KW: 返回 0
+      r_soc = SHOCK_READINESS_W_SOC * (SOC_RESERVE_TARGET - soc)
+      r_p   = SHOCK_READINESS_W_P * (P_REF_RESERVE_TARGET - |p_ref|)
+      R_readiness = r_soc + r_p
+
+    物理含义:
+      - SOC 越高 (接近 70%), 冲击来时有更多放电空间 → 正奖励
+      - |p_ref| 越低 (接近 10kW), 留有更多上调裕度 → 正奖励
+      - 分位数展宽 > 10kW 时才触发 (有冲击风险)
+
+    Args:
+        soc: 当前 SOC
+        p_ref: 当前有功动作指令 (kW)
+        base_load: 基荷 (50% 分位数, D10 第 77 维)
+        quantiles: 分位数预测数组 (15维, D10 第 61-75 维)
+
+    Returns:
+        冲击负荷预备度奖励值 (正奖励或 0)
+    """
+    p50 = base_load
+    p90 = float(quantiles[13]) if len(quantiles) > 13 else p50
+    spread = p90 - p50
+
+    if spread <= SHOCK_THRESHOLD_KW:
+        return 0.0
+
+    soc_gap = SOC_RESERVE_TARGET - soc
+    r_soc = SHOCK_READINESS_W_SOC * soc_gap
+
+    p_ref_gap = P_REF_RESERVE_TARGET - abs(p_ref)
+    r_p = SHOCK_READINESS_W_P * p_ref_gap
+
+    return r_soc + r_p
+
+
 # ═══════════════════════════════════════════════════════════════
 # MODE-01: 农网灌溉 (主调度函数)
 # ═══════════════════════════════════════════════════════════════
 
 def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
-    """SCENE-01 奖励函数 (v2.15 对齐下游 AI 引擎 PRD v2.15 Section 7.2).
+    """SCENE-01 奖励函数 (v2.17 对齐下游 AI 引擎 v2.13).
 
     R = w1·R_pv_consumption
       - α(s)·w2·P_battery_degradation
@@ -220,10 +269,12 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
       - w6·R_voltage_slope
       - w7·R_smooth
       - w8·R_safety_override
+      + w9·R_shock_readiness
 
-    v2.15 精简: 移除 v2.13/v2.14 时期的 w9~w13 (r_overload_warning, r_soc_warning,
-    r_soc_balance, r_readiness, r_state_improve), 与下游 AI 引擎 v2.15 对齐.
-    SafetyOverride 惩罚 reason_code 已删除 (v2.14 D9 字段变更), 本地采用统一公式.
+    v2.17 新增: w9 冲击负荷预备度奖励 (对齐下游 v2.13 shock_readiness_reward).
+    下游重构原因: 1Hz 决策无法感知 ms 级冲击, 应奖励"预备度"而非"响应速度".
+    v2.15 精简: 移除 v2.13/v2.14 时期的 r_overload_warning, r_soc_warning,
+    r_soc_balance, r_state_improve (下游未实现).
 
     纯函数: 所有状态从 r dict 读取, 不访问 self。
     Welford 原始奖励通过 info["welford_raw"] 回传。
@@ -238,7 +289,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     q_margin = r.get("q_realtime_margin", 1.0)
     safety_override_active = r.get("safety_override_active", False)
 
-    # 8 项子奖励计算 (v2.15)
+    # 9 项子奖励计算 (v2.17: 8 项基础 + 1 项 D10 预备度)
     r_pv = _compute_pv_consumption(r["p_pv_raw"], r["p_load_raw"], p_ref, v_avg)
     alpha = _compute_alpha(soc_new, q_margin, r.get("voltage_violation_count", 0))
     p_overload = _compute_overload(r.get("load_rate_unclamped", r["load_rate"]))
@@ -254,12 +305,18 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         safety_override_active,
         r.get("override_consecutive", 0),
         r.get("override_ratio", 0.0))
+    # v2.17: D10 冲击负荷预备度奖励
+    r_readiness = _compute_shock_readiness(
+        soc_new, p_ref,
+        r.get("base_load", 0.0),
+        r.get("load_forecast_quantiles", np.zeros(15, dtype=np.float32)))
 
-    # 权重提取 (v2.15: w1~w8)
+    # 权重提取 (v2.17: w1~w9)
     w4 = w[3] if len(w) > 3 else 0.0
     w5 = w[4] if len(w) > 4 else 0.0
     w7 = w[6] if len(w) > 6 else 0.0
     w8 = w[7] if len(w) > 7 else 0.0
+    w9 = w[8] if len(w) > 8 else 0.0
 
     # Welford 原始奖励 (前 4 个分量: r_pv, p_batt_deg, p_overload, r_pq)
     raw_reward = w[0] * r_pv - alpha * w[1] * p_batt_deg - w[2] * p_overload + w4 * r_pq
@@ -277,7 +334,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
     r_safety_norm = float(np.clip(r_safety / 100.0, -1.0, 0.0)) if r_safety < 0 else 0.0
 
-    # 加权求和 (v2.15: 8 项)
+    # 加权求和 (v2.17: 9 项)
     total = (w[0] * r_pv_norm
              + w[1] * p_batt_deg_norm
              + w[2] * p_overload_norm
@@ -285,7 +342,8 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
              + w5 * p_ramp_norm
              + w[5] * p_vs_norm
              + w7 * r_smooth_norm
-             + w8 * r_safety_norm)
+             + w8 * r_safety_norm
+             + w9 * r_readiness)
 
     info = {
         "r_pv_consumption": float(r_pv),
@@ -296,6 +354,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         "r_voltage_slope": float(r_voltage_slope),
         "r_smooth": float(r_smooth),
         "r_safety_override": float(r_safety),
+        "r_shock_readiness": float(r_readiness),
         "v_avg": float(v_avg),
         "alpha": float(alpha),
         "q_realtime_margin": float(q_margin),
