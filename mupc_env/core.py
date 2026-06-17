@@ -508,7 +508,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             prev_v_dev=prev_v_dev_for_reward,
         )
         reward, reward_info = rewards.compute_reward(
-            self._current_mode, self._weights, r)
+            self._current_mode, self._weights, r, cfg=self._cfg)
 
         # Welford 更新 (从 rewards 返回值中读取)
         welford_raw = reward_info.pop("welford_raw", None)

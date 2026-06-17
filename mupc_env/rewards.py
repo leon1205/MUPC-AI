@@ -35,13 +35,16 @@ from .constants import (
 # 调度器
 # ═══════════════════════════════════════════════════════════════
 
-def compute_reward(mode: str, weights: dict, r: dict) -> tuple[float, dict]:
+def compute_reward(mode: str, weights: dict, r: dict,
+                   cfg: object | None = None) -> tuple[float, dict]:
     """根据当前场景选择奖励函数并计算。
 
     Args:
         mode: 场景模式字符串 (如 "MODE-01")
         weights: 完整权重字典 {mode: [w1, w2, ...]}
         r: 奖励计算所需状态 dict
+        cfg: MupcConfig 实例 (v2.15+, 用于 SCENE-B3 虚拟电厂价格等可配置参数).
+             None 时使用默认值 (向后兼容).
 
     Returns:
         (total_reward, info_dict) 其中 info 包含调试信息和
@@ -57,7 +60,7 @@ def compute_reward(mode: str, weights: dict, r: dict) -> tuple[float, dict]:
     elif mode == "MODE-03":
         return _reward_demand(r, w)
     elif mode == "MODE-04":
-        return _reward_vpp(r, w)
+        return _reward_vpp(r, w, cfg)
     elif mode == "MODE-05":
         return _reward_green(r, w)
     else:
@@ -66,7 +69,10 @@ def compute_reward(mode: str, weights: dict, r: dict) -> tuple[float, dict]:
 
 # 模块内默认权重 (与 constants.py 保持一致，用作调度器 fallback)
 DEFAULT_WEIGHTS_MAP = {
-    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+    # v2.15 MODE-01: w1~w8 (对齐下游 v2.15 PRD 7.2)
+    # w1(光伏消纳), w2(电池损耗), w3(过载), w4(P-Q协同), w5(变化率),
+    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖)
+    "MODE-01": [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0],
     "MODE-02": [1.0, 1.0, 2.0],
     "MODE-03": [1.0, 0.5],
     "MODE-04": [1.0, 2.0, 1.0],
@@ -179,73 +185,24 @@ def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
 
 def _compute_safety_override(active: bool, consecutive: int,
                              ratio: float) -> float:
-    """安全覆盖惩罚 (v2.10 新增, v2.14 分层精细化)。"""
+    """安全覆盖惩罚 (v2.14 D9 4 字段对齐下游 v2.15).
+
+    对齐下游 MUPC AI 引擎 PRD v2.15 Section 7.2:
+      - consecutive < 10: 样本不足, 统一常数惩罚 -50/15 (reason_code 已删)
+      - consecutive >= 10: 样本充足, 比例 + 连续次数惩罚, 归一化至 [-1, 0]
+        (-5·ratio - 10·(consecutive/10).clamp(0,1)) / 15
+
+    注: 下游 v2.15 PRD 7.2 公式仍按 reason 差异化 (-50/-30/-100/-20),
+    但 FusedSystemState v2.14 已删除 safety_override_reason_code 字段,
+    故本地采用统一常数 -50/15 替代. 见 docs/superpowers/notes/下游不一致待处理清单.md.
+    """
     if not active:
         return 0.0
     if consecutive < 10:
-        return -1.0 / 15.0
+        return -50.0 / 15.0
     else:
-        consecutive_norm = min(consecutive / 50.0, 1.0)
-        return -ratio * consecutive_norm
-
-
-def _compute_overload_warning(lr_unc: float) -> float:
-    """过载预警 (R-02 v2.12)。"""
-    if lr_unc > 0.85:
-        return -(lr_unc - 0.85) / 0.15
-    return 0.0
-
-
-def _compute_soc_warning(soc_new: float) -> float:
-    """SOC 预警 (R-02 v2.12)。"""
-    soc_margin_low = soc_new - SOC_CRITICAL
-    soc_margin_high = 0.90 - soc_new
-    soc_margin = min(soc_margin_low, soc_margin_high)
-    if soc_margin < 0.10:
-        return -(0.10 - soc_margin) / 0.10
-    return 0.0
-
-
-def _compute_soc_balance(soc_new: float) -> float:
-    """SOC 均衡奖励 (R-03 v2.12): 鼓励 SOC 保持在 50% 附近。"""
-    return -abs(soc_new - 0.5)
-
-
-def _compute_shock_readiness(lr_unc: float, load_shed: float,
-                             soc_new: float, p_ref: float) -> float:
-    """冲击负荷响应奖励 (R-06 v2.12 + v2.13 重构)。"""
-    load_rate_delta = abs(lr_unc - 0.5) * 2
-    threshold_shock = 10.0
-    w_shock = 20.0
-    lambda_shock = 5.0
-    max_response_time = 15.0
-
-    r_shock = 0.0
-    if load_rate_delta > threshold_shock / 100.0:
-        r_shock = (w_shock * load_shed / max(LOAD_SHED_MAX_KW, 1e-6)
-                   - lambda_shock * 1.0 / max_response_time)
-
-    # v2.13: 预备度奖励
-    soc_reserve_target = 0.3
-    p_ref_reserve_target = 10.0  # kW
-    r_readiness = ((soc_reserve_target - soc_new)
-                   + 0.5 * max(0.0, p_ref_reserve_target - abs(p_ref)))
-    return r_shock + r_readiness
-
-
-def _compute_state_improve(dev: float, prev_v_dev: float, p_ref: float) -> float:
-    """状态改善率奖励 (R-14.4 v2.13)。
-
-    仅在电压偏差改善且动作方向与改善方向一致时奖励:
-    p_ref > 0 (放电→抬电压) 应配合电压从过高回落,
-    p_ref < 0 (充电→降电压) 应配合电压从过低回升。
-    """
-    if dev <= VOLTAGE_DEADBAND or prev_v_dev <= dev:
-        return 0.0
-    improvement = prev_v_dev - dev
-    if p_ref * improvement <= 0:
-        return 0.0
-    return improvement * (1.0 if p_ref >= 0 else -1.0)
+        consecutive_clamped = min(consecutive / 10.0, 1.0)
+        return (-5.0 * ratio - 10.0 * consecutive_clamped) / 15.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -253,14 +210,22 @@ def _compute_state_improve(dev: float, prev_v_dev: float, p_ref: float) -> float
 # ═══════════════════════════════════════════════════════════════
 
 def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
-    """SCENE-01 奖励函数 (v2.13 精细化奖励函数设计).
+    """SCENE-01 奖励函数 (v2.15 对齐下游 AI 引擎 PRD v2.15 Section 7.2).
 
-    R = w1*R_pv - α(s)*w2*P_batt_deg - w3*P_overload + w4*R_PQ
-        - w5*R_ramp - w6*R_voltage_slope - w7*R_smooth - w8*R_safety_override
-        + w9*R_overload_warning + w10*R_soc_warning + w11*R_soc_balance
-        + w12*R_shock_response + w13*R_state_improve
+    R = w1·R_pv_consumption
+      - α(s)·w2·P_battery_degradation
+      - w3·P_transformer_overload
+      + w4·R_PQ_coordination
+      - w5·R_ramp
+      - w6·R_voltage_slope
+      - w7·R_smooth
+      - w8·R_safety_override
 
-    纯函数: 所有状态从 r dict 读取，不访问 self。
+    v2.15 精简: 移除 v2.13/v2.14 时期的 w9~w13 (r_overload_warning, r_soc_warning,
+    r_soc_balance, r_readiness, r_state_improve), 与下游 AI 引擎 v2.15 对齐.
+    SafetyOverride 惩罚 reason_code 已删除 (v2.14 D9 字段变更), 本地采用统一公式.
+
+    纯函数: 所有状态从 r dict 读取, 不访问 self。
     Welford 原始奖励通过 info["welford_raw"] 回传。
     """
     # 提取状态
@@ -273,15 +238,13 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     q_margin = r.get("q_realtime_margin", 1.0)
     safety_override_active = r.get("safety_override_active", False)
 
-    # 子奖励计算
+    # 8 项子奖励计算 (v2.15)
     r_pv = _compute_pv_consumption(r["p_pv_raw"], r["p_load_raw"], p_ref, v_avg)
     alpha = _compute_alpha(soc_new, q_margin, r.get("voltage_violation_count", 0))
     p_overload = _compute_overload(r.get("load_rate_unclamped", r["load_rate"]))
     p_batt_deg = _compute_battery_degradation(p_ref)
     r_pq = _compute_pq_coordination(dev, q_margin, p_ref, v_low, v_high,
                                     safety_override_active)
-
-    load_rate_unc = r.get("load_rate_unclamped", r["load_rate"])
     p_ramp = _compute_ramp_penalty(p_ref, r.get("prev_p_batt", 0.0))
     p_voltage, r_voltage_slope = _compute_voltage_slope(
         v_avg, r.get("prev_v_avg", 1.0), w[5] if len(w) > 5 else 0.5)
@@ -291,23 +254,12 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         safety_override_active,
         r.get("override_consecutive", 0),
         r.get("override_ratio", 0.0))
-    r_ov_warn = _compute_overload_warning(load_rate_unc)
-    r_soc_warn = _compute_soc_warning(soc_new)
-    r_soc_bal = _compute_soc_balance(soc_new)
-    r_readiness = _compute_shock_readiness(load_rate_unc, r.get("load_shed", 0.0),
-                                           soc_new, p_ref)
-    r_improve = _compute_state_improve(dev, r.get("prev_v_dev", 0.0), p_ref)
 
-    # 权重提取
+    # 权重提取 (v2.15: w1~w8)
     w4 = w[3] if len(w) > 3 else 0.0
     w5 = w[4] if len(w) > 4 else 0.0
     w7 = w[6] if len(w) > 6 else 0.0
-    w8_val = w[7] if len(w) > 7 else 0.0
-    w9_val = w[8] if len(w) > 8 else 0.0
-    w10_val = w[9] if len(w) > 9 else 0.0
-    w11 = w[10] if len(w) > 10 else 0.0
-    w12_val = w[11] if len(w) > 11 else 0.0
-    w13_val = w[12] if len(w) > 12 else 0.0
+    w8 = w[7] if len(w) > 7 else 0.0
 
     # Welford 原始奖励 (前 4 个分量: r_pv, p_batt_deg, p_overload, r_pq)
     raw_reward = w[0] * r_pv - alpha * w[1] * p_batt_deg - w[2] * p_overload + w4 * r_pq
@@ -324,13 +276,8 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
 
     r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
     r_safety_norm = float(np.clip(r_safety / 100.0, -1.0, 0.0)) if r_safety < 0 else 0.0
-    r_ov_warn_norm = float(np.clip(r_ov_warn, -1.0, 0.0)) if r_ov_warn < 0 else 0.0
-    r_soc_warn_norm = float(np.clip(r_soc_warn, -1.0, 0.0)) if r_soc_warn < 0 else 0.0
-    r_soc_bal_norm = float(np.clip(r_soc_bal / 0.5, -1.0, 1.0)) if r_soc_bal != 0 else 0.0
-    r_readiness_norm = float(np.clip(r_readiness / 0.5, -1.0, 1.0)) if r_readiness != 0 else 0.0
-    r_improve_norm = float(np.clip(r_improve / 0.1, -1.0, 1.0)) if r_improve != 0 else 0.0
 
-    # 加权求和
+    # 加权求和 (v2.15: 8 项)
     total = (w[0] * r_pv_norm
              + w[1] * p_batt_deg_norm
              + w[2] * p_overload_norm
@@ -338,12 +285,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
              + w5 * p_ramp_norm
              + w[5] * p_vs_norm
              + w7 * r_smooth_norm
-             + w8_val * r_safety_norm
-             + w9_val * r_ov_warn_norm
-             + w10_val * r_soc_warn_norm
-             + w11 * r_soc_bal_norm
-             + w12_val * r_readiness_norm
-             + w13_val * r_improve_norm)
+             + w8 * r_safety_norm)
 
     info = {
         "r_pv_consumption": float(r_pv),
@@ -354,11 +296,6 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         "r_voltage_slope": float(r_voltage_slope),
         "r_smooth": float(r_smooth),
         "r_safety_override": float(r_safety),
-        "r_overload_warning": float(r_ov_warn),
-        "r_soc_warning": float(r_soc_warn),
-        "r_soc_balance": float(r_soc_bal),
-        "r_readiness": float(r_readiness),
-        "r_state_improve": float(r_improve),
         "v_avg": float(v_avg),
         "alpha": float(alpha),
         "q_realtime_margin": float(q_margin),
@@ -422,13 +359,30 @@ def _reward_demand(r: dict, w: list[float]) -> tuple[float, dict]:
 # MODE-04: 虚拟电厂
 # ═══════════════════════════════════════════════════════════════
 
-def _reward_vpp(r: dict, w: list[float]) -> tuple[float, dict]:
-    """R = w1*R_ancillary + w2*R_accuracy - w3*P_deadline"""
+def _reward_vpp(r: dict, w: list[float],
+                cfg: object | None = None) -> tuple[float, dict]:
+    """R = w1*R_ancillary + w2*R_accuracy - w3*P_deadline
+
+    辅助服务收益 (v2.15 配置化):
+      R_ancillary = P_capacity · capacity_price + P_mileage · mileage_price
+    价格从 cfg.vpp_pricing 读取, 未提供 cfg 时使用默认值 (0.1/0.05).
+    """
     dp = r.get("dispatch_p_set", 0.0)
     prev_p_batt = r.get("prev_p_batt", 0.0)
 
+    # v2.15: 容量/里程价格从 cfg 读取
+    capacity_price = 0.1
+    mileage_price = 0.05
+    if cfg is not None:
+        try:
+            capacity_price = cfg.vpp_pricing.capacity_price
+            mileage_price = cfg.vpp_pricing.mileage_price
+        except AttributeError:
+            pass
+
     # 辅助服务收益 (容量 + 里程)
-    r_ancillary = (abs(dp) * 0.1 + abs(r["p_batt"] - prev_p_batt) * 0.05) / 50.0
+    r_ancillary = (abs(dp) * capacity_price
+                   + abs(r["p_batt"] - prev_p_batt) * mileage_price) / 50.0
     r_ancillary = float(np.clip(r_ancillary, 0.0, 1.0))
 
     # 响应精度

@@ -387,7 +387,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 
 | 场景 | 命令行 | 优化目标 | 公式 |
 |---------|--------|----------|------|
-| SCENE-01: 台区季节性负荷模式 (MODE-01) | `MODE-01` | 最大化光伏消纳 + 防止过载 + 电压质量 + 功率变化率 | `R = w1·R_pv_consumption - w2·P_battery_degradation - w3·P_transformer_overload - w4·P_voltage_deviation - w5·R_ramp` |
+| SCENE-01: 台区季节性负荷模式 (MODE-01) | `MODE-01` | 最大化光伏消纳 + 防止过载 + 电压质量 + P-Q 协同 | `R = w1·R_pv - α(s)·w2·P_batt_deg - w3·P_overload + w4·R_PQ - w5·R_ramp - w6·R_voltage_slope - w7·R_smooth - w8·R_safety_override` |
 | SCENE-B1: 工商业模式-自主套利 (MODE-02) | `MODE-02` | 最大化峰谷价差 + 最小化电池损耗 | `R = w1·R_price_spread - w2·P_battery_degradation` |
 | SCENE-B2: 工商业模式-需量控制 (MODE-03) | `MODE-03` | 减免需量罚金 | `R = w1·R_demand_penalty_avoidance - w2·P_comfort_loss` |
 | SCENE-B3: 工商业模式-虚拟电厂 (MODE-04) | `MODE-04` | 辅助服务收益 + 响应精度 | `R = w1·R_ancillary_service + w2·R_response_accuracy - w3·P_deadline_deviation` |

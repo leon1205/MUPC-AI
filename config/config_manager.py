@@ -85,13 +85,26 @@ class CommConfig:
 
 @dataclass
 class DualControlConfig:
-    """双参数下垂控制配置 (对齐下游 v2.13, 5 维动作空间)"""
+    """双参数下垂控制配置 (v2.15: 2 维动作空间 [p_ref, k_droop])"""
     enabled: bool = True
     k_droop_min: float = 0.0
     k_droop_max: float = 30.0
     p_ref_ramp_limit_kw: float = 50.0
     k_droop_ramp_limit: float = 10.0
     pv_limit_min: float = 0.0
+
+
+@dataclass
+class VppPricingConfig:
+    """虚拟电厂价格配置 (SCENE-B3 辅助服务收益).
+
+    对齐下游 AI 引擎 PRD v2.15 Section 7.5 公式:
+      R_ancillary_service = P_regulation_capacity * capacity_price
+                          + P_regulation_mileage * mileage_price
+    本地训练侧使用此处占位值, 部署侧如需调整价格应同时更新本配置.
+    """
+    capacity_price: float = 0.1     # 容量价格 (元/kW)
+    mileage_price: float = 0.05     # 里程价格 (元/kW)
 
 
 @dataclass
@@ -144,7 +157,10 @@ class ObsNormalizationConfig:
 
 @dataclass
 class RewardWeightsConfig:
-    MODE_01: list = field(default_factory=lambda: [1.0, 0.5, 2.0, 1.0, 0.5])
+    # v2.15 MODE-01: 8 项权重 (对齐下游 v2.15 PRD 7.2)
+    # w1(光伏消纳), w2(电池), w3(过载), w4(P-Q协同), w5(变化率),
+    # w6(电压斜率), w7(下垂平滑), w8(安全覆盖)
+    MODE_01: list = field(default_factory=lambda: [1.0, 0.5, 2.0, 1.0, 0.5, 0.5, 0.5, 1.0])
     MODE_02: list = field(default_factory=lambda: [1.0, 1.0, 2.0])
     MODE_03: list = field(default_factory=lambda: [1.0, 0.5])
     MODE_04: list = field(default_factory=lambda: [1.0, 2.0, 1.0])
@@ -172,6 +188,7 @@ class MupcConfig:
     reward_weights: RewardWeightsConfig = field(default_factory=RewardWeightsConfig)
     comm: CommConfig = field(default_factory=CommConfig)
     dual_control: DualControlConfig = field(default_factory=DualControlConfig)
+    vpp_pricing: VppPricingConfig = field(default_factory=VppPricingConfig)
 
     # 配置文件路径（用于校验）
     _source_file: Optional[str] = field(default=None, repr=False)
@@ -199,6 +216,7 @@ class MupcConfig:
             reward_weights=_section(RewardWeightsConfig, data.get("reward_weights", {})),
             comm=_section(CommConfig, data.get("comm", {})),
             dual_control=_section(DualControlConfig, data.get("dual_control", {})),
+            vpp_pricing=_section(VppPricingConfig, data.get("vpp_pricing", {})),
             _source_file=str(path),
         )
 
