@@ -68,9 +68,9 @@ data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/�
         ↓
 lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
         ↓
-mupc_env.py          → Gymnasium 环境：58维观测 + 3维动作 + 5场景奖励
+mupc_env.py          → Gymnasium 环境：63维观测 + 2维动作 + 5场景奖励
         ↓
-train.py             → PPO/SAC 训练（或 NumPy PPO 后备）
+train.py             → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
         ↓
 export_onnx.py       → ONNX 导出
         ↓
@@ -127,15 +127,15 @@ train.py
 ├── data_loader.py          (SmartDSLoader + ChinaDataLoader + UnifiedDataLoader)
 ├── lstm_model.py           (PyTorch LSTM / Oracle 后备)
 ├── mupc_env.py             (Gymnasium 环境)
-│   └── action_validator.py  (5条动作约束)
-├── stable_baselines3       (PPO/SAC，可选)
+│   └── action_validator.py  (4+1 条动作约束)
+├── stable_baselines3       (PPO/SAC，主路径)
 │   └── _ppo_core.py       (NumPy PPO 后备)
 └── export_onnx.py         (ONNX 导出)
 ```
 
 **降级规则**：
 
-- SB3 不可用 → `_ppo_core.py`（纯 NumPy PPO）
+- SB3 / Gymnasium / Torch 不可用 → `_ppo_core.py`（纯 NumPy PPO，v2.15 2 维 tanh 兼容）
 - Gymnasium 不可用 → `_gym_stub.py`
 - LSTM 未提供 → Oracle（真实值 + 噪声）
 

@@ -80,6 +80,10 @@ def parse_args():
                    help="使用 Grid2Op + Pandapower 三相潮流仿真 (默认)")
     p.add_argument("--no-grid2op", action="store_false", dest="use_grid2op",
                    help="使用 VoltageSimulator 简化电压模型")
+    p.add_argument("--algo-backend", type=str, default="auto",
+                   choices=["auto", "sb3", "numpy"],
+                   help="RL 后端选择: auto=SB3 可用时优先 SB3, 否则 NumPy PPO; "
+                        "sb3=强制 SB3; numpy=强制 NumPy PPO (默认 auto)")
     p.add_argument("--lstm-checkpoint", type=str, default=None,
                    help="预训练 LSTM 模型路径")
     p.add_argument("--export-onnx", action="store_true",
@@ -115,7 +119,7 @@ def main():
     print("  MUPC RL 训练管线")
     print("=" * 56)
 
-    has_sb3 = _check_sb3()
+    has_sb3 = _check_sb3() and _check_gymnasium() and _check_torch()
     has_gym = _check_gymnasium()
     has_torch = _check_torch()
     print(f"\n依赖检测: SB3={'可用' if has_sb3 else '不可用(将使用NumPy PPO)'}, "
@@ -183,8 +187,14 @@ def main():
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.tensorboard_log, exist_ok=True)
 
-    # 5 维异构激活函数 (Tanh+Sigmoid)，SB3 MlpPolicy 不支持，统一使用 NumPy PPO
-    _train_numpy_ppo(env, eval_env, args, obs_dim)
+    # v2.15 2 维同质 tanh 动作空间, SB3 MlpPolicy 完全支持
+    backend = _resolve_backend(args.algo_backend, has_sb3)
+    if backend == "sb3":
+        print(f"  训练后端: stable-baselines3 (主路径)")
+        _train_sb3(env, eval_env, args)
+    else:
+        print(f"  训练后端: NumPy PPO (后备路径)")
+        _train_numpy_ppo(env, eval_env, args, obs_dim)
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
@@ -206,6 +216,17 @@ def main():
 
 
 # ── SB3 训练 ──────────────────────────────────────────────────
+
+def _resolve_backend(requested: str, has_sb3: bool) -> str:
+    """解析训练后端选择: auto → sb3 (若可用) / numpy, 否则按请求。"""
+    if requested == "auto":
+        return "sb3" if has_sb3 else "numpy"
+    if requested == "sb3" and not has_sb3:
+        print("[WARN] --algo-backend=sb3 但 SB3/Gymnasium/Torch 不可用, 降级到 NumPy PPO",
+              file=sys.stderr)
+        return "numpy"
+    return requested
+
 
 def _train_sb3(env, eval_env, args):
     import gymnasium

@@ -1,9 +1,12 @@
 """
 纯 NumPy PPO 实现 — stable-baselines3 不可用时的后备。
 
+v2.15: 2 维动作 [p_ref(tanh), k_droop(tanh)], 全 tanh 同质激活。
+       SB3 MlpPolicy 已支持该动作空间, 此实现仅在 SB3/Gymnasium 不可用时启用。
+
 特性:
   - 2 层 MLP (128 神经元) 策略网络
-  - 混合输出: Tanh(A1,A2) + Sigmoid(A3,A4)
+  - 2 维 tanh 输出 (v2.15)
   - GAE advantage 估计
   - Clipped objective + value function loss
   - Momentum SGD 优化器
@@ -46,7 +49,7 @@ class MLPPolicy:
             hidden = [128, 128]
         self.obs_dim = obs_dim
         self.hidden = hidden
-        self.act_dim = act_dim  # 5 维，对齐下游 v2.13
+        self.act_dim = act_dim  # 2 维 (v2.15): [p_ref, k_droop]
 
         # 权重初始化
         self.weights: dict[str, np.ndarray] = {}
@@ -234,7 +237,7 @@ class NumPyPPO:
         self.cfg = {**PPO_DEFAULTS, **(config or {})}
         obs_dim = obs_dim or env.observation_space.shape[0]
 
-        self.policy = MLPPolicy(obs_dim=obs_dim, act_dim=5)
+        self.policy = MLPPolicy(obs_dim=obs_dim, act_dim=2)
         self.opt_weights = MomentumSGD(lr=self.cfg["lr"])
         self.opt_log_std = MomentumSGD(lr=self.cfg["lr"])
 
@@ -481,43 +484,39 @@ if __name__ == "__main__":
     print("  NumPy PPO 自测")
     print("=" * 52)
 
-    # 1. MLPPolicy 5维输出验证 (v2.13)
-    print("\n[1] MLPPolicy 5维输出...")
-    policy = MLPPolicy(obs_dim=58, act_dim=5)
+    # 1. MLPPolicy 2 维输出验证 (v2.15)
+    print("\n[1] MLPPolicy 2 维输出...")
+    policy = MLPPolicy(obs_dim=58, act_dim=2)
     obs = np.random.randn(58).astype(np.float32)
     action, value = policy.forward(obs[np.newaxis, :])
-    assert action.shape == (1, 5), f"action shape {action.shape} != (1,5)"
+    assert action.shape == (1, 2), f"action shape {action.shape} != (1,2)"
     assert -1.0 <= action[0, 0] <= 1.0, f"p_ref {action[0,0]} out of [-1,1]"
     assert -1.0 <= action[0, 1] <= 1.0, f"k_droop {action[0,1]} out of [-1,1]"
-    assert 0.0 <= action[0, 2] <= 1.0, f"load {action[0,2]} out of [0,1]"
-    assert 0.0 <= action[0, 3] <= 1.0, f"pv {action[0,3]} out of [0,1]"
-    assert 0.0 <= action[0, 4] <= 1.0, f"conf {action[0,4]} out of [0,1]"
-    print(f"  p_ref={action[0,0]:.3f}, k_droop={action[0,1]:.3f}, load={action[0,2]:.3f} [OK]")
+    print(f"  p_ref={action[0,0]:.3f}, k_droop={action[0,1]:.3f} [OK]")
 
-    # 2. get_action 确定性/随机（5维）
+    # 2. get_action 确定性/随机（2 维）
     print("[2] get_action 采样...")
     act_det, _, _ = policy.get_action(obs, deterministic=True)
-    assert act_det.shape == (5,), f"det shape {act_det.shape}"
+    assert act_det.shape == (2,), f"det shape {act_det.shape}"
     act_stoch, _, _ = policy.get_action(obs, deterministic=False)
-    assert act_stoch.shape == (5,), f"stoch shape {act_stoch.shape}"
-    print(f"  deterministic: p_ref={act_det[0]:.3f}, k={act_det[1]:.3f}, l={act_det[2]:.3f} [OK]")
-    print(f"  stochastic:   p_ref={act_stoch[0]:.3f}, k={act_stoch[1]:.3f}, l={act_stoch[2]:.3f} [OK]")
+    assert act_stoch.shape == (2,), f"stoch shape {act_stoch.shape}"
+    print(f"  deterministic: p_ref={act_det[0]:.3f}, k={act_det[1]:.3f} [OK]")
+    print(f"  stochastic:   p_ref={act_stoch[0]:.3f}, k={act_stoch[1]:.3f} [OK]")
 
-    # 3. ActionValidator 7 条约束规则 (v2.13)
+    # 3. ActionValidator 4 条约束规则 (v2.15: ACT-01/02/03/04 + ACT-07)
     print("[3] ActionValidator 约束规则...")
     from action_validator import ActionValidator
     v = ActionValidator()
-    # 5维动作: [p_ref, k_droop, load_shedding, pv_limit, confidence]
-    act_init = np.array([0.0, 0.0, 0.3, 0.5, 0.5], dtype=np.float32)
+    # 2 维动作: [p_ref, k_droop]
+    act_init = np.array([0.0, 0.0], dtype=np.float32)
     # ACT-01: 小变化不触发 (p_ref 从 0→5kW < 50kW)
     v.validate(act_init, dispatch_p=None)
-    _, violated, _ = v.validate(np.array([0.1, 0.0, 0.3, 0.5, 0.5]), dispatch_p=None)
+    _, violated, _ = v.validate(np.array([0.1, 0.0]), dispatch_p=None)
     assert not violated, f"small delta should not trigger ACT-01: {violated}"
     # ACT-07: 调度约束 (p_ref=30kW > dispatch=20kW)
     v.reset()
     v.validate(act_init, dispatch_p=None)
-    _, violated, violations = v.validate(np.array([0.6, 0.0, 0.3, 0.5, 0.5]),
-                                          dispatch_p=20.0)
+    _, violated, violations = v.validate(np.array([0.6, 0.0]), dispatch_p=20.0)
     assert violated and "ACT-07" in violations, f"ACT-07 not triggered: {violations}"
     print("  ACT-01 (delta p_ref <= 50kW) [OK]")
     print("  ACT-07 (|p_ref| <= |dispatch|) [OK]")
