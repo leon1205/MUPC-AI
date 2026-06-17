@@ -1,6 +1,14 @@
-# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v2.14）
+# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v2.15）
 
-> **版本：** v2.14 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-15
+> **版本：** v2.15 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-17
+
+### 变更记录
+
+| 版本 | 日期 | 作者 | 变更说明 | 评审状态 |
+|------|------|------|----------|----------|
+| v2.15 | 2026-06-17 | 需求分析师 | 动作空间精简：5维→2维（移除load_shedding/pv_limit/confidence），下沉至策略引擎 | [REVIEWED: PASS] |
+| v2.14 | 2026-06-15 | - | SafetyOverride 奖励函数重构、FusedSystemState 78维统一 | [REVIEWED: PASS] |
+| v2.13 | 2026-06-14 | - | Sigmoid P-Q平滑化、Welford奖励归一化、confidence字段 | [REVIEWED: PASS] |
 
 ---
 
@@ -18,7 +26,7 @@ AI 引擎遵循 **"AI 优先，本地兜底"** 策略：正常时 AI 引擎主�
 |------|------|
 | 时序预测 | LSTM 模型预测光伏出力 / 负荷变化趋势（含分位数预测） |
 | 预设运行场景选择 | 5 种预设运行场景，支持远程控制/本地选择，同一时刻仅 1 种互斥运行 |
-| 多目标决策 | MADDPG/PPO 强化学习模型，5 维动作空间 + confidence，5 种奖励函数 |
+| 多目标决策 | MADDPG/PPO 强化学习模型，2 维动作空间，5 种奖励函数 |
 | 数据融合 | 融合电气量、电池数据、电价、气象、调度指令等 10 大类 **78 维**状态 |
 | NPU 推理 | 在 RK3588 NPU 上执行 INT8 量化模型推理 |
 | 在线微调 | 基于新数据持续更新模型权重（影子模型验证 + 渐进式切换） |
@@ -109,7 +117,7 @@ AI 引擎遵循 **"AI 优先，本地兜底"** 策略：正常时 AI 引擎主�
                                                          ↓
 融合数据 + 预测值 + 运行模式 → RLModel.decide() → ActionOutput
                                                          ↓
-ActionOutput → ActionValidator (7条约束规则校验) → strategy-engine
+ActionOutput → ActionValidator (5条约束规则校验) → strategy-engine
                                                          ↓
 新数据积累 → OnlineUpdater.update() → 模型权重增量更新 → 保存
 ```
@@ -132,7 +140,7 @@ flowchart TD
     G --> H[RLModel.decide]
     B --> H
     
-    H --> I[ActionOutput 5维 + confidence]
+    H --> I[ActionOutput 2维]
     I --> J[ActionValidator 约束校验]
     J --> K[strategy-engine]
     
@@ -400,7 +408,7 @@ pub struct ModeSwitchEvent {
 
 ### 6.1 功能概述
 
-RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场景标签，输出 5 维动作空间的最优控制指令。
+RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场景标签，输出 2 维动作空间的最优控制指令。
 
 **电压感知 P/Q 协同控制（v2.2）：** AI 引擎感知台区电压水平，在以下场景执行有功/无功协调控制：
 
@@ -470,15 +478,17 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 
 序列化为推理输入向量时，各维度按定义顺序拼接。
 
-### 6.3 动作空间定义（5 维 + confidence，v2.13）
+### 6.3 动作空间定义（2 维，v2.15）
 
 | 维度 | 字段名 | 数据类型 | 取值范围 | 单位 | 说明 | 分发路径 |
 |------|--------|----------|----------|------|------|----------|
 | A1 | p_ref | f64 | [-50.0, 50.0] | kW | 有功基准点（负值=充电，正值=放电）| 核间→实时控制模块 |
 | A2 | k_droop | f64 | [0.0, 30.0] | kW/V | 电压-有功下垂系数，范围由实时控制模块提供 | 核间→实时控制模块 |
-| A3 | load_shedding | f64 | [0.0, 60.0] | kW | 可中断负荷切除量 | 南向→负荷控制装置 |
-| A4 | pv_limit | f64 | [0.0, 1.0] | - | 光伏限功率比例（0=全限，1=不限）| 南向→光伏逆变器 |
-| A5 | confidence | f64 | [0.0, 1.0] | - | 决策置信度（v2.13 新增）| 仅展示 |
+
+> **v2.15 精简说明：** 原 A3(load_shedding)、A4(pv_limit)、A5(confidence) 已从动作空间移除：
+> - **load_shedding（可中断负荷切除）**：属于南向设备直控，由策略引擎的需量控制策略独立执行，不作为 AI 引擎输出维度
+> - **pv_limit（光伏限功率）**：属于南向设备直控，由策略引擎的防逆流策略独立执行，不作为 AI 引擎输出维度
+> - **confidence（决策置信度）**：属于 ActionOutput 元数据而非动作维度，已移至 `ModelOutput`，由 ActionValidator 校验后注入，不参与 AI 决策
 
 **下垂控制公式：** `P_output = P_ref + k_droop × ΔV`
 
@@ -510,9 +520,9 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | ACT-02 | k_droop 变化率 <= 10 kW/V/步 | 防止下垂系数突变 |
 | ACT-03 | p_ref ∈ [p_ref_min, p_ref_max] | 有功基准点范围约束 |
 | ACT-04 | k_droop ∈ [k_droop_min, k_droop_max] | 下垂系数范围约束 |
-| ACT-05 | load_shedding ∈ [0.0, max_load_shedding] | 负荷切除范围约束 |
-| ACT-06 | pv_limit ∈ [pv_limit_min, 1.0]（防逆流场景除外）| 光伏限功率比例约束，非零下限 |
-| ACT-07 | dispatch_p_set 有效时，\|p_ref\| <= \|dispatch_p_set\| | 调度指令权限约束 |
+| ACT-05 | dispatch_p_set 有效时，\|p_ref\| <= \|dispatch_p_set\| | 调度指令权限约束 |
+
+> **v2.15 说明：** load_shedding、pv_limit 的约束校验（原 ACT-05、ACT-06）已下沉至策略引擎独立执行，不再纳入 AI 动作约束规则。confidence 校验移至 ActionValidator → ModelOutput 流程。
 
 ### 6.6 接口定义
 
@@ -521,12 +531,11 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 pub struct ActionOutput {
     pub p_ref: f64,           // 有功功率基准点 (kW), 负=充电, 正=放电
     pub k_droop: f64,         // 电压-有功下垂系数 (kW/V)
-    pub load_shedding: f64,   // 可中断负荷切除量 (kW)
-    pub pv_limit: f64,        // 光伏限功率比例
-    pub confidence: f64,      // 决策置信度 (v2.13 新增)
 }
 ```
 
+> **v2.15 说明：** v2.15 从 ActionOutput 中移除 `load_shedding`（下沉至策略引擎需量控制）、`pv_limit`（下沉至策略引擎防逆流）、`confidence`（移至 `ModelOutput` 作为校验结果元数据）。
+>
 > **legacy 版本：** v2.6 及之前的 `ActionOutput` 结构体（使用 `p_batt_set` 字段）已废弃，仅用于兼容旧模式。
 
 ### 6.7 消息总线集成
@@ -540,11 +549,13 @@ pub struct ActionOutput {
 | `ai/droop_range` | intercore | ActionValidator | {k_min, k_max} JSON | 按需更新 |
 | `ai/current_mode` | ModeSelector | Web UI（心跳查询）| RunningMode JSON | 按需查询 |
 
-**指令分发说明（v2.7）：** ActionOutput 的 5 个控制维度按以下路径分发：
+**指令分发说明（v2.15）：** ActionOutput 的 2 个控制维度按以下路径分发：
 - `p_ref` + `k_droop` → 通过 intercore（TCP/RJ45）发送到**实时控制模块**，用于下垂控制公式
-- `pv_limit` → 通过 SouthCommandDispatcher 发送到**光伏逆变器**（南向 RS485/HPLC）
-- `load_shedding` → 通过 SouthCommandDispatcher 发送到**负荷控制装置**（南向 RS485/HPLC）
-- `confidence` → 仅用于置信度展示，不参与控制分发
+
+**下沉至策略引擎执行的功能（v2.15）：**
+- `load_shedding`（可中断负荷切除）→ 策略引擎的需量控制策略通过南向 RS485/HPLC 发送到负荷控制装置，AI 引擎不再直接输出
+- `pv_limit`（光伏限功率）→ 策略引擎的防逆流策略通过南向 RS485/HPLC 发送到光伏逆变器，AI 引擎不再直接输出
+- `confidence`（决策置信度）→ 从 ActionOutput 移至 ModelOutput，由 ActionValidator 校验后注入，作为决策质量评估元数据在 Web UI 展示
 
 ### 6.8 验收标准
 
@@ -561,7 +572,7 @@ pub struct ActionOutput {
 | OVERRIDE-01 | SafetyOverride 帧（0x0040）可正确解析 | P0 | v2.10 PRD |
 | OVERRIDE-02 | FusedSystemState.safety_override_active 在收到帧后正确设置 | P0 | v2.10 PRD |
 | OVERRIDE-03 | AI 感知 override_active=true 时获得 R_safety_override 惩罚 | P0 | v2.10 PRD |
-| ACT-01 | 动作空间包含全部 5 个动作维度 + confidence | 单元测试 |
+| ACT-01 | 动作空间包含全部 2 个动作维度 | 单元测试 |
 | ACT-02 | 每个动作维度的取值范围严格执行定义边界 | 单元测试 + clamp 验证 |
 | ACT-03 | 约束校验违反时自动 clamp 并记录 WARN 日志 | 集成测试 |
 | ACT-04 | 约束校验总延迟 < 0.5ms | 性能测试 |
@@ -817,7 +828,7 @@ R_carbon_reduction = 100 * (C_baseline - C_actual) / C_baseline
 | DV-03 | k 值可配置，范围 [0.0, 5.0] | 配置测试 |
 | DV-04 | 电压波动幅度降低 >= 25% | 对比实验 |
 | SH-01 | 无冲击负荷时 R_shock = 0 | 单元测试 |
-| SH-02 | 冲击负荷发生时，load_shedding 越大奖励越高 | 单元测试 |
+| SH-02 | 冲击负荷发生时，策略引擎执行 load_shedding 越大奖励越高（v2.15：load_shedding 值从策略引擎观测获取，非 AI 直接输出）| 单元测试 |
 | SH-03 | 响应时间越长惩罚越大 | 单元测试 |
 | SH-04 | 需量超标次数降低 >= 30% | 对比实验 |
 | TH-01 | Q_THRESHOLD 可通过配置修改 | 配置测试 |
@@ -1373,7 +1384,7 @@ rollback_checkpoints = 1      # 回滚检查点数量
 | T-01 | 状态空间维度描述错误 | PRD 历史版本标题写 59 维，实际应为 78 维 | **高** | ✅ 已修复（v2.14 统一版全部修正） |
 | T-02 | R-04 变压器过载分段惩罚 | 分段函数：安全区(0~75%) / 线性(75~90%) / 指数(90~100%) / 硬惩罚(>100%) | 中 | ✅ 已实现（`overload_penalty_piecewise`） |
 | T-03 | R-05 电压斜率动态权重 | w6(v) = base_w6 × (1.0 + k × \|ΔV\|) | 中 | ✅ 已实现（`dynamic_voltage_slope_weight`） |
-| T-04 | R-06 冲击负荷响应奖励 | R_shock = w × load_shedding / max - λ × response_time / max_response | 中 | ⚠️ 未实现（仅有注释掉的测试桩） |
+| T-04 | R-06 冲击负荷响应奖励 | R_shock = w × load_shedding / max - λ × response_time / max_response（v2.15：load_shedding 由策略引擎执行，AI 引擎从观测获取该值计算奖励）| 中 | ⚠️ 未实现（仅有注释掉的测试桩） |
 | T-05 | R-07 P-Q 阈值可配置化 | Q_THRESHOLD / P_THRESHOLD 从硬编码改为配置文件读取 | 中 | ✅ 已实现（`PqCoordinationThresholds` + Default） |
 | T-06 | 在线微调 Phase 3C.2 | 原为占位框架，现已完整实现影子模型验证+渐进式切换 | 中 | ✅ 已实现（`SafeOnlineUpdater::safe_update`） |
 | T-07 | v2.0 前 SceneClassifier | 已废弃，替换为 ModeSelector | 低 | ✅ 已关闭 |
@@ -1423,8 +1434,8 @@ mupc/crates/ai-engine/
 
 ---
 
-**文档状态：** 统一版 v2.14（整合了 v1.0~v2.14 所有历史版本）
+**文档状态：** 统一版 v2.15（整合了 v1.0~v2.15 所有历史版本）
 
 **来源文档：**
-- `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md`（v1.0~v2.14 历史版本合并）
+- `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md`（v1.0~v2.15 历史版本合并）
 - `docs/superpowers/plans/modules/05-MUPC-AI引擎-设计文档.md`（设计文档）

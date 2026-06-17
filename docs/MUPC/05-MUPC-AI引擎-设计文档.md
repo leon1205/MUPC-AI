@@ -2,10 +2,11 @@
 
 # MUPC AI 引擎 - 模块设计文档
 
-[DESIGN_APPROVED] — v2.14 SafetyOverride 奖励函数增强
+[DESIGN_APPROVED] — v2.15 动作空间精简（5维→2维）
 
 | 版本 | 日期       | 作者   | 状态 |
 | ---- | ---------- | ------ | ---- |
+| v2.15 | 2026-06-17 | 架构师 | [DESIGN_APPROVED] |
 | v2.14 | 2026-06-15 | 架构师 | [DESIGN_APPROVED] |
 | v2.13 | 2026-06-14 | 架构师 | [DESIGN_APPROVED] |
 | v2.12 | 2026-06-14 | 架构师 | [DESIGN_APPROVED] |
@@ -16,7 +17,7 @@
 | v2.7 | 2026-06-13 | 架构师 | 历史版本 |
 | v2.6 | 2026-06-10 | 架构师 | 历史版本 |
 
-**对应 PRD:** `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md` v2.14 (`[REVIEWED: PASS]`)
+**对应 PRD:** `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md` v2.15 (`[REVIEWED: PASS]`)
 
 ---
 
@@ -30,7 +31,7 @@
    - 4.2 分层控制架构（v2.4）
    - 4.3 算法选择
    - 4.4 完整状态空间表（10 大类，78 维，v2.14）
-   - 4.5 完整动作空间表（5 维 + confidence，v2.13）
+   - 4.5 完整动作空间表（2 维，v2.15）
    - 4.6 ActionOutput 结构体 & 解析
    - 4.7 RLModel 结构体
    - 4.8 ActionValidator 约束规则校验
@@ -126,10 +127,10 @@ AI 优化引擎是 MUPC 通信管理模块的核心智能决策组件，对应 w
 | LSTM 预测模型 | `lstm_model.rs` | 光伏出力与负荷功率时序预测，输出 15~30 分钟预测向量 |
 | 多源数据融合 | `data_fusion.rs` | 周期性（1Hz）从 5 个数据源采集数据，融合为 FusedSystemState |
 | 模式选择器 | `mode_selector.rs` | 5 种预设运行场景互斥选择，支持远程（IEC 104/61850）和本地（Web UI）切换 |
-| 强化学习模型 | `rl_model.rs` | MADDPG/PPO 多目标决策，5 维动作空间输出（v2.13） |
+| 强化学习模型 | `rl_model.rs` | MADDPG/PPO 多目标决策，2 维动作空间输出（v2.15） |
 | 奖励计算器 | `reward_calculator.rs` | 5 种场景奖励函数计算，驱动在线微调 |
 | 鲁棒性管理器 | `robustness_manager.rs` | 电压异常应急策略，检测并返回应急动作（v2.9 新增） |
-| 动作约束校验 | `action_validator.rs` | 7 条约束规则校验（ACT-01~07），防止异常值危害设备 |
+| 动作约束校验 | `action_validator.rs` | 4 条约束规则校验（ACT-DUAL-01~04），防止异常值危害设备（v2.15：load_shedding/pv_limit 下沉至策略引擎） |
 | RKNN Runtime | `rknn_runtime.rs` | RK3588 NPU FFI 推理封装，异步安全 |
 | FFI 绑定 | `rknn_runtime_sys.rs` | librknnrt.so C API 声明 |
 | RKNN 类型 | `rknn_types.rs` | FFI 边界数据结构 |
@@ -167,9 +168,9 @@ mupc-web-api          --> mupc-ai-engine (通过 AiIntegrator 门面)
                                                           |
 融合向量 + 预测值 + 运行模式 --> RLModel.decide() --> ActionOutput
                                                           |
-ActionOutput --> ActionValidator.validate() --> 通过--> 下发 strategy-engine
-                                         --> 不通过--> clamp + WARN 日志
-                                                          |
+ActionOutput (p_ref, k_droop) --> ActionValidator.validate() --> 通过--> 下发 strategy-engine
+                                                     --> 不通过--> clamp + WARN 日志
+                                                      |
 决策-执行对 --> RewardCalculator.calculate() --> 奖励值 --> OnlineUpdater
 ```
 
@@ -466,7 +467,7 @@ pub struct DispatchAdapter {
 }
 ```
 
-数据字段：dispatch_p_set (Option<f64>), dispatch_q_set (Option<f64>)。通过 gateway 事件驱动接收。缺失时两个字段均为 None，RL 决策跳过调度相关约束 (ACT-05)。
+数据字段：dispatch_p_set (Option<f64>), dispatch_q_set (Option<f64>)。通过 gateway 事件驱动接收。缺失时两个字段均为 None，RL 决策跳过调度相关约束 (ACT-DUAL-04)。
 
 ### 3.5 FusedSystemState 结构体（v2.14：34 字段，78 维输入向量）
 
@@ -687,7 +688,7 @@ fn validate_input_vector(v: &[f32]) -> Result<(), AiEngineError> {
 | 预测数据 (LSTM) | 使用全零向量，RL 决策仅依赖实时数据 | WARN |
 | 电价数据 | 使用上一有效值，连续缺失 3 个周期后使用默认分时电价表 | WARN |
 | 气象数据 | 使用上一有效值，连续缺失 10 个周期后绿色场景 R_carbon 强制置 0 | WARN |
-| 调度指令 | 对应字段置 None，RL 决策跳过 ACT-05 约束 | INFO |
+| 调度指令 | 对应字段置 None，RL 决策跳过 ACT-DUAL-04 约束 | INFO |
 
 ### 3.8 融合执行流程
 
@@ -734,7 +735,7 @@ impl DataFusionEngine {
 
 ### 4.1 功能概述
 
-RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近端策略优化）算法，基于融合状态向量、LSTM 预测值和运行场景权重，输出 5 维动作空间（p_ref + k_droop + load_shedding + pv_limit + confidence，v2.13）的最优控制指令。
+RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近端策略优化）算法，基于融合状态向量、LSTM 预测值和运行场景权重，输出 2 维动作空间（p_ref + k_droop，v2.15）的最优控制指令。load_shedding 和 pv_limit 已下沉至策略引擎（需量控制/防逆流策略独立执行），confidence 保留在 ModelOutput 内部用于校验，不再作为动作维度。
 
 ### 4.2 分层控制架构
 
@@ -746,12 +747,12 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 - 调节方式：查表法或 PID，不经过 AI
 - 执行器按下垂公式 `P_output = P_ref + k_droop × ΔV` 执行毫秒级暂态调节
 
-**上层（RL决策）**— v2.13 现行，5 维动作空间
+**上层（RL决策）**— v2.15 现行，2 维动作空间
 - `p_ref`（有功基准点，[-50.0, 50.0] kW）：AI 负责稳态全局优化，通过核间 TCP 下发
 - `k_droop`（电压-有功下垂系数，[0.0, 30.0] kW/V）：AI 设置暂态调节灵敏度，通过核间 TCP 下发
-- `load_shedding`（可中断负荷切除量，[0.0, 60.0] kW）：南向→负荷控制装置
-- `pv_limit`（光伏限功率比例，[0.0, 1.0]）：南向→光伏逆变器
-- `confidence`（决策置信度，[0.0, 1.0]）：仅用于置信度展示
+- `load_shedding`（可中断负荷切除量）：下沉至 strategy-engine（需量控制策略独立执行）
+- `pv_limit`（光伏限功率比例）：下沉至 strategy-engine（防逆流策略独立执行）
+- `confidence`（决策置信度）：保留在 ModelOutput 中（action_validator 内部校验使用）
 
 **分层优点：**
 - P 是 s/min 级慢变量，Q 是 ms 级快变量，单一网络同时学习两个时间尺度任务收敛困难且易振荡
@@ -761,15 +762,15 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 
 **动作空间对比：**
 
-| 维度 | v2.3（4维） | v2.4~v2.6（3维） | v2.7~v2.12（4维） | v2.13（5维） | 说明 |
-|------|------------|-----------------|------------------|-------------|------|
-| A1 | p_batt_set [-50,50]kW | p_batt_set [-50,50]kW | p_ref [-50,50]kW | p_ref [-50,50]kW | 有功基准点（RL控制） |
-| A2 | q_batt_set | ~~Q替代~~ | k_droop [0,30]kW/V | k_droop [0,30]kW/V | 下垂系数（v2.7新增，实时模块闭环） |
-| A3 | load_shedding [0,60]kW | load_shedding [0,60]kW | load_shedding [0,60]kW | load_shedding [0,60]kW | 可中断负荷（南向分发） |
-| A4 | pv_limit [0,1] | pv_limit [0,1] | pv_limit [0,1] | pv_limit [0,1] | 光伏限功率（南向分发） |
-| A5 | - | - | - | confidence [0,1] | 决策置信度（v2.13新增） |
+| 维度 | v2.3（4维） | v2.4~v2.6（3维） | v2.7~v2.12（4维） | v2.13~v2.14（5维） | v2.15（2维） | 说明 |
+|------|------------|-----------------|------------------|-------------------|-------------|------|
+| A1 | p_batt_set [-50,50]kW | p_batt_set [-50,50]kW | p_ref [-50,50]kW | p_ref [-50,50]kW | p_ref [-50,50]kW | 有功基准点（RL控制） |
+| A2 | q_batt_set | ~~Q替代~~ | k_droop [0,30]kW/V | k_droop [0,30]kW/V | k_droop [0,30]kW/V | 下垂系数（v2.7新增，实时模块闭环） |
+| A3 | load_shedding [0,60]kW | load_shedding [0,60]kW | load_shedding [0,60]kW | load_shedding [0,60]kW | —（下沉至策略引擎） | v2.15 起由需量控制策略独立执行 |
+| A4 | pv_limit [0,1] | pv_limit [0,1] | pv_limit [0,1] | pv_limit [0,1] | —（下沉至策略引擎） | v2.15 起由防逆流策略独立执行 |
+| A5 | - | - | - | confidence [0,1] | —（保留在 ModelOutput） | v2.15 起仅用于内部校验，非动作维度 |
 
-> **注：** v2.4 起 Q 控制完全交给实时控制模块闭环调节，RL 仅输出 P 控制指令（p_ref + k_droop + load_shedding + pv_limit + confidence），实现时间尺度解耦。表中 v2.3 的 q_batt_set 和 v2.4~v2.6 的 p_batt_set 为历史版本字段，现行代码中已不再使用。
+> **注：** v2.4 起 Q 控制完全交给实时控制模块闭环调节。v2.15 起 AI 动作空间精简为 2 维（p_ref + k_droop），load_shedding 和 pv_limit 下沉至 strategy-engine 本地策略独立执行，confidence 保留在 ModelOutput 中供 action_validator 内部校验。表中 v2.3 的 q_batt_set 和 v2.4~v2.6 的 p_batt_set 为历史版本字段，现行代码中已不再使用。
 
 ### 4.3 算法选择
 
@@ -835,37 +836,28 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 
 > **注：** v2.7 双参数模式将 Q 控制完全交给实时控制模块，RL 仅输出 P 控制指令（P_ref + k_droop），实现时间尺度解耦。
 
-### 4.5 完整动作空间表（5 维 + confidence，v2.13）
+### 4.5 完整动作空间表（2 维，v2.15）
 
 | 维度 | 字段名 | 类型 | 取值范围 | 单位 | 说明 | 分发路径 |
 |------|--------|------|----------|------|------|----------|
 | A1 | p_ref | f64 | [-50.0, 50.0] | kW | 有功基准点（负=充电，正=放电） | 核间→实时控制模块 |
 | A2 | k_droop | f64 | [0.0, 30.0] | kW/V | 电压-有功下垂系数 | 核间→实时控制模块 |
-| A3 | load_shedding | f64 | [0.0, 60.0] | kW | 可中断负荷切除 | 南向→负荷控制装置 |
-| A4 | pv_limit | f64 | [0.0, 1.0] | - | 光伏限功率比例（0=全限，1=不限） | 南向→光伏逆变器 |
-| A5 | confidence | f64 | [0.0, 1.0] | - | 决策置信度（v2.13 新增） | - |
 
-> **注：** v2.7 双参数模式将 Q 控制完全交给实时控制模块，RL 仅输出 P 控制指令。p_ref + k_droop 通过核间通信发送到实时控制模块，load_shedding + pv_limit 通过南向通信分发到设备。
+> **v2.15 下沉说明：** load_shedding 下沉至 strategy-engine（需量控制策略独立执行），pv_limit 下沉至 strategy-engine（防逆流策略独立执行），confidence 保留在 ModelOutput 中（action_validator 内部校验使用）。AI 引擎仅通过核间通信下发 p_ref + k_droop 至实时控制模块。
 
 ### 4.6 ActionOutput 结构体
 
 ```rust
-/// 强化学习决策输出（5 维动作 + 置信度，v2.13）
+/// 强化学习决策输出（2 维动作，v2.15）
 ///
 /// v2.7 双参数模式：p_ref（有功基准）+ k_droop（电压-有功下垂系数）
-/// v2.13 新增：confidence 字段
+/// v2.15 精简：load_shedding/pv_limit 下沉至策略引擎，confidence 保留在 ModelOutput 中
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionOutput {
     /// A1: 有功功率基准点 (kW), [-50.0, 50.0], 负=充电, 正=放电
     pub p_ref: f64,
     /// A2: 电压-有功下垂系数 (kW/V), [0.0, 30.0], 范围由实时控制模块提供
     pub k_droop: f64,
-    /// A3: 可中断负荷切除量 (kW), [0.0, 60.0]
-    pub load_shedding: f64,
-    /// A4: 光伏限功率比例, [0.0, 1.0], 0=全限, 1=不限
-    pub pv_limit: f64,
-    /// A5: 决策置信度 [0.0, 1.0]（v2.13 新增）
-    pub confidence: f64,
 }
 ```
 
@@ -883,33 +875,25 @@ pub struct ActionOutputLegacy {
 }
 ```
 
-### 4.6.2 parse_action_output 双参数解析（v2.7）
+### 4.6.2 parse_action_output 双参数解析（v2.15）
 
 ```rust
-/// 解析 RL 模型原始输出为 ActionOutput（双参数模式，v2.7）
+/// 解析 RL 模型原始输出为 ActionOutput（双参数模式，v2.15）
 ///
-/// 输出格式: [p_ref, k_droop, load_shedding, pv_limit, confidence]
+/// 输出格式: [p_ref, k_droop]（2 维）
+/// v2.15: load_shedding/pv_limit 下沉至策略引擎，不再作为 RL 动作维度
 pub fn parse_action_output(raw: &[f32], config: &ActionSpaceConfig) -> Option<ActionOutput> {
-    if raw.len() < 5 {
+    if raw.len() < 2 {
         return None;
     }
 
-    let k_min = config.k_droop_min.unwrap_or(-100.0);
-    let k_max = config.k_droop_max.unwrap_or(100.0);
-
-    let mut action = ActionOutput {
+    Some(ActionOutput {
         p_ref: (raw[0] as f64).clamp(
             -config.max_batt_discharge_power,
             config.max_batt_charge_power,
         ),
-        k_droop: (raw[1] as f64).clamp(k_min, k_max),
-        load_shedding: (raw[2] as f64).clamp(0.0, config.max_load_shedding),
-        pv_limit: (raw[3] as f64).clamp(0.0, 1.0),
-        confidence: raw.get(4).copied().unwrap_or(0.5) as f64,
-    };
-
-    action.confidence = action.confidence.clamp(0.0, 1.0);
-    Some(action)
+        k_droop: (raw[1] as f64).clamp(0.0, 30.0),
+    })
 }
 ```
 
@@ -932,7 +916,7 @@ impl RLModel {
     /// 执行决策
     ///
     /// 输入：78 维融合状态向量（v2.14）
-    /// 输出：5 维动作 + confidence [(p_ref, k_droop, load_shedding, pv_limit, confidence)]（v2.13）
+    /// 输出：2 维动作 (p_ref, k_droop)（v2.15）
     pub async fn decide(&self, input_vector: &[f32]) -> Result<ActionOutput, AiEngineError>;
 
     /// 获取模型类型
@@ -943,29 +927,27 @@ impl RLModel {
 }
 ```
 
-### 4.6.3 parse_action_output()（v2.13 简化版）
+### 4.6.3 parse_action_output()（v2.15 最终版）
 
-从 RKNN Runtime 推理输出的 f32 向量解析为 ActionOutput 结构体，并在解析阶段执行 clamp 限幅。相比 §4.6.2 的 v2.7 版本，v2.13 移除了 k_droop_min/max 的动态配置读取，改为固定范围 [0.0, 30.0]。
+从 RKNN Runtime 推理输出的 f32 向量解析为 ActionOutput 结构体，并在解析阶段执行 clamp 限幅。v2.15 将动作空间从 5 维精简为 2 维（p_ref + k_droop）。
 
 ```rust
-/// 解析 RL 模型输出向量为 ActionOutput（v2.13，5 维动作 + confidence）
+/// 解析 RL 模型输出向量为 ActionOutput（v2.15，2 维动作）
 ///
-/// 输出格式: [p_ref, k_droop, load_shedding, pv_limit, confidence]
+/// 输出格式: [p_ref, k_droop]
+/// v2.15: load_shedding/pv_limit/confidence 已从动作空间移除
 pub fn parse_action_output(raw: &[f32], config: &ActionSpaceConfig) -> Option<ActionOutput> {
-    if raw.len() < 5 {
+    if raw.len() < 2 {
         return None;
     }
     Some(ActionOutput {
-        p_ref:        (raw[0] as f64).clamp(-config.max_batt_discharge_power, config.max_batt_charge_power),
-        k_droop:     (raw[1] as f64).clamp(0.0, 30.0),  // 范围由实时控制模块提供
-        load_shedding:(raw[2] as f64).clamp(0.0, config.max_load_shedding),
-        pv_limit:     (raw[3] as f64).clamp(0.0, 1.0),
-        confidence:   (raw[4] as f64).clamp(0.0, 1.0),
+        p_ref:    (raw[0] as f64).clamp(-config.max_batt_discharge_power, config.max_batt_charge_power),
+        k_droop:  (raw[1] as f64).clamp(0.0, 30.0),  // 范围由实时控制模块提供
     })
 }
 ```
 
-### 4.8 ActionValidator — 约束规则校验（v2.13：7 条规则 ACT-01~07 + 双参数模式 ACT-DUAL-01~05）
+### 4.8 ActionValidator — 约束规则校验（v2.15：4 条规则 ACT-DUAL-01~04，load_shedding/pv_limit/confidence 下沉）
 
 ```rust
 /// 动作约束校验器
@@ -980,19 +962,19 @@ pub struct ActionValidator {
 }
 ```
 
-**7 条约束规则（ACT-01 ~ ACT-07，v2.13）：**
+**4 条双参数校验规则（ACT-DUAL-01 ~ ACT-DUAL-04，v2.15）：**
+
+v2.15 起 load_shedding 和 pv_limit 不再由 AI 输出，其约束下沉至 strategy-engine（需量控制/防逆流策略内置边界检查）。confidence 保留在 ModelOutput 中用于内部校验。AI 引擎仅校验 p_ref 和 k_droop。
 
 | 规则 ID | 约束条件 | 校验逻辑 |
 |---------|----------|----------|
-| ACT-01 | p_ref 变化率 <= 50kW/步 | `abs(p_ref_new - p_ref_prev) <= config.p_batt_ramp_limit_kw` |
-| ACT-02 | k_droop 变化率 <= 10 kW/V/步 | `abs(k_droop_new - k_droop_prev) <= config.k_droop_ramp_limit` |
-| ACT-03 | p_ref ∈ [p_ref_min, p_ref_max] | `clamp(p_ref, p_ref_min, p_ref_max)` |
-| ACT-04 | k_droop ∈ [k_droop_min, k_droop_max] | `clamp(k_droop, k_droop_min, k_droop_max)` |
-| ACT-05 | load_shedding ∈ [0.0, max_load_shedding] | `clamp(load_shedding, 0.0, max_load_shedding)` |
-| ACT-06 | pv_limit ∈ [0.0, 1.0] | `clamp(pv_limit, 0.0, 1.0)` |
-| ACT-07 | 调度约束 | `abs(p_ref) <= abs(dispatch_p_set)` (仅 dispatch_p_set 不为 None 时) |
+| ACT-DUAL-01 | p_ref 值域约束 | `clamp(p_ref, p_ref_min, p_ref_max)` |
+| ACT-DUAL-02 | k_droop 值域约束 | `clamp(k_droop, k_droop_min, k_droop_max)` |
+| ACT-DUAL-03 | p_ref 变化率 <= 50kW/步 | `abs(p_ref_new - p_ref_prev) <= config.p_batt_ramp_limit_kw` |
+| ACT-DUAL-04 | 调度约束 | `abs(p_ref) <= abs(dispatch_p_set)` (仅 dispatch_p_set 不为 None 时) |
 
-> **LEGACY（v2.4~v2.6）：** 旧版 `validate()` 方法使用已废弃字段 `p_batt_set`/`q_batt_set`，对应 ACT-01~05（有功/无功变化率、视在功率、光伏下限、调度权限）。v2.7 起由 `validate_dual()` 完全替代，旧方法仅保留向后兼容。
+> **LEGACY（v2.4~v2.6）：** 旧版 `validate()` 方法使用已废弃字段 `p_batt_set`/`q_batt_set`。v2.7 起由 `validate_dual()` 完全替代。
+> **LEGACY（v2.7~v2.14）：** ACT-05(load_shedding)/ACT-06(pv_limit)/ACT-07(dispatch_p_set) 已随 v2.15 动作空间精简下沉至策略引擎。
 
 ```rust
 impl ActionValidator {
@@ -1078,22 +1060,8 @@ impl ActionValidator {
             }
         }
 
-        // ACT-DUAL-05: pv_limit 下限（防逆流场景除外）
-        if !is_anti_reverse && validated.pv_limit < self.config.pv_limit_min {
-            validated.pv_limit = self.config.pv_limit_min;
-            violations.push(ViolationRecord {
-                rule: "ACT-DUAL-05",
-                field: "pv_limit",
-                original: action.pv_limit,
-                clamped: validated.pv_limit,
-            });
-        }
-
-        // load_shedding 和 confidence 最终 clamp
-        validated.load_shedding = validated
-            .load_shedding
-            .clamp(0.0, action_space_config.max_load_shedding);
-        validated.confidence = validated.confidence.clamp(0.0, 1.0);
+        // v2.15: load_shedding/pv_limit/confidence 已从 ActionOutput 移除
+        // 其约束下沉至 strategy-engine（需量控制/防逆流策略内置边界检查）
 
         *self.previous_action.write().await = Some(validated.clone());
         (validated, violations)
@@ -2280,14 +2248,12 @@ pub fn compute_online_loss(&self, task_loss: f32, new_logits: &[f32], offline_lo
 
 ```rust
 /// 公式：a_blended = (1 - α) * a_old + α * a_new
+/// v2.15: 动作空间精简为 2 维（p_ref + k_droop）
 pub fn blend_actions(&self, a_old: &ActionOutput, a_new: &ActionOutput, alpha: f64) -> ActionOutput {
     let one_minus_alpha = 1.0 - alpha;
     ActionOutput {
         p_ref: one_minus_alpha * a_old.p_ref + alpha * a_new.p_ref,
         k_droop: one_minus_alpha * a_old.k_droop + alpha * a_new.k_droop,
-        load_shedding: one_minus_alpha * a_old.load_shedding + alpha * a_new.load_shedding,
-        pv_limit: one_minus_alpha * a_old.pv_limit + alpha * a_new.pv_limit,
-        confidence: (one_minus_alpha * a_old.confidence + alpha * a_new.confidence).min(1.0),
     }
 }
 ```
@@ -2463,7 +2429,7 @@ fn map_rknn_error(code: c_int) -> Result<(), AiEngineError> {
 |------|----------|------|
 | 状态输入准备 | 5ms | 融合数据读取 + to_input_vector() 序列化 |
 | NPU 推理 | 100ms | rknn_inputs_set + rknn_run + rknn_outputs_get |
-| 动作输出校验 | 0.5ms | 5 条约束规则 clamp |
+| 动作输出校验 | 0.5ms | 4 条约束规则 clamp |
 | **总端到端延迟** | **120ms** | 从状态输入就绪到校验后动作输出可用 |
 
 ### 6.8 NPU 降级机制
@@ -2619,9 +2585,6 @@ impl ModelManager {
                 output: vec![
                     validated.p_ref as f32,
                     validated.k_droop as f32,
-                    validated.load_shedding as f32,
-                    validated.pv_limit as f32,
-                    validated.confidence as f32,
                 ],
             });
         }
@@ -3050,7 +3013,7 @@ mupc/crates/ai-engine/
 │   ├── load_covariates.rs        # 负荷协变量结构体（v2.11 新增）
 │   ├── weather_service.rs        # 气象数据服务 trait（v2.11 新增）
 │   ├── data_fusion.rs            # 多源数据融合引擎（DataSourceAdapter trait + 5 个实现）
-│   ├── action_validator.rs       # 动作约束校验器（5 条约束规则 ACT-01~05）
+│   ├── action_validator.rs       # 动作约束校验器（4 条双参数校验规则 ACT-DUAL-01~04，v2.15）
 │   ├── online_updater.rs         # 在线微调（DataPoint, OnlineUpdater, batch_size=32）
 │   ├── rknn_runtime.rs           # RKNN Runtime 推理器（RAII, spawn_blocking, NPU降级）
 │   ├── rknn_runtime_sys.rs       # RKNN Runtime C API FFI 绑定（unsafe extern \"C\"）
@@ -3422,16 +3385,17 @@ pub struct DemandData {
 - D1 中三相电压标幺值 (voltage_phase_a/b/c) 使 AI 引擎能感知台区电压水平，执行 P/Q 协同控制
 - v2.5~v2.14 扩展：逐步增加 q_realtime_margin、季节/时段编码、安全覆盖状态、概率负荷预测等维度
 
-### 13.5 ADR-005: 7 条动作约束规则 + clamp 限幅（v2.13 更新）
+### 13.5 ADR-005: 4 条双参数动作约束规则 + clamp 限幅（v2.15 更新）
 
-**决策：** AI 模型输出 5 维动作后，经 7 条约束规则（ACT-01~07）校验，违反约束时自动 clamp 到安全边界，并记录 WARN 日志。
+**决策：** AI 模型输出 2 维动作（p_ref, k_droop）后，经 4 条双参数校验规则（ACT-DUAL-01~04）校验，违反约束时自动 clamp 到安全边界，并记录 WARN 日志。load_shedding 和 pv_limit 的约束下沉至 strategy-engine（需量控制/防逆流策略内置边界检查），confidence 保留在 ModelOutput 中用于内部校验。
 
 **理由：**
 - AI 模型输出不能直接下发给物理设备，必须经过安全校验
-- 变化率约束 (ACT-01/02) 保护电池设备免受功率突变损害
-- 范围约束 (ACT-03~06) 保证动作值在安全边界内
-- 调度约束 (ACT-07) 保证不超出调度指令权限
+- 变化率约束 (ACT-DUAL-03) 保护电池设备免受功率突变损害
+- 值域约束 (ACT-DUAL-01/02) 保证动作值在安全边界内
+- 调度约束 (ACT-DUAL-04) 保证不超出调度指令权限
 - clamp（截断）比拒绝动作更鲁棒：拒绝动作会导致控制中断，clamp 保留有效部分
+- v2.15 将 load_shedding/pv_limit 下沉至策略引擎，使 AI 引擎专注于核心 P-Q 协同控制
 
 ### 13.6 ADR-006: A/B 双缓冲模型热加载
 
@@ -3639,4 +3603,19 @@ AI 引擎可通过 p_batt/q_batt 协同控制主动调节。v2.3 仅恢复电压
 | 5 | 版本号更新 | 文档头部 | v2.13 → v2.14 |
 
 **修订依据：** v2.14 增强 SafetyOverride 惩罚函数的精细度：(1) 引入连续触发次数和滑动窗口覆盖比例两个新特征；(2) 分层计算避免小样本偏差；(3) 新增互斥逻辑避免 SafetyOverride 与 P-Q 协同度的双重惩罚，使奖励信号更准确。
+
+### v2.15 修订记录 (2026-06-17)
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | **动作空间精简为 2 维** | §4.1/4.2/4.5/4.6 | ActionOutput 从 5 字段(p_ref, k_droop, load_shedding, pv_limit, confidence)精简为 2 字段(p_ref, k_droop)；load_shedding/pv_limit 下沉至 strategy-engine，confidence 保留在 ModelOutput |
+| 2 | 动作空间对比表更新 | §4.2 | 新增 v2.15(2维) 列，标记 load_shedding/pv_limit/confidence 下沉状态 |
+| 3 | parse_action_output 精简 | §4.6.2/4.6.3 | 解析格式从 `[p_ref, k_droop, load_shedding, pv_limit, confidence]` 改为 `[p_ref, k_droop]` |
+| 4 | ActionValidator 约束规则精简 | §4.8 | ACT-05(load_shedding)/ACT-06(pv_limit)下沉至 strategy-engine，ACT-07(dispatch)合并至 ACT-DUAL-04；v2.15 保留 4 条双参数校验规则 |
+| 5 | blend_actions 精简 | §5.15.7 | 5 维插值 → 2 维插值（仅 p_ref + k_droop） |
+| 6 | full_decision_cycle DataPoint | §7.3 | 输出向量从 5 元素改为 2 元素 |
+| 7 | ADR-005 更新 | §13.5 | 从 7 条约束规则更新为 4 条双参数校验规则 |
+| 8 | 版本号更新 | 文档头部 | v2.14 → v2.15 |
+
+**修订依据：** PRD v2.15 (`[REVIEWED: PASS]`) 将动作空间从 5 维精简为 2 维：(1) p_ref/k_droop 通过核间通信下发实时控制模块；(2) load_shedding 下沉至 strategy-engine 需量控制策略独立执行；(3) pv_limit 下沉至 strategy-engine 防逆流策略独立执行；(4) confidence 保留在 ModelOutput 中供 action_validator 内部校验。精简后 AI 引擎专注于核心 P-Q 协同控制，策略引擎承担本地设备控制职责。
 
