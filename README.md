@@ -22,10 +22,10 @@ data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/�
         ↓
 lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
         ↓
-mupc_env.py          → Gymnasium 环境：58维观测 + 3维动作 + 5场景奖励
+mupc_env/            → Gymnasium 环境：63/64维观测 + 2维动作 + 5场景奖励
 │ └── grid2op_env/ → Grid2Op + Pandapower 三相潮流电压仿真（可选）
         ↓
-train.py → PPO/SAC 训练（或 NumPy PPO 后备）
+train.py → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
         ↓
 export_onnx.py       → ONNX 导出
         ↓
@@ -134,6 +134,7 @@ python data_loader.py --unified --lat 31.23 --lon 121.47
 | `--lstm-params` | `hidden_dim=64,num_layers=2,epochs=100,patience=15` | LSTM 训练参数 |
 | `--train-lstm` | `False` | 独立训练 LSTM（不跑 RL） |
 | `--no-lstm` | `False` | 使用 Oracle 预测代替 LSTM |
+| `--algo-backend` | `auto` | RL 后端 (v2.17 SB3 主路径): `auto` / `sb3` / `numpy` |
 | `--no-grid2op` | `False` | 使用 VoltageSimulator 代替 Grid2Op |
 | `--export-onnx` | `False` | 训练结束后导出 ONNX |
 | `--lr-decay` | `False` | 启用学习率衰减 |
@@ -143,31 +144,36 @@ python data_loader.py --unified --lat 31.23 --lon 121.47
 | `--reward-weights` | 按场景默认 | 自定义奖励权重 |
 | `--seed` | `42` | 随机种子 |
 
-## 观测空间（58维单模式，59维多模式）
+## 观测空间（63维单模式，64维多模式，v2.16）
 
 ```
-[0..9]   D1 实时数据: SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压/实时模块Q裕度
-[10..24] D2 光伏预测 (15维，LSTM或Oracle)
-[25..39] D2 负荷预测 (15维，LSTM或Oracle)
-[41..43] D3 电价: 当前价/下时段价/时段ID
-[44..46] D4 需量: 当前需量/合同值/本月峰值
-[47..48] D5 气象: 辐照/温度
-[49]     D6 调度指令
-[50]     D7 Q裕度
-[51..56] D7 季节one-hot: 灌溉季/炒茶季/空调季/常规季/保留/保留
-[57]     D7 时段: 白天/夜间
-[58]     mode_id (仅多模式训练)
+[0..9]    D1 实时数据 (10标量)         SOC/光伏/负荷/电网功率/变压器负载/电池功率/三相电压/实时模块Q裕度
+[10..24]  D2 光伏预测 (15维)          LSTM或Oracle
+[25..39]  D2 负荷预测 (15维)          LSTM或Oracle
+[40..42]  D3 电价 (3字段)             当前价/下时段价/时段ID
+[43..45]  D4 需量 (3字段)             当前需量/合同值/本月峰值
+[46..47]  D5 气象 (2字段)             辐照/温度
+[48]      D6 调度指令                  dispatch_p_set
+[49]      D7 Q裕度                    q_realtime_margin
+[50..55]  D7 季节one-hot (6维)        灌溉季/炒茶季/空调季/常规季/保留/保留
+[56..57]  D7 时段one-hot (2维)        白天/夜间 (v2.16 由 1 维升级为 2 维)
+[58]      D9 safety_override_active   安全覆盖激活
+[59]      D9 safety_override_p_ref    安全覆盖设定值
+[60]      D9 override_consecutive     连续触发次数 (v2.16)
+[61]      D9 override_ratio           滑动窗口覆盖比例 (v2.16)
+[62]      (可选) mode_id              多模式训练追加 (多模式为第63位)
 ```
 
-## 动作空间（3维）
+## 动作空间（2维，v2.15 精简）
 
 | 维度 | 范围 | 说明 |
 |------|------|------|
-| p_batt | [-50, 50] kW | 电池有功（RL 控制），匹配电池最大充放电功率 |
-| load_shedding | [0, 60] kW | 可中断负荷切除（RL 控制），匹配负荷峰值 |
-| pv_limit | [0, 1] | 光伏有功限值比例（v2.6 新增，主动弃光） |
+| p_ref | [-50, 50] kW | 电池有功基准点（RL 控制），匹配电池最大充放电功率 |
+| k_droop | [0, 30] kW/V | 电压-有功下垂系数（RL 控制），下垂公式: P_output = p_ref - k_droop × ΔV |
 
-Q_batt 由实时电压调节器闭环，不经过 RL。
+Q_batt 由实时电压调节器闭环，不经过 RL。  
+load_shedding / pv_limit 已下沉至 strategy-engine 本地策略（不在 RL 动作空间）。  
+confidence 改为 ModelOutput 元数据（不在 RL 动作空间）。
 
 > **配置说明**：以上参数由 `config/mupc_env_config.yaml` 统一管理，修改配置文件即可调整动作空间范围，无需改动代码。
 
@@ -221,19 +227,26 @@ Q_batt 由实时电压调节器闭环，不经过 RL。
 
 - SOC 硬限制：10%~90%（不可突破）
 - 变压器容量：200 kVA，过载阈值 85%
-- 动作约束 ACT-01/03/05（Q/功率圆/pv_limit 由实时控制处理）
+- 动作约束 (v2.15): ACT-01 (Δp_ref ≤ 50kW/步) / ACT-02 (Δk_droop ≤ 10kW/V/步) / ACT-03 (p_ref ∈ [-50,50] kW) / ACT-04 (k_droop ∈ [0,30] kW/V) / ACT-07 (|p_ref| ≤ |dispatch_p|)
 
 ## 项目结构
 
 ```
 MUPC-AI2/
 ├── data_loader.py              # SMART-DS 数据加载 + 状态合成
-├── mupc_env.py               # Gymnasium 环境 (58/59维, 3维动作, Grid2Op集成)
+├── mupc_env.py               # 兼容重定向 (→ mupc_env/ 包)
+├── mupc_env/                 # Gymnasium 环境 (63/64维, 2维动作, Grid2Op集成, v2.15 模块化)
+│   ├── __init__.py           # 仅导出 MupcEnv
+│   ├── constants.py          # 物理常数 + 归一化边界 + 权重配置
+│   ├── voltage_sim.py        # VoltageSimulator (Grid2Op 优先, 自动降级)
+│   ├── observation.py        # EnvState + build_observation + normalize_obs
+│   ├── rewards.py            # 5 场景奖励 + 13 个 SCENE-01 子奖励
+│   └── core.py               # MupcEnv 主类
 ├── lstm_model.py             # LSTM 预测模型 / Oracle 后备
-├── train.py                  # PPO/SAC 训练主入口（统一入口）
-├── action_validator.py        # 动作约束 (ACT-01~05)
-├── export_onnx.py           # ONNX 导出
-├── _ppo_core.py             # 纯 NumPy PPO 后备
+├── train.py                  # SB3 PPO/SAC 主入口 (NumPy PPO 后备)
+├── action_validator.py        # 动作约束 (ACT-01/02/03/04 + ACT-07, v2.15 4+1 条)
+├── export_onnx.py           # ONNX 导出 (RL 策略 act_dim=2)
+├── _ppo_core.py             # 纯 NumPy PPO 后备 (v2.15 act_dim=2)
 ├── _gym_stub.py            # Gymnasium 桩模块
 ├── grid2op_env/ # Grid2Op电压仿真引擎（v2.3 新增）
 │   ├── __init__.py
@@ -249,9 +262,10 @@ MUPC-AI2/
 └── tensorboard_logs/ # 训练日志
 ```
 
-## 降级规则
+## 降级规则 (v2.17 SB3 主路径)
 
-- SB3 不可用 → `_ppo_core.py`（纯 NumPy PPO）
+- SB3 / Gymnasium / Torch 任一不可用 → `_ppo_core.py`（纯 NumPy PPO 后备）
+- `--algo-backend=numpy` 强制 NumPy PPO；`--algo-backend=sb3` 强制 SB3（不可用时 WARN 降级）
 - Gymnasium 不可用 → `_gym_stub.py`
 - LSTM 未提供 → Oracle（真实值 + 噪声）
 - Grid2Op不可用 → VoltageSimulator（简化电压模型）
@@ -270,6 +284,6 @@ Grid2Op 模式训练速度下降约 2~13 倍（相比 VoltageSimulator），但�
 ## 代码规范
 
 - 安全相关代码标注 `SAFETY`
-- 动作 clamp 标注约束规则 ID (ACT-01~05)
+- 动作 clamp 标注约束规则 ID (v2.15: ACT-01/02/03/04 + ACT-07)
 - 所有函数包含 Type Hints 和 Docstrings
-- `mupc_env.py` 不依赖 RL 框架，可独立运行
+- `mupc_env.py`/`mupc_env/` 不依赖 RL 框架，可独立运行

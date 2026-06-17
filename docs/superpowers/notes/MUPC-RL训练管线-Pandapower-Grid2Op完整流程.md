@@ -458,7 +458,7 @@ P_output = P_ref - k_droop × (V_actual - V_target)
            │
            ▼
    ┌─────────────────────┐
-   │ 1. 动作校验          │  ACT-01~05
+   │ 1. 动作校验          │  ACT-01/02/03/04 + ACT-07 (v2.15)
    │ 2. 单位转换          │  [-1,1] → [物理单位]
    │ 3. 有效负荷/光伏计算  │  p_load_eff, p_pv_eff
    │ 4. SOC 更新          │  硬限 [10%, 90%]
@@ -1057,7 +1057,7 @@ policy.learn(total_timesteps=1_000_000)
 | `mupc_env/rewards.py` | 奖励函数 (13 个子奖励) |
 | `mupc_env/constants.py` | 物理常数 |
 | `mupc_env/voltage_sim.py` | 降级仿真器 |
-| `action_validator.py` | 5 条动作约束 (ACT-01~05) |
+| `action_validator.py` | 动作约束 (v2.15: ACT-01/02/03/04 + ACT-07, 4+1 条) |
 | `grid2op_env/network.py` | 农网台区网络拓扑 |
 | `grid2op_env/power_flow.py` | Grid2Op + Pandapower 集成 (核心) |
 | `grid2op_env/numpy_chronics.py` | 时序数据注入器 |
