@@ -4,21 +4,42 @@ MUPC 观测构建与归一化模块 (提取自 mupc_env.py)
 包含:
 - EnvState: 环境状态数据载体
 - update_season_time_encoding(): 季节/时段编码
-- build_observation(): 构建 78/79 维观测向量 (v2.14 对齐下游)
+- build_observation(): 构建 78/79 维观测向量 (v2.17 对齐下游 v2.14)
 - normalize_obs(): MinMax 归一化
 
-观测维度构成 (78 维单模式, 79 维多模式, 对齐下游 v2.14 PRD 6.2):
-  D1  [0..9]   10 维 实时数据 (SOC/光伏/负荷/电网/变压器/电池/三相电压/q_margin)
-  D2  [10..39] 30 维 预测数据 (pv_forecast 15 + load_forecast 15)
-  D3  [40..44]  5 维 电价 (current/next/tariff_id/peak_price/valley_price, v2.14)
-  D4  [45..47]  3 维 需量 (current/contract/peak_demand_this_month)
-  D5  [48..49]  2 维 气象 (solar_irradiance/temperature)
-  D6  [50..51]  2 维 调度 (dispatch_p_set/dispatch_q_set, v2.14)
-  D7  [52]      1 维 q_realtime_margin
-  D8  [53..60]  8 维 季节时段 (season_encoding 6 + time_period_encoding 2)
-  D9  [61..64]  4 维 安全覆盖 (active/p_ref/consecutive/ratio)
-  D10 [65..81] 17 维 概率负荷预测 (quantiles 15 + shock_probability + base_load, v2.14)
-  [82]          1 维 mode_id (仅多模式训练, mode == 'all')
+观测维度构成 (78 维单模式, 79 维多模式, 对齐下游 v2.14 §3.6/§4.4):
+  D1  [0..8]    9 维 实时数据 (soc/pv/load/grid/transformer_load/battery_power/va/vb/vc)
+  D2  [9..23]  15 维 pv_forecast
+  D2  [24..38] 15 维 load_forecast
+  D3  [39..41]  3 维 电价 (current/next/tariff_id, peak/valley_price 不入向量)
+  D4  [42..44]  3 维 需量 (current/contract/peak_this_month)
+  D5  [45..46]  2 维 气象 (solar_irradiance/temperature)
+  D6  [47]      1 维 dispatch_p_set (dispatch_q_set 不入向量)
+  D7  [48]      1 维 q_realtime_margin
+  D8  [49..54]  6 维 season_encoding
+  D8  [55..56]  2 维 time_period_encoding (白天/夜间)
+  D9  [57..60]  4 维 safety_override (active/p_ref/consecutive/ratio)
+  D10 [61..75] 15 维 load_forecast_quantiles (P3.3~P96.7)
+  D10 [76]      1 维 shock_load_probability
+  D10 [77]      1 维 base_load (50% 分位数)
+  [78]          1 维 mode_id (仅 is_multi_mode=True)
+
+Python ↔ Rust FusedSystemState 字段映射表 (v2.17, ONNX 数组顺序一致):
+  Python (EnvState)          Rust (FusedSystemState)      观测索引
+  ────────────────────────   ─────────────────────────    ────────
+  load_rate                  transformer_load              [4]
+  va / vb / vc               voltage_phase_a / _b / _c     [6]/[7]/[8]
+  battery_power_prev         battery_power                 [5]
+  current_price              current_electricity_price     [39]
+  next_price                 next_period_price             [40]
+  tariff_id                  price_tariff_id               [41]
+  peak_demand                peak_demand_this_month        [44]
+  solar_irradiance           solar_irradiance              [45]
+  dispatch_p_set             dispatch_p_set                [47]
+  safety_override_active     safety_override_active        [57]
+  safety_override_p_ref      safety_override_p_ref         [58]
+  override_consecutive       safety_override_consecutive   [59]
+  override_ratio             safety_override_ratio         [60]
 """
 
 from dataclasses import dataclass
