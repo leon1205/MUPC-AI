@@ -190,21 +190,19 @@ def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
 
 def _compute_safety_override(active: bool, consecutive: int,
                              ratio: float) -> float:
-    """安全覆盖惩罚 (v2.14 D9 4 字段对齐下游 v2.15).
+    """安全覆盖惩罚 (v2.17 对齐下游 v2.14 safety_override_penalty_impl).
 
-    对齐下游 MUPC AI 引擎 PRD v2.15 Section 7.2:
-      - consecutive < 10: 样本不足, 统一常数惩罚 -50/15 (reason_code 已删)
-      - consecutive >= 10: 样本充足, 比例 + 连续次数惩罚, 归一化至 [-1, 0]
-        (-5·ratio - 10·(consecutive/10).clamp(0,1)) / 15
+    对齐下游 Rust reward_calculator.rs:
+      - consecutive < 10: 冷启动, -3.33 clamp 至 [-1, 0] → -1.0
+      - consecutive >= 10: (-5·ratio - 10·min(consecutive/10, 1)) / 15
+    返回值 ∈ [-1.0, 0.0] (已归一化, 无需调用方再除).
 
-    注: 下游 v2.15 PRD 7.2 公式仍按 reason 差异化 (-50/-30/-100/-20),
-    但 FusedSystemState v2.14 已删除 safety_override_reason_code 字段,
-    故本地采用统一常数 -50/15 替代. 见 docs/superpowers/notes/下游不一致待处理清单.md.
+    v2.17 修正: 冷启动值 clamp 至 -1.0 对齐下游 Rust .max(-1.0).
     """
     if not active:
         return 0.0
     if consecutive < 10:
-        return -50.0 / 15.0
+        return max(-50.0 / 15.0, -1.0)  # -3.333 clamp to -1.0 (对齐下游)
     else:
         consecutive_clamped = min(consecutive / 10.0, 1.0)
         return (-5.0 * ratio - 10.0 * consecutive_clamped) / 15.0
@@ -323,7 +321,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
 
     # 子项归一化到 [-1, 1]
     r_pv_norm = float(np.clip(r_pv, 0.0, 1.0))
-    p_batt_deg_norm = float(np.clip(-p_batt_deg / 0.25, -1.0, 0.0)) if p_batt_deg > 0 else 0.0
+    p_batt_deg_norm = float(np.clip(alpha * (-p_batt_deg / 0.25), -1.0, 0.0)) if p_batt_deg > 0 else 0.0
     p_overload_norm = float(np.clip(p_overload / 100.0, -1.0, 0.0)) if p_overload < 0 else 0.0
     r_pq_norm = float(np.clip(r_pq / 50.0, -1.0, 1.0))
     p_ramp_norm = float(np.clip(-p_ramp / 0.05, -1.0, 0.0)) if p_ramp > 0 else 0.0
@@ -332,7 +330,8 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     p_vs_norm = float(np.clip(-p_voltage / max_w6 / 0.4, -1.0, 0.0)) if p_voltage > 0 and max_w6 > 0 else 0.0
 
     r_smooth_norm = float(np.clip(r_smooth / 150.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
-    r_safety_norm = float(np.clip(r_safety / 100.0, -1.0, 0.0)) if r_safety < 0 else 0.0
+    # v2.17 修正: _compute_safety_override 已返回 [-1,0], 不再除 100
+    r_safety_norm = float(np.clip(r_safety, -1.0, 0.0)) if r_safety < 0 else 0.0
 
     # 加权求和 (v2.17: 9 项)
     total = (w[0] * r_pv_norm
