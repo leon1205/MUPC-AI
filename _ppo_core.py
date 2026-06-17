@@ -29,21 +29,19 @@ def _ortho_init(shape: tuple, scale: float = 1.0) -> np.ndarray:
 
 
 class MLPPolicy:
-    """2 层 MLP → actor(混合输出) + critic(1维)。
+    """2 层 MLP → actor(tanh) + critic(1维)。
 
     网络结构:
       Input(obs_dim) → Linear(128) → ReLU → Linear(128) → ReLU
-                        ├── actor:  Linear(act_dim) → [Tanh(:1), Sigmoid(1:)]
+                        ├── actor:  Linear(act_dim=2) → Tanh
                         └── critic: Linear(1)
 
-    dual_mode=False (标准模式):
-      3维动作: [p_batt(tanh), load_shedding(sigmoid), pv_limit(sigmoid)]
-    dual_mode=True (双参数模式):
-      5维动作: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
+    v2.15: 2维动作 [p_ref(tanh), k_droop(tanh)]
+    load_shedding/pv_limit 下沉至 strategy-engine.
     """
 
     def __init__(self, obs_dim: int = 58, hidden: list[int] | None = None,
-                 act_dim: int = 5):
+                 act_dim: int = 2):
         if hidden is None:
             hidden = [128, 128]
         self.obs_dim = obs_dim
@@ -81,17 +79,12 @@ class MLPPolicy:
         return x
 
     def forward(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """前向传播 → (action_mean, value)。5 维, 对齐下游 v2.13。"""
+        """前向传播 → (action_mean, value)。2 维, 对齐下游 v2.15。"""
         latent = self._forward_shared(obs)  # (batch, 128)
         action_mean = latent @ self.weights["actor_w"] + self.weights["actor_b"]
 
-        # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
-        a1 = np.tanh(action_mean[:, :1])        # p_ref: [-1, 1]
-        a2 = np.tanh(action_mean[:, 1:2])        # k_droop: [-1, 1]
-        a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))  # sigmoid
-        a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 3:4]))  # sigmoid
-        a5 = 1.0 / (1.0 + np.exp(-action_mean[:, 4:5]))  # sigmoid
-        action = np.concatenate([a1, a2, a3, a4, a5], axis=-1)
+        # 2 维: [p_ref(tanh), k_droop(tanh)]
+        action = np.tanh(action_mean)
 
         value = latent @ self.weights["critic_w"] + self.weights["critic_b"]
         return action, value.ravel()
@@ -112,26 +105,16 @@ class MLPPolicy:
         else:
             a_raw = action_mean + np.random.randn(self.act_dim) * std
 
-        # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
-        a1 = np.tanh(a_raw[:1])
-        a2 = np.tanh(a_raw[1:2])
-        a3 = 1.0 / (1.0 + np.exp(-a_raw[2:3]))
-        a4 = 1.0 / (1.0 + np.exp(-a_raw[3:4]))
-        a5 = 1.0 / (1.0 + np.exp(-a_raw[4:5]))
-        action = np.concatenate([a1, a2, a3, a4, a5])
-        # log_prob Jacobian for 5 dims
-        action_2d = action.reshape(1, -1)
+        # 2 维: [p_ref(tanh), k_droop(tanh)], v2.15 全 tanh
+        action = np.tanh(a_raw)
+        # log_prob Jacobian: tanh 的 log|det| = log(1 - tanh²(z))
         eps = 1e-7
-        log_jac = (np.log(eps + 1.0 - action_2d[:, :1] ** 2).ravel() +
-                   np.log(eps + 1.0 - action_2d[:, 1:2] ** 2).ravel() +
-                   np.log(eps + action_2d[:, 2:3]) + np.log(eps + 1.0 - action_2d[:, 2:3]) +
-                   np.log(eps + action_2d[:, 3:4]) + np.log(eps + 1.0 - action_2d[:, 3:4]) +
-                   np.log(eps + action_2d[:, 4:5]) + np.log(eps + 1.0 - action_2d[:, 4:5]))
+        log_jac = np.log(eps + 1.0 - action ** 2).sum()
 
         # Gaussian log_prob + Jacobian correction
         sigma2 = std ** 2
         log_gauss = -0.5 * np.sum((a_raw - action_mean) ** 2 / sigma2 + np.log(2 * np.pi * sigma2))
-        log_prob = float(np.clip(log_gauss + log_jac.sum(), -20.0, 20.0))
+        log_prob = float(np.clip(log_gauss + log_jac, -20.0, 20.0))
 
         value = float((latent @ self.weights["critic_w"] + self.weights["critic_b"]).ravel()[0])
         return action, value, log_prob
@@ -357,13 +340,8 @@ class NumPyPPO:
         latent = self.policy._forward_shared(obs)
         action_mean = latent @ self.policy.weights["actor_w"] + self.policy.weights["actor_b"]
 
-        # 5 维: [p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid), confidence(sigmoid)]
-        a1 = np.tanh(action_mean[:, :1])        # p_ref
-        a2 = np.tanh(action_mean[:, 1:2])        # k_droop
-        a3 = 1.0 / (1.0 + np.exp(-action_mean[:, 2:3]))  # load_shedding
-        a4 = 1.0 / (1.0 + np.exp(-action_mean[:, 3:4]))  # pv_limit
-        a5 = 1.0 / (1.0 + np.exp(-action_mean[:, 4:5]))  # confidence
-        new_actions = np.concatenate([a1, a2, a3, a4, a5], axis=-1)
+        # 2 维 (v2.15): [p_ref(tanh), k_droop(tanh)]
+        new_actions = np.tanh(action_mean)
 
         new_values = (latent @ self.policy.weights["critic_w"]
                       + self.policy.weights["critic_b"]).ravel()
@@ -398,18 +376,9 @@ class NumPyPPO:
         std = np.exp(self.policy.log_std[:old_actions.shape[1]])  # only env dimensions
         sigma2 = std ** 2
 
-        # Invert activation to get old pre-activation action (5 维)
-        a_raw_old = np.zeros_like(old_actions)
+        # Invert activation to get old pre-activation action (2 维, v2.15 全 tanh)
         eps = 0.999999
-        # a1,a2=tanh → atanh, a3,a4,a5=sigmoid → logit
-        a_raw_old[:, :1] = np.arctanh(np.clip(old_actions[:, :1], -eps, eps))
-        a_raw_old[:, 1:2] = np.arctanh(np.clip(old_actions[:, 1:2], -eps, eps))
-        a_raw_old[:, 2:3] = np.log(np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7) /
-                                    (1.0 - np.clip(old_actions[:, 2:3], 1e-7, 1-1e-7)))
-        a_raw_old[:, 3:4] = np.log(np.clip(old_actions[:, 3:4], 1e-7, 1-1e-7) /
-                                    (1.0 - np.clip(old_actions[:, 3:4], 1e-7, 1-1e-7)))
-        a_raw_old[:, 4:5] = np.log(np.clip(old_actions[:, 4:5], 1e-7, 1-1e-7) /
-                                    (1.0 - np.clip(old_actions[:, 4:5], 1e-7, 1-1e-7)))
+        a_raw_old = np.arctanh(np.clip(old_actions, -eps, eps))
 
         # Gradient of log_prob w.r.t. action_mean = (a_raw - μ) / σ²
         dL_dmu = ratio.reshape(-1, 1) * advantages.reshape(-1, 1) * (a_raw_old - action_mean[:, :old_actions.shape[1]]) / sigma2

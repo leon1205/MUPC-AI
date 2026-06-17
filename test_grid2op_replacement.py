@@ -123,45 +123,43 @@ def ut_03_action_constraint():
         env = MupcEnv(data, mode="MODE-01", use_grid2op=False)  # 降级模式，避免 Grid2Op 依赖
         env.reset()
 
-        violations_found = {"ACT-01": False, "ACT-03": False, "ACT-05": False}
+        violations_found = {"ACT-01": False, "ACT-03": False, "ACT-04": False, "ACT-07": False}
 
-        # ── ACT-01 测试：Δp_batt > 50kW/步 ──
+        # ── ACT-01 测试：Δp_ref > 50kW/步 ──
+        # prev_p_ref=-50kW, 新p_ref=+50kW → Δ=100 > 50 → 触发
         env2 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env2.reset()
-        # 先让 prev_p_batt = 0，然后给一个大动作 Δp = 400kW > 50kW
-        env2._validator.prev_p_batt = 0.0
-        action = np.array([0.8, 0.0, 0.5])  # p_batt=40kW(校准后), load_shed=0, pv_limit=0.5
-        # 注: 现在 P_BATT_MAX=50kW (校准后), action=0.8 → 40kW, 仍 > 50 不成立, 改用 1.0+prev
-        _, violated, violations = env2._validator.validate(action, dispatch_p=None, q_batt_real=0.0)
+        env2._validator.prev_p_ref = -50.0
+        action = np.array([0.3, 0.0])  # p_ref=15kW, Δ=|15-(-50)|=65 > 50 → ACT-01
+        _, violated, violations = env2._validator.validate(action, dispatch_p=None)
         if violated and "ACT-01" in violations:
             violations_found["ACT-01"] = True
         _record("UT-03 [ACT-01 ΔP>50kW]", violations_found["ACT-01"],
-                "" if violations_found["ACT-01"] else "ACT-01 not triggered")
+                f"violated={violated}, violations={list(violations.keys())}" if not violations_found["ACT-01"] else "")
 
-        # ── ACT-03 测试：功率圆超限 sqrt(p²+q²) > S_MAX ──
-        # 绕过 ACT-01: prev_p_batt 设为 40kW（与 action 相同，Δp=0）
-        # p=40kW, q=200kVar → s=sqrt(40²+200²)=203, S_MAX=200kVA → 触发 ACT-03
+        # ── ACT-03 测试：p_ref 越界 (超出 ±50kW) ──
+        # p_ref=120%→60kW > 50kW → 触发 ACT-03
         env3 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env3.reset()
-        env3._validator.prev_p_batt = 40.0  # 绕过 ACT-01
-        action = np.array([0.8, 0.0, 0.5])  # p=40kW
-        _, violated, violations = env3._validator.validate(action, dispatch_p=None, q_batt_real=200.0)
+        # 旁路 ACT-01: prev_p_ref=50 → Δp=10 < 50
+        env3._validator.prev_p_ref = 50.0
+        action = np.array([1.2, -1.0])  # p_ref=60kW(旁路ACT-01), k_droop=0
+        _, violated, violations = env3._validator.validate(action, dispatch_p=None)
         if violated and "ACT-03" in violations:
             violations_found["ACT-03"] = True
-        _record("UT-03 [ACT-03 功率圆]", violations_found["ACT-03"],
+        _record("UT-03 [ACT-03 p_ref越界]", violations_found["ACT-03"],
                 f"violated={violated}, violations={list(violations.keys())}")
 
-        # ── ACT-05 测试：|p_batt| > |dispatch_p| ──
-        # 绕过 ACT-01: prev_p_batt=30kW 与 action 相同，Δp=0
-        # dispatch_p=10kW, |p|=30>10 → 触发 ACT-05
+        # ── ACT-01 增强测试：Δp_ref > 50kW ──
+        # prev_p_ref=0, 新p_ref=40kW → Δp=40<50 不触发, 但p_ref=90kW → ACT-03
         env4 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env4.reset()
-        env4._validator.prev_p_batt = 30.0  # 绕过 ACT-01
-        action = np.array([0.6, 0.0, 0.5])  # p=30kW
-        _, violated, violations = env4._validator.validate(action, dispatch_p=10.0, q_batt_real=10.0)
-        if violated and "ACT-05" in violations:
-            violations_found["ACT-05"] = True
-        _record("UT-03 [ACT-05 调度约束]", violations_found["ACT-05"],
+        env4._validator.prev_p_ref = 0.0
+        action = np.array([0.8, 0.0])  # p_ref=40kW
+        _, violated, violations = env4._validator.validate(action, dispatch_p=10.0)
+        if violated and "ACT-07" in violations:
+            violations_found["ACT-07"] = True
+        _record("UT-03 [ACT-07 调度约束]", violations_found["ACT-07"],
                 f"violated={violated}, violations={list(violations.keys())}")
 
     except Exception as e:
@@ -226,7 +224,7 @@ def ut_05_soc_sync():
         # 动作 [0.2, 0] = p_batt=100kW 充电
         for i in range(100):
             # 5D action: [p_ref, k_droop, load_shed, pv_limit, confidence]
-            action = np.array([0.2, 0.0, 0.0, 0.5, 0.5])  # 固定充电 10kW
+            action = np.array([0.2, 0.0])  # 2D: [p_ref=10kW, k_droop=0]
             _, _, _, _, info = env.step(action)
             soc_values.append(info["soc"])
 
@@ -269,7 +267,7 @@ def ut_06_reward_consistency():
         for i in range(20):
             # 固定动作保证可重复性
             np.random.seed(i)  # 用于 VoltageSimulator 的随机噪声
-            action = np.array([0.1, 0.1, 0.1, 0.5, 0.5])  # 5D: [p_ref, k_droop, load_shed, pv_limit, confidence]
+            action = np.array([0.1, 0.1])  # 2D: [p_ref=5kW, k_droop=15 KW/V]
             _, reward, _, _, _ = env.step(action)
             rewards.append(reward)
 
@@ -426,7 +424,7 @@ def it_03_onnx_export():
                 def forward(self, x):
                     return self.net(x)
 
-            act_dim = 3  # v2.14: [p_batt, load_shed, pv_limit]
+            act_dim = 2  # v2.15: [p_ref, k_droop]
             model = SimpleActor(obs_dim, act_dim)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -484,15 +482,15 @@ def test_grid2op_fallback():
         # 显式 use_grid2op=False 应该使用 VoltageSimulator
         env_no_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env_no_grid2op.reset()
-        # 5D action: [p_ref, k_droop, load_shed, pv_limit, confidence]
-        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0, 0.0, 1.0, 0.5]))
+        # 2D action: [p_ref, k_droop]
+        _, _, _, _, info = env_no_grid2op.step(np.array([0.0, 0.0]))
         _record("降级模式 [VoltageSimulator 正常]", True,
                 f"va={info['va']:.3f}, vb={info['vb']:.3f}, vc={info['vc']:.3f}")
 
         # 显式 use_grid2op=True 时，Grid2Op 不可用应自动降级
         env_with_grid2op = MupcEnv(data, mode="MODE-01", use_grid2op=True)
         env_with_grid2op.reset()
-        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0, 0.0, 1.0, 0.5]))
+        _, _, _, _, info2 = env_with_grid2op.step(np.array([0.0, 0.0]))
         _record("降级模式 [Grid2Op不可用自动降级]", True,
                 f"va={info2['va']:.3f}, vb={info2['vb']:.3f}, vc={info2['vc']:.3f}")
 

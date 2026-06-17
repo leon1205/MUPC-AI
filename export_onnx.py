@@ -41,11 +41,10 @@ def _ensure_export_deps():
 
 def _build_rl_export_model(obs_dim: int = 58,
                            hidden: list[int] | None = None):
-    """构建仅用于 ONNX 导出的策略网络壳 (4 维动作, 对齐下游部署)。
+    """构建仅用于 ONNX 导出的策略网络壳 (2 维动作, 对齐下游 v2.15)。
 
-    训练环境使用 5 维动作空间 (含 confidence), 但 ONNX 导出仅包含
-    实际参与控制分发的 4 维动作 (p_ref, k_droop, load_shedding, pv_limit)。
-    confidence 仅用于置信度展示, 不参与控制分发, 因此不导出。
+    下游 MUPC AI 引擎 PRD v2.15: 动作空间精简为 2 维 [p_ref, k_droop]。
+    load_shedding/pv_limit 下沉至 strategy-engine，confidence 移至 ModelOutput。
 
     Args:
         obs_dim: 观测维度 (default 58, 兼容旧 checkpoint)
@@ -57,7 +56,7 @@ def _build_rl_export_model(obs_dim: int = 58,
     if hidden is None:
         hidden = [128, 128]
 
-    act_dim = 4  # 部署动作空间: [p_ref, k_droop, load_shedding, pv_limit]
+    act_dim = 2  # v2.15 部署动作空间: [p_ref(tanh), k_droop(tanh)]
 
     class RLExportModelWithNorm(nn.Module):
         def __init__(self):
@@ -92,12 +91,8 @@ def _build_rl_export_model(obs_dim: int = 58,
             x_norm = self._normalize(x)
             latent = self.shared(x_norm)
             action = self.actor(latent)
-            # 4 维: p_ref(tanh), k_droop(tanh), load_shedding(sigmoid), pv_limit(sigmoid)
-            a1 = torch.tanh(action[:, :1])      # p_ref: [-1, 1]
-            a2 = torch.tanh(action[:, 1:2])     # k_droop: [-1, 1]
-            a3 = torch.sigmoid(action[:, 2:3])  # load_shedding: [0, 1]
-            a4 = torch.sigmoid(action[:, 3:4])  # pv_limit: [0, 1]
-            return torch.cat([a1, a2, a3, a4], dim=-1)
+            # 2 维 (v2.15): [p_ref(tanh), k_droop(tanh)]
+            return torch.tanh(action)
 
     return RLExportModelWithNorm()
 
@@ -393,7 +388,7 @@ def main():
     parser.add_argument("--to-rknn", action="store_true",
                         help="同时导出 RKNN (需要 rknn-toolkit2)")
     parser.add_argument("--dual-mode", action="store_true",
-                        help="启用双参数下垂模式（5维训练空间，4维导出）")
+                        help="启用双参数下垂模式（2维训练空间，2维导出，v2.15）")
     args = parser.parse_args()
 
     try:

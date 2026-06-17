@@ -1,5 +1,5 @@
 """
-MUPC 全状态 RL 环境主类 (v2.14 分层控制架构).
+MUPC 全状态 RL 环境主类 (v2.15 分层控制架构).
 
 使用模块化架构:
 - constants.py: 物理常数 + 归一化边界 + 权重映射
@@ -7,7 +7,8 @@ MUPC 全状态 RL 环境主类 (v2.14 分层控制架构).
 - observation.py: 观测构建 + 归一化 + 季节编码
 - rewards.py: 奖励调度器 + 5 场景奖励函数
 
-动作空间 3 维: [p_batt, load_shedding, pv_limit]
+动作空间 2 维 (v2.15): [p_ref, k_droop]
+load_shedding/pv_limit 下沉至 strategy-engine, confidence 移至 ModelOutput 元数据。
 Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
 观测空间: Box(63,) 单模式 或 Box(64,) 多模式
 """
@@ -36,9 +37,10 @@ from .voltage_sim import VoltageSimulator
 
 
 class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
-    """MUPC 全状态 RL 环境 (v2.14 分层控制架构).
+    """MUPC 全状态 RL 环境 (v2.15 分层控制架构).
 
-    动作空间 3 维: [p_batt, load_shedding, pv_limit]
+    动作空间 2 维: [p_ref, k_droop]
+    load_shedding/pv_limit 下沉至 strategy-engine.
     Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
     观测空间: Box(63,) 或 Box(64,) (多模式)
     """
@@ -94,33 +96,31 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
 
-        # v2.13: 统一 5 维动作空间 [p_ref, k_droop, load_shedding, pv_limit, confidence]
-        # 对齐下游 MUPC AI 引擎 PRD v2.13 Section 6.3
+        # v2.15: 2 维动作空间 [p_ref, k_droop]
+        # 对齐下游 MUPC AI 引擎 PRD v2.15 Section 6.3
+        # load_shedding/pv_limit 下沉至 strategy-engine, confidence 移至 ModelOutput 元数据
         k_droop_min = constants.K_DROOP_MIN
         k_droop_max = constants.K_DROOP_MAX
         delta_p_max = constants.P_REF_RAMP_LIMIT_KW
         delta_k_max = constants.K_DROOP_RAMP_LIMIT
-        pv_limit_min = 0.0
         if config is not None:
             try:
                 k_droop_min = config.dual_control.k_droop_min
                 k_droop_max = config.dual_control.k_droop_max
                 delta_p_max = config.dual_control.p_ref_ramp_limit_kw
                 delta_k_max = config.dual_control.k_droop_ramp_limit
-                pv_limit_min = config.dual_control.pv_limit_min
             except Exception:
                 pass
         self._validator = ActionValidator(
             p_batt_max=constants.P_BATT_MAX_KW,
             k_droop_min=k_droop_min,
             k_droop_max=k_droop_max,
-            load_shed_max=constants.LOAD_SHED_MAX_KW,
             delta_p_max=delta_p_max,
             delta_k_droop_max=delta_k_max,
-            pv_limit_min=pv_limit_min,
         )
-        low_act = np.array([-1.0, -1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        high_act = np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        # 2D 全 tanh: [p_ref ∈ [-1,1], k_droop ∈ [-1,1]]
+        low_act = np.array([-1.0, -1.0], dtype=np.float32)
+        high_act = np.array([1.0, 1.0], dtype=np.float32)
         self.action_space = Box(low_act, high_act, dtype=np.float32)
 
         # ── 内部状态 ──
@@ -395,7 +395,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 季节时段编码
         self._update_season_time_encoding()
 
-        # 2. 动作约束校验 (5维统一, ACT-01~07)
+        # 2. 动作约束校验 (2维, ACT-01/02/04, v2.15)
+        # load_shedding/pv_limit 下沉至 strategy-engine, confidence 移至 ModelOutput
         dispatch_p = self._data["dispatch_p_set"][self._step_idx]
         dispatch_p_use = float(dispatch_p) if abs(dispatch_p) >= 1e-6 else None
 
@@ -405,12 +406,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         k_droop = float(clamped[1] * (constants.K_DROOP_MAX -
                                        constants.K_DROOP_MIN) / 2.0 +
                         (constants.K_DROOP_MAX + constants.K_DROOP_MIN) / 2.0)
-        load_shed = float(clamped[2] * constants.LOAD_SHED_MAX_KW)
-        pv_limit = float(clamped[3])
-        confidence = float(clamped[4])
+        # v2.15: 以下 3 维下沉至策略引擎, 训练中固定为默认值
+        load_shed = 0.0       # 策略引擎需量控制
+        pv_limit = 1.0         # 策略引擎防逆流
+        confidence = 0.5        # ModelOutput 元数据
         p_batt = p_ref
 
-        # 3. 有效负荷与光伏
+        # 3. 有效负荷与光伏 (load_shed=0, pv_limit=1.0 — 下沉维度)
         p_load_raw = float(self._data["load_power"][self._step_idx])
         p_load_eff = max(0.0, p_load_raw - load_shed)
         p_pv_raw = float(self._data["pv_power"][self._step_idx])

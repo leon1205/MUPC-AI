@@ -294,11 +294,13 @@ class Grid2OpPowerFlow:
         # 实际物理上, k_droop 通常较小 (e.g. 1-10 kW/V)
         # P_storage_final (MW) 限制在 ±P_BATT_MAX (防止越界)
         if k_droop != 0.0:
-            dv = v_actual - 1.0  # 电压偏差 p.u.
-            # ΔV 实际电压差: dv * V_base (V_base = 0.4 kV, 即 400V)
-            # k_droop (kW/V) × dv × 400V = droop 调整 (kW)
-            # 转换为 MW 后加入 storage_p_mw
-            droop_adjustment_kw = k_droop * dv * 0.4 * 1000.0  # kW
+            # 标准下垂公式: P_output = P_ref - k_droop × (V_actual - V_target)
+            # 物理意义: 电压低 → 偏差负 → 减负负得正 → 增发功率抬升电压
+            dv = v_actual - 1.0  # 电压偏差 p.u. (V_actual < 1.0 时为负)
+            # ΔV 实际电压差 (V): dv * V_base (V_base = 0.4 kV, 即 400V)
+            # k_droop (kW/V) × (-dv) × 400V = droop 调整 (kW)
+            # 低电压时 dv<0 → -dv>0 → 调整正值 (增发)
+            droop_adjustment_kw = -k_droop * dv * 0.4 * 1000.0  # kW
             droop_adjustment_mw = droop_adjustment_kw / 1000.0  # MW
             storage_p_mw = storage_p_mw + droop_adjustment_mw
             # 限制在电池物理约束内
