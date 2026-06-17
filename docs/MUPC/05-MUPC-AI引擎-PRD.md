@@ -1397,7 +1397,7 @@ rollback_checkpoints = 1      # 回滚检查点数量
 | T-01 | 状态空间维度描述错误 | PRD 历史版本标题写 59 维，实际应为 78 维 | **高** | ✅ 已修复（v2.14 统一版全部修正） |
 | T-02 | R-04 变压器过载分段惩罚 | 分段函数：安全区(0~75%) / 线性(75~90%) / 指数(90~100%) / 硬惩罚(>100%) | 中 | ✅ 已实现（`overload_penalty_piecewise`） |
 | T-03 | R-05 电压斜率动态权重 | w6(v) = base_w6 × (1.0 + k × \|ΔV\|) | 中 | ✅ 已实现（`dynamic_voltage_slope_weight`） |
-| T-04 | R-06 冲击负荷响应奖励 | R_shock = w × load_shedding / max - λ × response_time / max_response（v2.15：load_shedding 由策略引擎执行，AI 引擎从观测获取该值计算奖励）| 中 | ⚠️ 未实现（仅有注释掉的测试桩） |
+| T-04 | R-06 冲击负荷响应奖励 | v2.13 重构为冲击负荷**预备度奖励**：`R_readiness = w1×(SOC预留-SOC) + w2×(P预留-\|p_ref\|)`，当 P90-P50 > threshold 时触发。替代 v2.12 原始 `response_time` 设计（专家建议 §2.5：1Hz RL 无法感知 ms 级冲击）| 中 | ✅ 已实现（`shock_readiness_reward` + `calc_shock_readiness_reward`） |
 | T-05 | R-07 P-Q 阈值可配置化 | Q_THRESHOLD / P_THRESHOLD 从硬编码改为配置文件读取 | 中 | ✅ 已实现（`PqCoordinationThresholds` + Default） |
 | T-06 | 在线微调 Phase 3C.2 | 原为占位框架，现已完整实现影子模型验证+渐进式切换 | 中 | ✅ 已实现（`SafeOnlineUpdater::safe_update`） |
 | T-07 | v2.0 前 SceneClassifier | 已废弃，替换为 ModeSelector | 低 | ✅ 已关闭 |
