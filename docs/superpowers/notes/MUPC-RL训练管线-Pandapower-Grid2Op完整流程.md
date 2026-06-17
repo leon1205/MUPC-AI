@@ -43,7 +43,7 @@
 AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 ```
 
-**核心问题**：AI 给出一个动作（5 个数），仿真器如何把这些数变成"电压/电流/功率"的真实物理变化？
+**核心问题**：AI 给出一个动作（2 个数），仿真器如何把这些数变成"电压/电流/功率"的真实物理变化？
 
 这就是 Pandapower + Grid2Op 要回答的问题。
 
@@ -54,9 +54,9 @@ AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 ```
 ┌─────────────────────────────────────────────────────────┐
 │            你训练的 AI 控制器 (RL Policy)                 │
-│            输入: 63 维观测  →  输出: 5 维动作             │
+│            输入: 63 维观测  →  输出: 2 维动作             │
 └───────────────────────┬─────────────────────────────────┘
-                        │ 5D 动作
+                        │ 2D 动作
                         ↓
 ┌─────────────────────────────────────────────────────────┐
 │  Grid2Op  (Python 库, 电网仿真框架)                       │
@@ -148,7 +148,7 @@ $$
 
 ## 4. 单步训练的完整旅程（核心）
 
-下面以"AI 给出一个 5 维动作"开始，逐步追踪到"返回新观测"的全过程。
+下面以"AI 给出一个 2 维动作"开始，逐步追踪到"返回新观测"的全过程。
 
 ### 4.1 第 1 步：AI 看到的世界 (观测)
 
@@ -178,51 +178,52 @@ obs, info = env.reset()
 - [58..61] D9: SafetyOverride (4 维)
 - (可选) [62] mode_id: 仅多模式训练
 
-### 4.2 第 2 步：AI 输出动作 (5 维)
+### 4.2 第 2 步：AI 输出动作 (2 维, v2.15)
 
 ```python
 action = model(obs)  # AI 网络前向推理
-# action = [p_ref=0.5, k_droop=0.0, load_shed=0.0, pv_limit=1.0, confidence=0.8]
+# action = [p_ref=0.5, k_droop=-0.3]
 ```
 
-5 个数的物理含义：
+2 个数的物理含义 (v2.15 精简, load_shedding/pv_limit 下沉至 strategy-engine):
 
 | 维度 | 范围 | 物理含义 | 物理单位 |
 |------|------|----------|----------|
 | `p_ref` | [-1, 1] | 电池有功基准 (负=充电, 正=放电) | 映射为 ±50kW |
 | `k_droop` | [-1, 1] | 下垂系数 (电压响应增益) | 映射为 [0, 30] kW/V |
-| `load_shed` | [0, 1] | 切负荷量 | 映射为 [0, 60] kW |
-| `pv_limit` | [0, 1] | 光伏限发比例 (1=不限, 0=全弃) | 无量纲 |
-| `confidence` | [0, 1] | AI 自信度 (仅展示用, 不影响物理) | 无量纲 |
+
+> **v2.15 精简说明**: load_shedding (切负荷) 和 pv_limit (光伏限发) 已不再由 AI 引擎输出, 改为 strategy-engine 本地策略独立执行。confidence (决策置信度) 改为 ModelOutput 元数据, 不参与 AI 决策。
 
 ### 4.3 第 3 步：MupcEnv 解析动作并执行 step()
 
 **入口**：`mupc_env/core.py` 中的 `step()` 方法
 
 ```python
-# === 步骤 3.1: 动作校验 (5 个动作必须合法) ===
+# === 步骤 3.1: 动作校验 (2 个动作必须合法, ACT-01~04, 07) ===
 clamped, violated, violations = self._validator.validate(action, dispatch_p)
-# 校验: p_batt 不能跳变 >50kW (ACT-01)
-# 校验: 功率圆 sqrt(p²+q²) ≤ 200kVA (ACT-03)
-# 校验: |p_batt| ≤ |dispatch_p| (ACT-05)
-# 等等... 5 条规则 (ACT-01~05)
-# 不合法 → clipped (削峰填谷)
+# 校验: p_ref 不能跳变 >50kW (ACT-01)
+# 校验: k_droop 不能跳变 >10 kW/V (ACT-02)
+# 校验: p_ref ∈ [-50, +50] kW (ACT-03)
+# 校验: k_droop ∈ [0, 30] kW/V (ACT-04)
+# 校验: |p_ref| ≤ |dispatch_p| (ACT-07)
+# 不合法 → clamped (削峰填谷)
 # 仍不合法 → violated=True, 写入 info
 ```
 
 ```python
-# === 步骤 3.2: 5 个变量映射到物理单位 ===
+# === 步骤 3.2: 2 个变量映射到物理单位 ===
 p_ref     = clamped[0] * 50.0    # [-50, +50] kW
-k_droop   = clamped[1] * 15.0     # [0, 30] kW/V
-load_shed = clamped[2] * 60.0     # [0, 60] kW
-pv_limit  = clamped[3]            # [0, 1]
-confidence= clamped[4]            # [0, 1]
+k_droop   = clamped[1] * 15.0 + 15.0  # [0, 30] kW/V
+# v2.15: 以下 3 维下沉至 strategy-engine, 训练中固定为默认值
+load_shed = 0.0       # strategy-engine 需量控制
+pv_limit  = 1.0        # strategy-engine 防逆流
+confidence = 0.5        # ModelOutput 元数据
 ```
 
 ```python
-# === 步骤 3.3: 计算有效负荷/光伏 ===
-p_load_eff = max(0, p_load_raw - load_shed)  # 切负荷后的真实负荷
-p_pv_eff = p_pv_raw * pv_limit              # 限发后的真实光伏
+# === 步骤 3.3: 计算有效负荷/光伏 (下沉维度默认值) ===
+p_load_eff = max(0, p_load_raw - load_shed)  # = p_load_raw (load_shed=0)
+p_pv_eff = p_pv_raw * pv_limit              # = p_pv_raw (pv_limit=1.0)
 ```
 
 ```python
@@ -434,15 +435,16 @@ P_output = P_ref - k_droop × (V_actual - V_target)
 - RL 模型需要看到三相信息才能学习精细控制
 - 仿真器提供 (va, vb, vc) 三维输出
 
-### 5.6 5 维动作 vs 4 维 ONNX 导出
+### 5.6 2 维动作空间 (v2.15)
 
-**训练时** (5 维): `[p_ref, k_droop, load_shed, pv_limit, confidence]`
-- confidence 仅用于显示, 训练时不参与仿真
+**训练时 (2 维)**: `[p_ref, k_droop]`
+- 对齐下游 MUPC AI 引擎 PRD v2.15
+- load_shedding/pv_limit 下沉至 strategy-engine
+- confidence 移至 ModelOutput 元数据
 
-**部署时** (4 维): `[p_ref, k_droop, load_shed, pv_limit]`
-- 去除 confidence, 因为它不参与控制分发
-- 训练环境 action_space 仍为 5D (兼容 v2.13 训练接口)
-- ONNX 导出 4 维动作, 对齐实际控制分发接口
+**部署时 (2 维)**: `[p_ref, k_droop]`
+- ONNX 导出 2 维动作, 全 tanh 输出
+- 训练与部署接口完全一致, 消除训练-部署 gap
 
 ---
 
@@ -451,7 +453,7 @@ P_output = P_ref - k_droop × (V_actual - V_target)
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  MupcEnv.step(action)                                         │
-│  action = [p_ref, k_droop, load_shed, pv_limit, confidence]   │
+│  action = [p_ref, k_droop]                                    │
 └──────────┬──────────────────────────────────────────────────┘
            │
            ▼
@@ -534,10 +536,8 @@ P_output = P_ref - k_droop × (V_actual - V_target)
 
 **AI 决策** (看到电压低):
 - `p_ref=0.6` (意图放电 30kW)
-- `k_droop=1.0` (中等下垂)
-- `load_shed=0.0` (不切负荷)
-- `pv_limit=1.0` (光伏不限)
-- `confidence=0.7`
+- `k_droop=-0.33` (中等下垂, 对应 5 kW/V)
+- v2.15 下沉维度: load_shed=0 (strategy-engine), pv_limit=1.0 (strategy-engine)
 
 **Grid2Op 执行**:
 
@@ -602,7 +602,7 @@ for episode in range(1000):
 
 ## 8.5 PPO 算法如何用这些奖励训练 AI
 
-前面介绍了"AI 看到 63 维 → 选 5 维动作 → 拿到奖励"的流程, 但**奖励是如何反传回 AI 网络, 让它越变越聪明的**? 这一节回答这个问题。
+前面介绍了"AI 看到 63 维 → 选 2 维动作 → 拿到奖励"的流程, 但**奖励是如何反传回 AI 网络, 让它越变越聪明的**? 这一节回答这个问题。
 
 ### 8.5.1 核心思想: 用"惊喜度"更新网络
 
@@ -978,7 +978,7 @@ policy.learn(total_timesteps=1_000_000)
 | **物理保真** | Newton-Raphson 是工程标准, 能精确捕捉 P-U-Q 关系 |
 | **速度快** | Pandapower 用稀疏矩阵 + Newton 迭代, ~7ms/step |
 | **可降级** | 如果 grid2op 不可用, 自动降级到 VoltageSimulator |
-| **5D 完整** | 4 维动作 (p_ref, k_droop, load_shed, pv_limit) 都进入仿真, confidence 仅展示 |
+| **2D 精简** | p_ref + k_droop 进入仿真, load_shedding/pv_limit 下沉至 strategy-engine |
 | **训练-部署一致** | ONNX 导出的 4 维动作与执行器预期完全对齐 |
 
 ### 9.2 与其他方案对比
@@ -1015,9 +1015,9 @@ policy.learn(total_timesteps=1_000_000)
 
 **答**: 模拟同步发电机的"自我调节"特性。当电网频率/电压下降时, 发电机自动多发电, 维持系统稳定。在我们的场景中, 当末端电压低时, 电池多放电, 抬升电压。
 
-#### Q3: 为什么 confidence 不参与物理?
+#### Q3: 为什么 load_shedding 和 pv_limit 不由 AI 输出?
 
-**答**: PRD v2.13 §6.7 规定 confidence 仅用于显示, 不参与控制分发。训练时把它放在 5 维中, 是为了对齐下游 AI 引擎的接口。ONNX 导出时去除, 保持 4 维。
+**答**: v2.15 起 load_shedding (切负荷) 和 pv_limit (光伏限发) 下沉至 strategy-engine (本地策略引擎)。AI 引擎专注于核心 P-Q 协同控制 (p_ref + k_droop)。这避免了 AI 与本地策略的冲突, 也简化了动作空间。
 
 #### Q4: 训练完的 AI 如何部署到 RK3588?
 
@@ -1092,7 +1092,7 @@ policy.learn(total_timesteps=1_000_000)
 
 整个流程可以一句话概括:
 
-**AI 给 5 个数 → MupcEnv 解释为物理量 → Grid2Op 推进时间+注入数据 → Pandapower 跑真实潮流计算 → 返回新电压 → AI 拿奖励继续学习。**
+**AI 给 2 个数 → MupcEnv 解释为物理量 → Grid2Op 推进时间+注入数据 → Pandapower 跑真实潮流计算 → 返回新电压 → AI 拿奖励继续学习。**
 
 经过数百万次这样的循环, AI 学会了如何最优地控制农网台区, 最终导出 ONNX 模型, 部署到 RK3588 的真实硬件上。
 
