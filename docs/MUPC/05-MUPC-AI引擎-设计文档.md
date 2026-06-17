@@ -475,7 +475,7 @@ pub struct DispatchAdapter {
 /// 融合系统状态（v2.14：10 大类，78 维输入向量）
 #[derive(Debug, Clone)]
 pub struct FusedSystemState {
-    // ------- D1: 实时数据 (10 个 RL 字段，v2.5 新增 q_realtime_margin) -------
+    // ------- D1: 实时数据 (9 个 RL 字段，q_realtime_margin 已移至 D7) -------
     /// UTC 时间戳（毫秒），辅助字段
     pub timestamp: i64,
     /// 电池荷电状态 [0.0, 1.0]
@@ -571,25 +571,27 @@ pub struct FusedSystemState {
 
 ```rust
 impl FusedSystemState {
-    /// 序列化为 78 维输入向量（v2.14）
-    /// 布局：
-    ///   [0..10]  D1 实时数据 (10 个标量，含 q_realtime_margin)
-    ///   [10..25] D2 pv_forecast (15 维)
-    ///   [25..40] D2 load_forecast (15 维)
-    ///   [40..43] D3 电价 (3 个 RL 字段)
-    ///   [43..46] D4 需量 (3 字段)
-    ///   [46..48] D5 气象 (2 字段)
-    ///   [48]     D6 dispatch_p_set (1 维，None 时填 0.0)
-    ///   [49]     D7 q_realtime_margin (1 维)
-    ///   [50..58] D8 season_encoding (6 维) + time_period_encoding (2 维)
-    ///   [58..62] D9 safety_override (4 维，v2.14 扩展 consecutive+ratio)
-    ///   [62..77] D10 load_forecast_quantiles (15 维，v2.11 新增)
-    ///   [77]     D10 shock_load_probability (1 维，v2.11 新增)
-    ///   [78]     D10 base_load (1 维，v2.11 新增)
+    /// 序列化为 78 维输入向量（v2.14，v2.15 修正 D1 重复）
+    ///
+    /// 布局（与 MUPC-AI2 训练管线 `observation.py:to_input_vector` 严格对齐）:
+    ///   [0..8]   D1 实时数据 (9 标量，q_realtime_margin 已移至 D7)
+    ///   [9..23]  D2 pv_forecast (15 维)
+    ///   [24..38] D2 load_forecast (15 维)
+    ///   [39..41] D3 电价 (3 个 RL 字段)
+    ///   [42..44] D4 需量 (3 字段)
+    ///   [45..46] D5 气象 (2 字段)
+    ///   [47]     D6 dispatch_p_set (1 维，None 时填 0.0)
+    ///   [48]     D7 q_realtime_margin (1 维，v2.14 从 D1 移入)
+    ///   [49..54] D8 season_encoding (6 维)
+    ///   [55..56] D8 time_period_encoding (2 维)
+    ///   [57..60] D9 safety_override (4 维，v2.14 扩展 consecutive+ratio)
+    ///   [61..75] D10 load_forecast_quantiles (15 维，v2.11 新增)
+    ///   [76]     D10 shock_load_probability (1 维，v2.11 新增)
+    ///   [77]     D10 base_load (1 维，v2.11 新增)
     pub fn to_input_vector(&self) -> Vec<f32> {
         let mut v = Vec::with_capacity(78);
 
-        // [0..10] D1: 10 个标量 (不含 timestamp，含 q_realtime_margin)
+        // [0..8] D1: 9 标量（v2.15 修正：q_realtime_margin 已移至 D7，不在此处）
         v.push(self.battery_soc as f32);
         v.push(self.pv_power as f32);
         v.push(self.load_power as f32);
@@ -599,54 +601,53 @@ impl FusedSystemState {
         v.push(self.voltage_phase_a as f32);
         v.push(self.voltage_phase_b as f32);
         v.push(self.voltage_phase_c as f32);
-        v.push(self.q_realtime_margin as f32);  // v2.5 新增
 
-        // [10..25] D2 pv_forecast: 15 维
+        // [9..23] D2 pv_forecast: 15 维
         let pv = pad_or_truncate(&self.pv_forecast_15min, 15);
         v.extend(pv.iter().map(|&x| x as f32));
 
-        // [25..40] D2 load_forecast: 15 维
+        // [24..38] D2 load_forecast: 15 维
         let load = pad_or_truncate(&self.load_forecast_15min, 15);
         v.extend(load.iter().map(|&x| x as f32));
 
-        // [40..43] D3: 3 个 RL 字段
+        // [39..41] D3: 3 个 RL 字段
         v.push(self.current_electricity_price as f32);
         v.push(self.next_period_price as f32);
         v.push(self.price_tariff_id as f32);
 
-        // [43..46] D4: 3 字段
+        // [42..44] D4: 3 字段
         v.push(self.current_demand as f32);
         v.push(self.contract_demand as f32);
         v.push(self.peak_demand_this_month as f32);
 
-        // [46..48] D5: 2 字段
+        // [45..46] D5: 2 字段
         v.push(self.solar_irradiance as f32);
         v.push(self.temperature as f32);
 
-        // [48] D6: dispatch_p_set (None 时 0.0)
+        // [47] D6: dispatch_p_set (None 时 0.0)
         v.push(self.dispatch_p_set.unwrap_or(0.0) as f32);
 
-        // [49] D7: q_realtime_margin (v2.5 新增)
+        // [48] D7: q_realtime_margin（v2.14 从 D1 移入，v2.15 修正：仅出现一次）
         v.push(self.q_realtime_margin as f32);
 
-        // [50..58] D8: season_encoding (6 维) + time_period_encoding (2 维)
+        // [49..56] D8: season_encoding (6 维) + time_period_encoding (2 维)
         for &s in &self.season_encoding { v.push(s as f32); }
         for &t in &self.time_period_encoding { v.push(t as f32); }
 
-        // [58..62] D9: safety_override (4 维，v2.14 扩展)
+        // [57..60] D9: safety_override (4 维，v2.14 扩展)
         v.push(if self.safety_override_active { 1.0 } else { 0.0 });
         v.push(self.safety_override_p_ref.unwrap_or(0.0) as f32);
         v.push(self.safety_override_consecutive as f32);
         v.push(self.safety_override_ratio as f32);
 
-        // [62..77] D10 load_forecast_quantiles: 15 维 (v2.11 新增)
+        // [61..75] D10 load_forecast_quantiles: 15 维 (v2.11 新增)
         let quantiles = pad_or_truncate(&self.load_forecast_quantiles, 15);
         v.extend(quantiles.iter().map(|&x| x as f32));
 
-        // [77] D10 shock_load_probability (v2.11 新增)
+        // [76] D10 shock_load_probability (v2.11 新增)
         v.push(self.shock_load_probability as f32);
 
-        // [78] D10 base_load (v2.11 新增)
+        // [77] D10 base_load (v2.11 新增)
         v.push(self.base_load as f32);
 
         debug_assert_eq!(v.len(), 78, "输入向量必须为 78 维");
@@ -820,7 +821,7 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 | | shock_load_probability | f64 | [0.0, 1.0] | - | 冲击负荷发生概率 |
 | | base_load | f64 | [0.0, 1000.0] | kW | 基础负荷（50% 分位数） |
 
-**输入向量维度（v2.14）：** 78 维 = 10(D1) + 30(D2) + 3(D3) + 3(D4) + 2(D5) + 1(D6) + 1(D7) + 8(D8) + 4(D9) + 17(D10)。
+**输入向量维度（v2.15 修正）：** 78 维 = 9(D1) + 30(D2) + 3(D3) + 3(D4) + 2(D5) + 1(D6) + 1(D7) + 8(D8) + 4(D9) + 17(D10)。（v2.15 修正：D1 10→9，q_realtime_margin 仅计入 D7，不再重复）
 
 > **注：** v2.14 D9 新增 `safety_override_consecutive` 和 `safety_override_ratio` 字段（2 维），用于精细化 SafetyOverride 惩罚计算。D9 从 2 维扩展至 4 维，输入向量从 76 维扩展至 78 维。
 
