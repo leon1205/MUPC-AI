@@ -10,7 +10,7 @@ MUPC 全状态 RL 环境主类 (v2.15 分层控制架构).
 动作空间 2 维 (v2.15): [p_ref, k_droop]
 load_shedding/pv_limit 下沉至 strategy-engine, confidence 移至 ModelOutput 元数据。
 Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
-观测空间: Box(63,) 单模式 或 Box(64,) 多模式
+观测空间: Box(78,) 单模式 或 Box(79,) 多模式 (v2.14 对齐下游)
 """
 
 import math
@@ -42,7 +42,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     动作空间 2 维: [p_ref, k_droop]
     load_shedding/pv_limit 下沉至 strategy-engine.
     Q_batt 由实时电压调节器闭环给出，不经过 RL 动作输出。
-    观测空间: Box(63,) 或 Box(64,) (多模式)
+    观测空间: Box(78,) 或 Box(79,) (多模式, v2.14 对齐下游)
     """
 
     metadata = {"render_modes": []}
@@ -91,7 +91,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._init_voltage_simulator(use_grid2op)
 
         # 观测/动作空间 (v2.14: 78维单模式, 79维多模式)
-        obs_dim = 63 if mode != "all" else 64
+        obs_dim = 78 if mode != "all" else 79
         low_obs = np.full(obs_dim, -10.0, dtype=np.float32)
         high_obs = np.full(obs_dim, 10.0, dtype=np.float32)
         self.observation_space = Box(low_obs, high_obs, dtype=np.float32)
