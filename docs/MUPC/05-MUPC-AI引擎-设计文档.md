@@ -1324,28 +1324,27 @@ R_safety_override      = 安全覆盖惩罚（v2.10 新增，见下）
 其中 v_avg = (voltage_phase_a + voltage_phase_b + voltage_phase_c) / 3.0
 ```
 
-**安全覆盖惩罚 R_safety_override（v2.14 重构）：**
+**安全覆盖惩罚 R_safety_override（v2.14 重构 + v2.15 修正）：**
 
-v2.14 采用分层计算策略，结合滑动窗口统计信息：
+v2.14 采用分层计算策略，结合滑动窗口统计信息。v2.15 删除 `match reason` 分支（因 D9 无 reason_code 字段）：
 
+```rust
+if state.safety_override_active {
+    if state.safety_override_consecutive < 10 {
+        // 样本不足：使用固定中等惩罚（v2.15：删除 reason 差异化）
+        -3.33
+    } else {
+        // 样本充足：比例 + 连续次数惩罚，归一化至 [-1, 0]
+        let ratio_penalty = -5.0 * state.safety_override_ratio;
+        let consecutive_penalty = -10.0 * (state.safety_override_consecutive as f64 / 10.0).clamp(0.0, 1.0);
+        (ratio_penalty + consecutive_penalty) / 15.0
+    }
+} else {
+    0.0
+}
 ```
-// 样本不足时（consecutive < 10）：使用原因固定惩罚，归一化至 [-1, 0]
-if safety_override_consecutive < 10:
-    if safety_override_active:
-        match reason:
-            "voltage_violation" => -50.0 / 15 ≈ -3.33
-            "q_exhausted" => -30.0 / 15 ≈ -2.0
-            "emergency" => -100.0 / 15 ≈ -6.67
-            _ => -20.0 / 15 ≈ -1.33
-    else:
-        0.0
 
-// 样本充足时（consecutive >= 10）：比例 + 连续次数惩罚，归一化至 [-1, 0]
-else:
-    ratio_penalty = -5.0 * safety_override_ratio
-    consecutive_penalty = -10.0 * (consecutive / 10).clamp(0, 1)
-    R_safety_override = (ratio_penalty + consecutive_penalty) / 15
-```
+**v2.15 修正说明：** D9 字段表已无 `safety_override_reason_code`（仅 4 维：active/p_ref/consecutive/ratio），样本不足时无 reason 数据可用，故删除 v2.13 引入的 reason 差异化惩罚分支。固定惩罚 -3.33 取原 voltage_violation 档位（最常见原因）。
 
 **系数说明（v2.14 校准）：**
 
@@ -1355,6 +1354,7 @@ else:
 | k_consecutive | 10.0 | 连续触发次数惩罚系数 |
 | min_sample_threshold | 10 | 最小样本阈值 |
 | norm_divisor | 15.0 | 归一化除数 |
+| cold_start_penalty | 3.33 | 样本不足时固定惩罚（v2.15 新增，替代原 reason 差异化） |
 
 **互斥惩罚逻辑（v2.14 新增）：**
 

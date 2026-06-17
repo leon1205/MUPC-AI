@@ -273,7 +273,7 @@ DataFusionEngine 负责周期性（默认 1Hz，可配置 1s~60s）从多个数�
 
 | 字段 | 类型 | 单位 | 说明 |
 |------|------|------|------|
-| trigger_reason | String | - | 触发原因：voltage_violation / q_exhausted / emergency / other |
+| trigger_reason | String | - | 触发原因：voltage_violation / q_exhausted / emergency / other。**v2.15 起仅用于日志/审计**，不进入 FusedSystemState D9，奖励函数不再按 reason 差异化 |
 | override_p_ref | f64 | kW | 强制放电功率（实时模块计算的代际参考值） |
 | duration_ms | u32 | ms | 覆盖持续时间 |
 | recovery_condition | String | - | 恢复条件：voltage_recovered / q_margin_available / manual_reset |
@@ -690,21 +690,22 @@ r_pq = w_save * r_lazy + w_support * r_correct;
 
 **SafetyOverride 惩罚 R_safety_override（v2.14 重构）：**
 ```rust
-if consecutive < 10 {
-    // 样本不足：原因固定惩罚 / 15
-    match reason {
-        "voltage_violation" => -50.0 / 15,
-        "q_exhausted" => -30.0 / 15,
-        "emergency" => -100.0 / 15,
-        _ => -20.0 / 15,
+if safety_override_active {
+    if safety_override_consecutive < 10 {
+        // 样本不足：使用固定中等惩罚（v2.15：删除 reason 差异化，因 D9 无 reason_code 字段）
+        -3.33
+    } else {
+        // 样本充足：比例 + 连续次数惩罚，归一化至 [-1, 0]
+        (-5.0 * safety_override_ratio - 10.0 * (safety_override_consecutive / 10).clamp(0.0, 1.0)) / 15.0
     }
 } else {
-    // 样本充足：比例 + 连续次数惩罚，归一化至 [-1, 0]
-    (-5.0 * ratio - 10.0 * (consecutive / 10).clamp(0, 1)) / 15.0
+    0.0
 }
 ```
 
 **互斥逻辑（v2.14）：** `safety_override_active = true` 时，跳过该步的 P-Q 协同度惩罚
+
+> **v2.15 更新：** 删除 v2.13 中的 `match reason { voltage_violation/q_exhausted/emergency/... }` 分支。原因：D9 字段表（§3.5）已无 `safety_override_reason_code` 字段（4 维收窄为 active/p_ref/consecutive/ratio），样本不足时无 reason 数据可用。改用统一固定惩罚 -3.33（≈ 原 voltage_violation -50/15 档位）。
 
 **权重配置：**
 | 权重 | 默认值 | 说明 | 可配置范围 |
