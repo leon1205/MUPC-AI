@@ -229,6 +229,26 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         """是否实际启用了 Grid2Op 模式（请求 + 可用 + 初始化成功）。"""
         return self._use_grid2op_active
 
+    def get_welford_stats(self) -> dict:
+        """获取 Welford 奖励归一化统计量 (调试/监控用)。
+
+        Returns:
+            dict: {
+                "count": int,        # 累积样本数
+                "mean": float,       # 奖励均值
+                "std": float,        # 奖励标准差
+                "is_normalized": bool  # 是否已启用归一化 (count >= 100)
+            }
+        """
+        var = self._welford_m2 / self._welford_count if self._welford_count > 0 else 0.0
+        std = float(np.sqrt(var))
+        return {
+            "count": int(self._welford_count),
+            "mean": float(self._welford_mean),
+            "std": std,
+            "is_normalized": self._welford_count >= 100,
+        }
+
     # ── 辅助状态构建 ────────────────────────────────────
 
     def _make_env_state(self) -> observation.EnvState:
@@ -319,9 +339,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._prev_v_avg = 1.0
         self._safety_override_active = False
         self._safety_override_p_ref = 0.0
-        self._welford_mean = 0.0
-        self._welford_m2 = 1.0
-        self._welford_count = 0
+        # Welford 状态不重置: 跨 episode 累积, 训练稳定后启用归一化
         self._prev_v_dev = 0.0
         self._override_count = 0
         self._override_window = 0
@@ -498,6 +516,23 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             self._welford_mean += delta / self._welford_count
             delta2 = welford_raw - self._welford_mean
             self._welford_m2 += delta * delta2
+
+        # ── Welford 奖励归一化 (v2.18) ──
+        # 历史 bug: Welford 仅累积, 从未读取用于归一化奖励. 这导致 PPO
+        # 在奖励尺度变化时训练不稳定. 修复: 累积到足够样本后, 用
+        # Welford 统计量把原始奖励归一化到 N(0, 1) 区间, 再返回给 trainer.
+        # 热启动: count < 100 时不归一化 (样本不足, 统计量不稳定).
+        # 同时记录原值到 info 供调试.
+        reward_info["reward_raw"] = float(reward)
+        if self._welford_count >= 100 and welford_raw is not None:
+            var = self._welford_m2 / self._welford_count
+            std = float(np.sqrt(var) + 1e-8)
+            reward = (reward - self._welford_mean) / std
+            reward_info["reward_normalized"] = float(reward)
+            reward_info["welford_mean"] = float(self._welford_mean)
+            reward_info["welford_std"] = std
+        else:
+            reward_info["reward_normalized"] = float(reward)
 
         # 12. 推进时间
         self._step_idx += 1
