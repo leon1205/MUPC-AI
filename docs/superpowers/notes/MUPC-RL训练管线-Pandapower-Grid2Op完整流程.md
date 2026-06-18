@@ -75,8 +75,12 @@ AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 ┌──────────────────────────────────────────────────────────────────────┐
 │  MupcEnv.step(action) — 编排层 (mupc_env/core.py)                    │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │ ① 实时电压环算 q_batt (与 AI 无关, 由 Q-V 闭环给出)             │  │
-│  │    q_batt = -K_Q_V × (V_prev - 1.0)  → q_realtime_margin      │  │
+│  │ ① 模拟 q_realtime_margin (训练管线无真实实时模块, 见注 A)        │  │
+│  │    用上一步末端电压推算本步 Q-V 闭环会输出的 q_batt,              │  │
+│  │    反算裕度:                                                     │  │
+│  │      q_batt = -K_Q_V × (V_prev - 1.0)  (clamp ±300 kVar)       │  │
+│  │      q_realtime_margin = 1 - |q_batt| / 300                    │  │
+│  │    此值在 step 开头算, AI 决策后即可在 78 维 obs 的 D7[48] 看到  │  │
 │  │ ② 动作校验 ACT-01~05 (v2.17)                                    │  │
 │  │    - ACT-01 |Δp_ref| ≤ 50 kW/步                                 │  │
 │  │    - ACT-02 |Δk_droop| ≤ 30 kW/V/步 (v2.17: 10→30)              │  │
@@ -143,6 +147,19 @@ AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 | **Pandapower (物理计算)** | 定义网络, 跑 Newton-Raphson 潮流, 返回节点电压 | 不管时间, 不管 AI, 不管奖励 |
 
 > **关键时序**: MupcEnv 先构建 78 维 obs → 调度 AI 输出 2 维动作 → MupcEnv 完整校验 (ACT-01~05) + 反归一化 → 调度 Grid2Op/Pandapower 物理仿真 → 根据仿真结果计算奖励 → 构建新 obs。AI 不感知物理仿真细节, Pandapower 不感知时间与 AI 动作。
+
+#### 注 A: q_realtime_margin 的"模拟"与"真实来源"
+
+`q_realtime_margin` (D7[48]) 在**训练**与**部署**两个环境中的来源不同:
+
+| 环境 | 来源 | 物理路径 |
+|------|------|----------|
+| **训练 (本地 Python)** | MupcEnv **模拟**生成 (step 开头 ① 步) | 用上一步末端电压推算 Q-V 闭环会输出的 q_batt → 反算裕度 `1 - \|q_batt\|/300` |
+| **部署 (下游 RK3588)** | MUPC **实时控制模块** 注入 | intercore DataUploadPayload 帧 → FusedSystemState.q_realtime_margin → 输入向量 D7[48] |
+
+> **为什么训练时要模拟**: 训练管线在 x86 PC 上, 没有真实硬件实时控制模块闭环, 也无法真实采样互感器数据. 训练闭环 (AI → 物理仿真 → 奖励 → AI) 需要这个值进入 78 维 obs 才能工作, 因此**用相同的 Q-V 闭环公式模拟**, 让 AI 看到与部署时**结构等价**的状态. 真实部署时此值由实时控制模块直接给出, 训练管线的模拟代码**不参与**推理路径.
+
+> **训练时的轻微错位**: 本地 step() 在开头用**上一步结束时的电压**算 q_realtime_margin, 而本步骤的 Q-V 闭环 q_batt 是为下一步电压仿真用的. 这是工程简化 (训练管线没有"实时控制模块"独立线程), 真实部署时 q_realtime_margin 与 q_batt 由实时控制模块**同时**计算, 不存在错位.
 
 ### 2.2 关键概念：潮流计算 (Power Flow)
 
@@ -259,7 +276,7 @@ obs, info = env.reset()
 | 45 | **D5 气象** | `solar_irradiance` | 太阳辐照度 (W/m²) | SMART-DS/中国合成数据 | MinMax [0,1500] |
 | 46 | D5 | `temperature` | 环境温度 (°C) | SMART-DS/中国合成数据 | MinMax [-20,60] |
 | 47 | **D6 调度** | `dispatch_p_set` | 调度有功指令 (kW) | 合成: 非VPP=0，VPP=随机 | MinMax [-200,200] |
-| 48 | **D7** | `q_realtime_margin` | 实时模块无功裕度 | MupcEnv: `1.0 - abs(q_batt)/300` | Identity [0,1] |
+| 48 | **D7** | `q_realtime_margin` | 实时模块无功裕度 | **训练**: MupcEnv 模拟 `1.0 - abs(q_batt)/300` / **部署**: 实时控制模块注入 | Identity [0,1] |
 | 49 | **D8 季节** | `season_irrigation` (灌溉季) | 3~4 月 one-hot | MupcEnv: 小时/月份推算 | One-hot |
 | 50 | D8 | `season_tea` (炒茶季) | 5 月 one-hot | 同上 | One-hot |
 | 51 | D8 | `season_ac` (空调季) | 6~8 月 one-hot | 同上 | One-hot |
@@ -295,7 +312,7 @@ MupcEnv 内部状态 (core.py)
   ├── _soc (电池递推) ──→  D1[0]
   ├── _grid_power (计算) ──→  D1[3]
   ├── _load_rate (计算) ──→  D1[4]
-  ├── q_batt (电压环) → q_realtime_margin ──→  D7[48]
+  ├── q_batt (Q-V 闭环模拟, 见 2.1 注 A) → q_realtime_margin ──→  D7[48]
   ├── season_encoding (月份推算) ──→  D8[49..54]
   └── time_period_encoding (小时判断) ──→  D8[55..56]
   │
