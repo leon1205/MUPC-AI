@@ -1,11 +1,12 @@
-# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v2.15）
+# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v2.16）
 
-> **版本：** v2.15 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-17
+> **版本：** v2.16 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-18
 
 ### 变更记录
 
 | 版本 | 日期 | 作者 | 变更说明 | 评审状态 |
 |------|------|------|----------|----------|
+| v2.16 | 2026-06-18 | 需求分析师 | LSTM 模型优化：步长统一为 15 分钟、15 步分位数预测、D10 数据流通、删除 confidence 字段、消除冗余推理 | [REVIEWED: PASS] |
 | v2.15 | 2026-06-17 | 需求分析师 | 动作空间精简：5维→2维（移除load_shedding/pv_limit/confidence），下沉至策略引擎 | [REVIEWED: PASS] |
 | v2.14 | 2026-06-15 | - | SafetyOverride 奖励函数重构、FusedSystemState 78维统一 | [REVIEWED: PASS] |
 | v2.13 | 2026-06-14 | - | Sigmoid P-Q平滑化、Welford奖励归一化、confidence字段 | [REVIEWED: PASS] |
@@ -220,6 +221,176 @@ pub struct LstmOutput {
 | PLF-05 | 协变量（温度、日期类型）正确传入 | P1 | 集成测试 |
 | PLF-06 | 概率预测在测试集上 P90 分位数误差 < 15% | P1 | 离线评估 |
 | PLF-07 | FusedSystemState 正确存储分位数预测结果 | P0 | 集成测试 |
+
+---
+
+### 3.6 v2.16 LSTM 模型优化（基于专家建议 `docs/TODO/LSTM优化2.md`）
+
+#### 3.6.1 背景与动机
+
+| 现存问题 | 来源 | 风险 |
+|----------|------|------|
+| 代码硬编码 `/ 60`（1 分钟步长假设），与 MUPC-AI2 训练管线实际步长不一致 | 专家建议 #3 | 模型启动时 `InputShapeMismatch` |
+| `ProbabilisticLoadOutput` 仅计算第一步分位数，D10 15 维实际传 0 给 RL | 专家建议 #4 + 代码审计 | RL 输入失真，影响决策 |
+| `LstmOutput.confidence` 字段基于预测序列方差，数学上无意义 | 专家建议 #2 | 错误指标误导 RL |
+| `predict()` 与 `predict_quantiles()` 触发 2 次 NPU 推理 | 专家建议 #7 | 边缘设备算力浪费 |
+| 缺少输出维度校验，模型输出不足时静默截断 | 专家建议 #8 | 数据丢失无感知 |
+| 关键纯函数（协变量调整、冲击概率、置信度）无单元测试 | 专家建议 #9 | 回归风险 |
+
+#### 3.6.2 核心变更
+
+##### 变更 1：步长统一化（LSTM-06 / LSTM-07）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `LstmConfig.step_seconds` | `u64` | 900（15 分钟） | **新增**：统一输入输出步长计算 |
+| `LstmConfig.input_window_secs` | `u64` | 21600（6 小时） | **改**：从 3600 调整 |
+| `LstmConfig.output_horizon_secs` | `u64` | 22500（225 分钟 = 15 步 × 15 分钟） | **改**：从 900 调整 |
+
+**步长计算公式：**
+
+```rust
+let input_size = self.config.input_window_secs / self.config.step_seconds;   // = 24
+let output_size = self.config.output_horizon_secs / self.config.step_seconds; // = 15
+```
+
+**验收标准修订：**
+
+| ID | 标准（修订前） | 标准（修订后） |
+|----|----------------|----------------|
+| LSTM-05 | 预测输出向量长度可配置（默认 15） | 不变（默认 15 步对齐训练管线 MUPC-AI2 输出） |
+| §3.4 | 光伏预测 MAPE ≤ 10%（15 分钟预测范围） | 光伏预测 MAPE ≤ 10%（**第 1 步 15 分钟预测**，远期步 MAPE 允许放宽至 20%） |
+
+##### 变更 2：15 步分位数预测（LSTM-09）
+
+**`ProbabilisticLoadOutput` 结构重构：**
+
+```rust
+pub struct ProbabilisticLoadOutput {
+    pub timestamp: i64,
+    /// 15 个未来时间步的分位数预测（每步含 P10/P50/P90）
+    pub quantile_steps: Vec<StepQuantiles>,  // 长度 = 15
+    pub base_load: f32,                      // 第 1 步 P50
+    pub shock_probability: f64,
+}
+
+pub struct StepQuantiles {
+    pub step_index: usize,  // 0..14
+    pub p10: f32,
+    pub p50: f32,
+    pub p90: f32,
+}
+```
+
+**`predict_multi_quantile` 实现要点：**
+
+- 对 `predictions[0..14]` 每个值分别应用 `calculate_covariate_adjustment` 得到对应步的 P10/P50/P90
+- 共享协变量调整因子 `covariates`，仅基线（点预测值）随步变化
+
+##### 变更 3：D10 数据流通（LSTM-10）
+
+**新增方法 `ModelManager::update_fused_state_quantiles`：**
+
+```rust
+/// 将 LSTM 分位数预测结果写入 FusedSystemState.D10
+/// 
+/// v2.16: 修复 D10 数据流未接通的 bug
+/// 行为：将 15 步 P90 值填充到 load_forecast_quantiles 字段（与 reward_calculator.rs:586 注释一致）
+pub async fn update_fused_state_quantiles(
+    &self,
+    state: &mut FusedSystemState,
+    prob_output: &ProbabilisticLoadOutput,
+);
+```
+
+**D10 填充语义（修订）：**
+
+| 字段 | 修订前 | 修订后 |
+|------|--------|--------|
+| `load_forecast_quantiles` | 含义模糊（注释 vs 代码不一致）| **明确**：15 步 P90 值（与 `reward_calculator.rs` 取索引 13 一致）|
+
+##### 变更 4：删除 confidence 字段（LSTM-08）
+
+**`LstmOutput` 结构简化：**
+
+```diff
+ pub struct LstmOutput {
+     pub predictions: Vec<f32>,
+-    pub confidence: f64,
+ }
+```
+
+**理由（来自专家建议 #2）：**
+- 全工程 grep 验证无任何代码读取 `LstmOutput.confidence`
+- 当前 `1 - variance` 算法数学上无意义（variance 是预测序列不同时间步之间的差异，不是预测不确定性）
+- 策略引擎 `ai_validator.rs` 中的 `confidence` 是独立 `ModelOutput` 字段，与 LSTM 无关
+- 与 v2.15 已将 `confidence` 从 `ActionOutput` 移除的趋势一致
+
+**关联修订：**
+
+| 位置 | 修订 |
+|------|------|
+| §3.3 接口定义 | 删除 `LstmOutput.confidence` |
+| §3.5 PLF-04 | 修订为"使用 `base_load` + `shock_load_probability`，不依赖 confidence" |
+
+##### 变更 5：消除冗余推理（LSTM-12）
+
+**重构 `predict_quantiles`：**
+
+- 旧实现：`predict_quantiles → predict_multi_quantile → self.predict(input)` 触发 2 次 NPU 推理
+- 新实现：`predict` 作为底层公共方法，`predict_quantiles` 复用其结果做后处理，**仅 1 次 NPU 推理**
+
+##### 变更 6：输出维度校验（LSTM-11）
+
+**`predict()` 新增错误返回：**
+
+```rust
+if output.len() < output_size {
+    return Err(AiEngineError::OutputShapeMismatch);
+}
+```
+
+##### 变更 7：测试覆盖（LSTM-13）
+
+**新增单元测试（覆盖关键纯函数）：**
+
+| 测试函数 | 覆盖目标 |
+|----------|----------|
+| `test_calculate_covariate_adjustment_*` | 协变量温度/时段/季节分因子及合成因子 |
+| `test_calculate_shock_probability_*` | 冲击负荷概率正态分布假设 |
+| `test_calculate_quantile_confidence_*` | 分位数间距置信度计算 |
+| `test_erfc_*` | 误差函数近似精度 |
+| `test_step_seconds_default` | 默认 `step_seconds=900` |
+| `test_quantile_steps_length` | 15 步分位数输出长度固定 |
+
+#### 3.6.3 验收标准汇总（v2.16 新增）
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| LSTM-06 | `LstmConfig` 新增 `step_seconds` 字段，默认 900 | 单元测试 |
+| LSTM-07 | 默认 `input_window_secs=21600` + `output_horizon_secs=22500`，计算步数 = 24/15 | 单元测试 |
+| LSTM-08 | `LstmOutput` 删除 `confidence` 字段，全工程无引用 | 单元测试 + grep 验证 |
+| LSTM-09 | `ProbabilisticLoadOutput.quantile_steps` 长度固定 15，每步含 P10/P50/P90 | 单元测试 |
+| LSTM-10 | `model_manager.update_fused_state_quantiles` 接通 D10 数据流 | 集成测试 |
+| LSTM-11 | `predict()` 输出长度不足时返回 `OutputShapeMismatch` | 单元测试 |
+| LSTM-12 | `predict_quantiles` 仅触发 1 次 NPU 推理（性能计数器验证）| 性能测试 |
+| LSTM-13 | `calculate_covariate_adjustment` / `calculate_shock_probability` / `calculate_quantile_confidence` / `erfc` 单元测试覆盖率 >= 80% | cargo test |
+
+#### 3.6.4 兼容性说明
+
+| 项 | 影响 | 处理 |
+|----|------|------|
+| `LstmOutput.confidence` 删除 | 任何外部 crate 调用者 | grep 全工程零读取，影响为零；如有遗漏由编译错误暴露 |
+| `LstmConfig` 字段默认值变更 | 现有部署使用 `Default::default()` 启动 | 部署文档同步更新默认值 |
+| `ProbabilisticLoadOutput` 结构变更 | `reward_calculator.rs` 当前使用 `ProbabilisticLoadOutput` | 同次 PR 同步更新 `reward_calculator.rs` 调用方 |
+
+#### 3.6.5 非目标（v2.16 不做）
+
+| 专家建议项 | 状态 | 理由 |
+|------------|------|------|
+| #1 真分位数回归 | 📋 训练管线侧工作 | 需 MUPC-AI2 用 Quantile Loss 重训 LSTM，Rust 侧仅标记实验性 |
+| #5 协变量阈值参数化 | ❌ 推迟 | 单台区部署，硬编码可接受 |
+| #6 冲击概率正态假设 | ❌ 推迟 | 需历史冲击负荷统计，当前数据基础不足 |
 
 ---
 

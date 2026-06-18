@@ -230,11 +230,11 @@ LSTM 时序预测模型负责预测未来 15~30 分钟（默认 15 分钟，可�
 |------|------|
 | 预测目标 | 光伏出力 (PV forecast)、负荷功率 (Load forecast) |
 | 负荷分类 | 基荷（基础用电）、可调负荷（柔性负荷）、冲击负荷（概率预测） |
-| 预测范围 | 15 分钟（默认），可配置扩展至 30 分钟 |
-| 采样间隔 | 每分钟 1 个采样点 |
+| 预测范围 | 225 分钟（默认 15 步 × 15 分钟，可配置调整） |
+| 采样间隔 | 每 15 分钟 1 个采样点（v2.16 统一，与 MUPC-AI2 训练管线对齐） |
 | 输入数据 | 历史光伏出力、历史负荷功率、气象数据（光照、温度） |
-| 输入窗口 | 60 分钟，由 `LstmConfig.input_window_secs` 配置 |
-| 输出窗口 | 15~30 分钟，由 `LstmConfig.output_horizon_secs` 配置 |
+| 输入窗口 | 6 小时（24 步 × 15 分钟），由 `LstmConfig.input_window_secs / step_seconds` 计算 |
+| 输出窗口 | 225 分钟（15 步 × 15 分钟），由 `LstmConfig.output_horizon_secs / step_seconds` 计算 |
 | 模型格式 | ONNX（训练）--> INT8 量化 --> .rknn（部署）|
 | 精度要求 | 光伏 MAPE <= 10%, 负荷 MAPE <= 15% |
 
@@ -298,12 +298,13 @@ impl LstmModel {
 
 ### 2.6 预测向量长度处理
 
-预测输出向量长度由 `LstmConfig.output_horizon_secs / 60` 计算。当实际输出长度与配置不符时：
+**v2.16 修订**：预测输出向量长度由 `LstmConfig.output_horizon_secs / step_seconds` 计算（替代原 `/60` 硬编码）。当实际输出长度与配置不符时：
 - 超出部分：截断（取前 N 个值）
-- 不足部分：补零填充到配置长度
+- 不足部分：**返回 `OutputShapeMismatch` 错误**（v2.16 修复原静默补零行为）
 
 ```rust
-let output_size = self.config.output_horizon_secs as usize / 60;
+// v2.16: 使用 step_seconds 统一计算（默认 900s = 15 分钟）
+let output_size = self.config.output_horizon_secs as usize / self.config.step_seconds as usize;
 let predictions: Vec<f32> = output.into_iter()
     .take(output_size)
     .chain(std::iter::repeat(0.0))
@@ -1784,20 +1785,20 @@ pub fn calculate_discounted(&self, current_reward: f32) -> f32 {
 ```
 LstmModel
   ├─ predict()           （原有确定性预测）
-  ├─ predict_quantiles()  （v2.11 分位数预测）
+  ├─ predict_quantiles()  （v2.11 分位数预测，v2.16 重构为 15 步）
   └─ erfc()               （正态分布 CDF 近似）
         ↓
-ProbabilisticLoadOutput
-  ├─ quantiles: Vec<QuantilePrediction>  [P10, P50, P90]
-  ├─ base_load (P50)
+ProbabilisticLoadOutput (v2.16 重构)
+  ├─ quantile_steps: Vec<StepQuantiles>  (15 步 × [P10, P50, P90])
+  ├─ base_load (第 1 步 P50)
   ├─ shock_probability
-  └─ confidence
+  └─ confidence (基于 P50/P90 间距)
         ↓
   ┌────┴────┐
   ↓         ↓
-RewardCalculator  FusedSystemState
+RewardCalculator  FusedSystemState (D10)
 calc_demand_with_   load_forecast_quantiles
-uncertainty()       (v2.11 新增字段)
+uncertainty()       (15 维，v2.16 接通数据流)
 ```
 
 #### 5.10.4 详细设计
@@ -1813,20 +1814,30 @@ pub struct LoadCovariates {
 }
 ```
 
-**ProbabilisticLoadOutput：**
+**ProbabilisticLoadOutput（v2.16 重构）：**
 
 ```rust
+/// 单分位数预测（v2.11，向后兼容保留）
 pub struct QuantilePrediction {
     pub quantile: f32,  // 分位数（0.0 ~ 1.0）
     pub value: f32,      // 预测值 (kW)
 }
 
+/// 单步分位数预测（v2.16 新增）
+pub struct StepQuantiles {
+    pub step_index: usize,   // 步索引 0..14
+    pub p10: f32,            // P10 分位数预测值
+    pub p50: f32,            // P50 分位数预测值
+    pub p90: f32,            // P90 分位数预测值
+}
+
+/// 概率负荷预测输出（v2.11 新增，v2.16 重构为 15 步结构）
 pub struct ProbabilisticLoadOutput {
     pub timestamp: i64,
-    pub quantiles: Vec<QuantilePrediction>,
-    pub base_load: f32,           // 50% 分位数
-    pub shock_probability: f64,   // 冲击负荷概率
-    pub confidence: f64,
+    pub quantile_steps: Vec<StepQuantiles>,  // 15 个未来时间步（v2.16）
+    pub base_load: f32,                       // 第 1 步 P50（向后兼容）
+    pub shock_probability: f64,               // 冲击负荷概率
+    pub confidence: f64,                      // 基于 P50/P90 间距
 }
 ```
 
@@ -3114,8 +3125,9 @@ pub struct AiEngineConfig {
 ```toml
 [lstm]
 model_path = \"/etc/mupc/models/lstm.rknn\"
-input_window_secs = 3600
-output_horizon_secs = 900
+input_window_secs = 21600     # 6 小时（v2.16: 3600 → 21600）
+output_horizon_secs = 22500   # 225 分钟 = 15 步 × 15 分钟（v2.16: 900 → 22500）
+step_seconds = 900            # 15 分钟步长（v2.16 新增）
 quantization = \"INT8\"
 
 [rl]
@@ -3162,7 +3174,7 @@ enable_fallback_to_cpu = true
 
 | 配置结构 | 关键字段 | 默认值 |
 |----------|----------|--------|
-| LstmConfig | model_path, input_window_secs, output_horizon_secs, quantization | /etc/mupc/models/lstm.rknn, 3600, 900, INT8 |
+| LstmConfig | model_path, input_window_secs, output_horizon_secs, step_seconds, quantization | /etc/mupc/models/lstm.rknn, 21600, 22500, 900, INT8 |
 | RlConfig | model_path, algorithm, quantization | /etc/mupc/models/rl.rknn, MADDPG, INT8 |
 | OnlineUpdateConfig | enabled, batch_size, learning_rate | false, 32, 0.001 |
 | FusionConfig | fusion_period_secs, data_source_timeout_secs, enable_health_monitoring | 1, 10, true |
