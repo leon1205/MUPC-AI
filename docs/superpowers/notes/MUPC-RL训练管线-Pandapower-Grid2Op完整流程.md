@@ -61,6 +61,7 @@ AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 │  • 随机初始化 SOC / 电压 / 需量 (避开边界)                              │
 │  • 季节时段 one-hot 编码                                              │
 │  • _make_env_state() → EnvState 数据快照                              │
+│  • LSTM.predict(step_idx) → forecast (30 维 D2 预测) ← 详见 4.1.5     │
 │  • build_observation() → 78 维 (单模式) / 79 维 (多模式) ndarray      │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │ 78 维 obs
@@ -129,7 +130,8 @@ AI 网络模型 (ONNX)         ←→   AI 网络模型 (PyTorch, 训练中)
 │  │               + R_shaping + R_soc_balance + R_state_improve     │  │
 │  │    (9 项归一化 w1~w9 + 3 项未归一化附加)                          │  │
 │  │ ⑩ Welford 在线归一化 (v2.18, count≥100 启用)                    │  │
-│  │ ⑪ 推进 step_idx, 构建下一个 EnvState + 78 维 obs                │  │
+│  │ ⑪ 推进 step_idx, LSTM.predict(new_step_idx) → D2 预测           │  │
+│  │    _make_env_state() + build_observation() → 下一个 78 维 obs   │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │ (new_obs, reward, terminated, truncated, info)
@@ -329,6 +331,203 @@ TOU 合成 (data_loader.py: _generate_tou_prices)
 调度合成 (data_loader.py: _generate_dispatch)
   └── dispatch_p_set ──→  D6[47]
 ```
+
+### 4.1.5 LSTM 预测模型 — D2 预测 + D10 概率负荷的来源
+
+观测空间的 D2 (30 维) + D10 (17 维) 都不是从原始数据直接读出来的，而是由 **LSTM 预测模型** (`lstm_model.py`) 推算出的未来 15 分钟预测。RL 不需要"真实未来"，而是需要"AI 视角下的预测"——这样训练出的策略才能在真实部署时使用相同接口的 LSTM 输出做决策。
+
+#### 4.1.5.1 模型架构 (v2.14 扩展)
+
+```python
+class LSTMForecast:
+    """LSTM 时序预测模型 (v2.14: 30 维 → 47 维)."""
+    def __init__(self, input_dim=7, hidden_dim=64, num_layers=2,
+                 forecast_steps=15, dropout=0.1, with_d10=True):
+```
+
+**架构 (单 LSTM + 多头 Linear)**:
+
+```
+   输入 (batch, seq_len=8, 7)                    输出 (batch, 47)
+   ┌──────────────────────────┐         ┌────────────────────────────────┐
+   │ 8 步 × 7 特征 = 120 分钟 │         │ pv_pred(15)                    │ head_pv: ReLU
+   │ 时序窗口                  │   →     │ load_pred(15)                  │ head_load: ReLU
+   │                          │  LSTM   │ quantiles(15) [P10,P30...P90]  │ head_d10_quantiles: ReLU
+   │  特征 7 维:               │  2 层   │ shock_prob(1) ∈ [0,1]          │ head_d10_shock: Sigmoid
+   │  [pv, load, ghi,          │  hidden │ base_load(1) ≥ 0               │ head_d10_base: ReLU
+   │   temp, sin_h, cos_h,     │  64     │                                │
+   │   yesterday_pv]           │         │                                │
+   └──────────────────────────┘         └────────────────────────────────┘
+                                              ↓                 ↓
+                                              D2 (前 30 维)    D10 (后 17 维)
+```
+
+**关键设计**:
+
+| 要素 | 选择 | 理由 |
+|------|------|------|
+| `seq_len=8` | 8 步 × 15 分钟 = 120 分钟上下文 | 光伏云遮突变 ~5-15 min, 2h 窗口足够 |
+| `forecast_steps=15` | 15 步 × 15 分钟 = 225 分钟 (3.75h) | 与 78 维 obs 的 D2 维度严格对齐 |
+| `yesterday_pv` (7 维特征) | 引入昨日同时段 PV | 捕捉日周期规律 (日出日落时刻近似) |
+| `sin_h/cos_h` (5,6 维) | 小时循环编码 | 避免 0/24 不连续, 让 LSTM 感知"快到中午" |
+| `head_d10_shock` Sigmoid | 输出 [0, 1] 概率 | 与 D10[76] 范围对齐 |
+| 其他头 ReLU | 输出非负 | PV/load/分位数/基荷物理上 ≥ 0 |
+
+**D10 17 维拆分** (P10/P30/P50/P70/P90 × 3 个预测步):
+
+```
+quantiles[0..4]   = P10/P30/P50/P70/P90 @ t+1  (15 分钟预测)
+quantiles[5..9]   = P10/P30/P50/P70/P90 @ t+2  (30 分钟预测)
+quantiles[10..14] = P10/P30/P50/P70/P90 @ t+3  (45 分钟预测)
+```
+
+#### 4.1.5.2 训练数据准备 (`LSTMTrainer.prepare_data`)
+
+训练样本 (X, y) 构建逻辑:
+
+```python
+seq_len = 8       # 输入窗口 120 分钟
+forecast = 15     # 预测窗口 225 分钟
+n_samples = n - seq_len - forecast
+```
+
+**昼夜均衡采样** —— 这是关键工程经验:
+
+- 原始数据中夜间 PV=0 样本占 ~50%, 模型会"偷懒"恒输出 0
+- 解决: 保留全部白天样本 (预测窗口内 PV>5kW), 夜间下采样至白天×2
+- 白天 50k+ 样本, 夜间 100k 样本 (1:2), 总 ~150k 训练样本
+
+**LSTM 输入 7 维**:
+
+```python
+x[i, 0] = pv_power[step]          # 当前 PV (kW)
+x[i, 1] = load_power[step]        # 当前负荷 (kW)
+x[i, 2] = solar_irradiance[step]  # 辐照度 (W/m²)
+x[i, 3] = temperature[step]       # 温度 (°C)
+x[i, 4] = sin(2π·h/24)            # 小时循环编码 sin
+x[i, 5] = cos(2π·h/24)            # 小时循环编码 cos
+x[i, 6] = pv_power[step - 96]     # 昨日同时段 PV (96 = 24h / 15min)
+```
+
+**LSTM 训练 target (47 维)**:
+
+```python
+y[0:15]  = pv_power[t+1..t+15]   # D2 PV 预测目标
+y[15:30] = load_power[t+1..t+15]  # D2 负荷预测目标
+y[30:45] = quantiles              # D10 5 分位 × 3 步
+y[45]    = shock_probability      # D10 冲击概率
+y[46]    = base_load              # D10 基荷
+```
+
+#### 4.1.5.3 推理接口 (`predict` / `predict_numpy`)
+
+`MupcEnv` 在每步 `step()` 末尾调用 LSTM 推理 (78 维 obs 构建时):
+
+```python
+# mupc_env/core.py:605
+state = self._make_env_state()
+forecast = self._predictor.predict(self._step_idx)   # 返回 30 维 (D2)
+obs = observation.build_observation(state, forecast)  # 78 维 obs
+```
+
+**`predict(step_idx)` 内部**:
+
+1. 取最近 8 步数据 (含当前): `seq_indices = [step_idx-7, step_idx-6, ..., step_idx]`
+2. 边界保护: `max(0, min(i, n-1))` 防止首尾越界
+3. 构建 (8, 7) 输入, 含 sin/cos 小时编码 + 昨日 PV
+4. `predict_numpy(x[None, ...])` → (1, 47) 或 (1, 30)
+5. **截断到前 30 维返回** —— 向后兼容, D10 由 data_loader 合成提供
+
+> **为什么 predict() 截断 30 维而不是返回 47 维**: 历史接口约定, D10 的真实生成由 `data_loader._generate_load_forecast_quantiles()` 合成 (15 维 linspace(0.85, 1.27) + shock_prob + base_load), 避免 LSTM D10 头与合成数据不一致. v2.14+ LSTM 已支持 47 维, 但 predict() 保持 30 维向后兼容.
+
+#### 4.1.5.4 Oracle 后备 (无 PyTorch 时)
+
+```python
+# mupc_env/core.py:80-81
+if lstm_predictor is not None:
+    self._predictor = lstm_predictor
+else:
+    from lstm_model import OraclePredictor
+    self._predictor = OraclePredictor(data)
+```
+
+**`OraclePredictor` 行为**: 真实值 + 高斯噪声 (无 LSTM 也能跑通环境), 用于:
+
+- PyTorch 未安装的环境自测
+- LSTM 训练前的快速冒烟测试
+- 单元测试不需要 ML 推理时
+
+**Oracle vs 训练后 LSTM 的区别**: Oracle 用了"未来信息" (data 中 t+1 实际值), 这是**信息泄露**, 训练出的 RL 策略会过拟合. 真实训练必须用训练后的 LSTM (即使是首次随机初始化, 也比 Oracle 严格).
+
+#### 4.1.5.5 完整调用链 (时序图)
+
+```
+MupcEnv.reset() / step() 末尾
+  │
+  ├─→  _make_env_state()       # 构建 EnvState (含 D1/D3/D4/D5/D6/D7/D8/D9)
+  │
+  ├─→  _predictor.predict(step_idx)   # ←── LSTM 推理入口
+  │      │
+  │      ├─→ 拼装 7 维输入窗口 (8 步, 含 sin/cos/yesterday_pv)
+  │      │
+  │      ├─→ predict_numpy(x[None, ...])   # PyTorch forward
+  │      │      │
+  │      │      ├─ LSTM (2 层, hidden=64) → last_hidden
+  │      │      ├─ head_pv     → ReLU → (15,)
+  │      │      ├─ head_load   → ReLU → (15,)
+  │      │      └─ (D10 头, with_d10=True 时)
+  │      │            ├─ head_d10_quantiles → ReLU → (15,)
+  │      │            ├─ head_d10_shock     → Sigmoid → (1,)
+  │      │            └─ head_d10_base      → ReLU → (1,)
+  │      │
+  │      └─→ 截断到前 30 维返回     # D2 预测
+  │
+  └─→  build_observation(state, forecast)
+        │
+        ├─ obs[9:24]   = forecast[:15]     # D2 PV
+        ├─ obs[24:39]  = forecast[15:30]   # D2 load
+        ├─ obs[61:76]  = data.load_forecast_quantiles  # D10 quantiles (合成, 不走 LSTM)
+        ├─ obs[76]     = data.shock_load_probability   # D10 shock
+        └─ obs[77]     = data.base_load                # D10 base
+```
+
+**注**: 78 维 obs 的 D2 来自 LSTM, D10 来自 data_loader 合成 (LSTM D10 头虽然训练了 47 维, 但 predict() 截断 30 维, D10 走 data 路径). 部署时 D10 头会从 RKNN LSTM 模型输出, 整 47 维都会用上.
+
+#### 4.1.5.6 训练入口
+
+```bash
+# 独立训练 LSTM (仅 LSTM, 不跑 RL)
+python train.py --train-lstm --data-source merged \
+       --lstm-params epochs=200,patience=20
+
+# 与 RL 联合训练 (1M 步)
+python train.py --mode MODE-01 --data-source merged --train-lstm \
+       --lstm-params hidden_dim=128,num_layers=3,epochs=200,patience=30 \
+       --total-timesteps 1000000 --export-onnx
+```
+
+**LSTM ONNX 导出**:
+
+```bash
+python export_onnx.py --lstm checkpoints/lstm_checkpoint.pt
+# 输出 lstm_forecast.onnx, 输入 (1, 4, 6), 输出 (1, 30) [v2.14 D2 only]
+# 部署到 RK3588 后转为 RKNN, 推理延迟 < 5ms
+```
+
+#### 4.1.5.7 LSTM vs 部署真实预测接口
+
+| 维度 | 训练 (本地 Python) | 部署 (下游 RK3588) |
+|------|---------------------|---------------------|
+| 模型 | LSTMForecast (PyTorch) | RKNN 量化模型 (INT8) |
+| 输入窗口 | 8 步 (120 min) | **4 步 (60 min)** (RKNN 输入 (1, 4, 6)) |
+| 输出维度 | 30 (predict 截断) | 47 (RKNN 完整输出, 含 D10) |
+| 推理延迟 | ~2ms (CPU) | < 5ms (NPU) |
+| 输入来源 | self._data 数组 (MupcEnv 内部) | intercore DataUploadPayload 帧 |
+| D10 处理 | 走 data_loader 合成 | 走 RKNN LSTM D10 头 (47 维完整用上) |
+
+> **训练-部署 gap 风险**: 训练时 predict() 截断 30 维 + D10 走合成, 部署时 RKNN 输出 47 维. 评估影响: 训练管线 D10 行为与 D2 行为解耦 (LSTM D2 头准确, D10 由 data 合成), 部署时 D10 行为依赖 RKNN LSTM 精度. v2.14+ 训练管线 predict() 已能返回 47 维 (model 自身支持), 后续可统一走 LSTM 路径.
+
+---
 
 ### 4.2 第 2 步：AI 输出动作 (2 维, v2.15)
 
