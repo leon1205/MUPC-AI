@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v2.18 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
 | v2.17 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
 | v2.16 | 2026-06-15 | 需求分析师 | **[REVIEWED: PASS]** |
 | v2.15 | 2026-06-14 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -245,9 +246,9 @@ VoltageSimulator 模式（降级）:
 [49..54]  D8 season_encoding (6维)   合成 (季节 one-hot)
 [55..56]  D8 time_period_encoding    合成 (2维 one-hot, 白天/夜间)
 [57..60]  D9 safety_override (4字段) active/p_ref/consecutive/ratio
-[61..75]  D10 分位数负荷预测 (15维)  LSTM 输出 (P3.3~P96.7)
-[76]      D10 shock_load_probability 冲击负荷发生概率
-[77]      D10 base_load              基荷 (50% 分位数)
+[61..75]  D10 分位数负荷预测 (15维)  LSTM D10 头推理 (v2.18, 冷启动时 fallback 到 data 合成)
+[76]      D10 shock_load_probability 冲击负荷发生概率 (LSTM sigmoid 输出, v2.18)
+[77]      D10 base_load              基荷 (50% 分位数, LSTM ReLU 输出, v2.18)
 [78]      (可选) mode_id              1字段
 ```
 
@@ -340,8 +341,8 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | 输入窗口 | 过去 120 分钟 (8 步 × 15分钟, v2.14 4→8) |
 | 输出窗口 | 未来 15 分钟 (1 步 × 15分钟)（默认，可配置至 30 分钟） |
 | 输入特征 | [pv_power, load_power, solar_irradiance, temperature, hour_sin, hour_cos, yesterday_pv] (7 维, v2.14 新增周期性特征) |
-| 输出 | [pv_forecast_1..15, load_forecast_1..15] (30 维，15+15) |
-| 模型架构 | 2 层 LSTM (hidden=64) + Linear head |
+| 输出 | [pv_forecast_1..15, load_forecast_1..15, quantiles_1..15, shock_prob, base_load] (47 维 = 15+15+15+1+1, v2.18: 30→47) |
+| 模型架构 | 2 层 LSTM (hidden=64) + 5 个 Linear 头 (pv/load/d10_quantiles/d10_shock/d10_base) |
 | 精度要求 | 光伏 MAPE ≤ 10%，负荷 MAPE ≤ 15% |
 | 训练数据 | SMART-DS 光伏 + 负荷数据，按时间 8:2 切分 |
 
@@ -354,7 +355,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | F3-01 | LSTM 模型训练完成，loss 收敛 | 检查训练 loss 曲线 |
 | F3-02 | 光伏预测 MAPE ≤ 10%（测试集） | 回测计算 |
 | F3-03 | 负荷预测 MAPE ≤ 15%（测试集） | 回测计算 |
-| F3-04 | 预测输出形状 (1, 30) = 15 pv + 15 load | 单元测试 |
+| F3-04 | 预测输出形状 (1, 47) = 15 pv + 15 load + 15 quantiles + 1 shock_prob + 1 base_load (v2.18) | 单元测试 |
 | F3-05 | ONNX 导出 + checker 验证通过 | `python export_onnx.py --lstm` |
 
 ---
@@ -473,7 +474,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 
 `export_onnx.py` 导出两种模型为 ONNX：
 
-1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features)，输出 (1, 30)
+1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features), 输出 (1, 47) (v2.18: pv15+load15+D10_17)
 2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 78) 或 (1, 79) (v2.14 对齐下游)，输出 (1, 2) (v2.15: [p_ref, k_droop])
 
 导出流程：
@@ -488,7 +489,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F6-01 | RL 策略 ONNX 输入 (1, 78/79) 输出 (1, 2) | 检查 ONNX spec (v2.17) |
-| F6-02 | LSTM ONNX 输入 (1, 4, 6) 输出 (1, 30) | 检查 ONNX spec |
+| F6-02 | LSTM ONNX 输入 (1, 4, 6) 输出 (1, 47) (v2.18) | 检查 ONNX spec |
 | F6-03 | ONNX 推理与 PyTorch 推理误差 < 1e-5 | 单元测试 |
 | F6-04 | 导出文件名含时间戳 | 检查文件名 |
 | F6-05 | 无 SB3 checkpoints 时自动从 npz 导出 | 测试 npz 路径 |
