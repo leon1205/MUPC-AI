@@ -309,6 +309,8 @@ pub async fn update_fused_state_quantiles(
 |------|--------|--------|
 | `load_forecast_quantiles` | 含义模糊（注释 vs 代码不一致）| **明确**：15 步 P90 值（与 `reward_calculator.rs` 取索引 13 一致）|
 
+> **说明**：`ProbabilisticLoadOutput.quantile_steps` 内部为 15 步 × [P10, P50, P90]，但仅 P90 写入 D10（保持 78 维不变）。P10/P50 数据生成后未消费，待 MUPC-AI2 训练管线实施真分位数回归（专家建议 #1）后再统一扩展至 45 维。
+
 ##### 变更 4：删除 confidence 字段（LSTM-08）
 
 **`LstmOutput` 结构简化：**
@@ -631,7 +633,7 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | | safety_override_p_ref | Option\<f64\> | [-50.0, 50.0] | kW | 安全覆盖强制放电功率（仅 active=true 时有效）| intercore |
 | | safety_override_consecutive | u32 | [0, ∞) | - | 连续触发次数（v2.14 新增）| intercore |
 | | safety_override_ratio | f64 | [0.0, 1.0] | - | 滑动窗口内覆盖比例（v2.14 新增）| intercore |
-| **D10-概率负荷** | load_forecast_quantiles | Vec\<f64\>(15) | [0.0, 10000.0] | kW | 分位数负荷预测（P10/P50/P90...，v2.11 新增）| LSTM |
+| **D10-概率负荷** | load_forecast_quantiles | Vec\<f64\>(15) | [0.0, 10000.0] | kW | 分位数负荷预测（v2.16：15 步 P90 值；P10/P50 数据生成后未消费，待真分位数回归上线后扩展）| LSTM |
 | | shock_load_probability | f64 | [0.0, 1.0] | - | 冲击负荷发生概率（v2.11 新增）| LSTM |
 | | base_load | f64 | [0.0, 10000.0] | kW | 基础负荷，50% 分位数（v2.11 新增）| LSTM |
 
