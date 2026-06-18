@@ -155,6 +155,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._override_consecutive: int = 0
 
         # v2.5: 季节/时段编码
+        # q_realtime_margin 占位值, reset 时无电压历史可用
+        # (上一步末端电压需 step() 末尾潮流仿真才能给出).
+        # 首次 step() 开头会基于 v_prev (=self._va/_vb/_vc 初值 1.0) 重算.
+        # 部署时该值由实时控制模块通过 DataUploadPayload 帧注入, 不存在此错位.
         self._q_realtime_margin: float = 0.5
         self._season_encoding: np.ndarray = np.zeros(6, dtype=np.float32)
         self._time_period_encoding: np.ndarray = np.zeros(2, dtype=np.float32)

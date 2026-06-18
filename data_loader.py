@@ -69,7 +69,12 @@ TOU_SCHEDULE_WINTER = [
 
 
 def _compute_months_from_hours(hours: np.ndarray, n_steps: int) -> np.ndarray:
-    """从小时数组计算月份（假设 1月1日从 step 0 开始，365天/年）。"""
+    """从小时数组计算月份（假设 1月1日从 step 0 开始，365天/年，非闰年）。
+
+    注: 训练管线使用 365 天平年简化. 闰年 (Feb 29) 会被映射到 Mar 1,
+    对 15 分钟步长训练影响可忽略. 边界处理: cum_days[12]=365 与 % 365
+    配合, 使 Dec 31 (索引 364) 落入 else 分支前被 m=11 (334..365) 截获.
+    """
     days = np.arange(n_steps) * 15 / 60 / 24  # 累积天数
     months = (days % 365).astype(np.float32)
     # 累积天数映射到月份: Jan=0..30, Feb=31..58, Mar=59..89, ...

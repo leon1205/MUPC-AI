@@ -269,7 +269,7 @@ VoltageSimulator 模式（降级）:
 
 **配置参数：**
 - `dual_control.enabled`: 启用/禁用下垂执行（默认 True，v2.15 起默认启用）
-- `dual_control.k_droop_min/max`: 下垂系数范围 [0, 30] (kW/V)
+- `dual_control.k_droop_min/max`: 下垂系数范围 [-100, 100] (kW/V, v2.17 对齐下游)
 - `dual_control.p_ref_ramp_limit_kw`: P_ref 变化率限制 (50.0 kW/步)
 - `dual_control.k_droop_ramp_limit`: k_droop 变化率限制 (10.0 kW/V/步)
 
@@ -450,9 +450,9 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 | 规则 ID | 约束条件 | 训练环境实现 |
 |---------|----------|-------------|
 | ACT-01 | \|Δp_ref\| ≤ 50 kW/步 | 计算变化率，超标则 clamp |
-| ACT-02 | \|Δk_droop\| ≤ 10 kW/V/步 | 计算变化率，超标则 clamp |
-| ACT-03 | p_ref ∈ [-50, 50] kW | 超出边界则 clamp |
-| ACT-04 | k_droop ∈ [0, 30] kW/V | 超出边界则 clamp |
+| ACT-02 | \|Δk_droop\| ≤ 30 kW/V/步 (v2.17) | 计算变化率，超标则 clamp |
+| ACT-03 | √(p_ref² + k_droop²) ≤ 200 kVA (S-circle, v2.17) | 超出边界则缩放 |
+| ACT-04 | k_droop ∈ [-100, 100] kW/V (v2.17) | 超出边界则 clamp |
 | ACT-05 | dispatch_p 有效时 \|p_ref\| ≤ \|dispatch_p\| | 有调度时 clamp |
 
 > 部署端 ActionValidator 在 Rust 端同样实现这些规则。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
@@ -474,7 +474,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 `export_onnx.py` 导出两种模型为 ONNX：
 
 1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features)，输出 (1, 30)
-2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 63) 或 (1, 64)，输出 (1, 2) (v2.15: [p_ref, k_droop])
+2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 78) 或 (1, 79) (v2.14 对齐下游)，输出 (1, 2) (v2.15: [p_ref, k_droop])
 
 导出流程：
 1. 加载 PyTorch checkpoint / NumPy PPO weights
