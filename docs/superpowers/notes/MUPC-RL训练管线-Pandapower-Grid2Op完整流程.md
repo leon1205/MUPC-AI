@@ -436,9 +436,13 @@ obs = observation.build_observation(state, forecast)  # 78 维 obs
 2. 边界保护: `max(0, min(i, n-1))` 防止首尾越界
 3. 构建 (8, 7) 输入, 含 sin/cos 小时编码 + 昨日 PV
 4. `predict_numpy(x[None, ...])` → (1, 47) 或 (1, 30)
-5. **截断到前 30 维返回** —— 向后兼容, D10 由 data_loader 合成提供
+5. **v2.18: 返回完整 47 维** (D2 + D10), 不再截断
 
-> **为什么 predict() 截断 30 维而不是返回 47 维**: 历史接口约定, D10 的真实生成由 `data_loader._generate_load_forecast_quantiles()` 合成 (15 维 linspace(0.85, 1.27) + shock_prob + base_load), 避免 LSTM D10 头与合成数据不一致. v2.14+ LSTM 已支持 47 维, 但 predict() 保持 30 维向后兼容.
+> **v2.18 变更**: 之前 predict() 截断到 30 维, D10 由 data_loader 合成 (linspace 数学公式). 修复训练-部署 gap: 训练时 RL 看到的 D10 与部署时 RKNN 输出的 D10 完全不同, 训练出的策略过拟合合成数据. v2.18 让 predict() 返回 47 维, MupcEnv 优先使用 LSTM D10 头推理结果, 部署时 RKNN 也输出 47 维, 训练-部署完全对齐.
+>
+> **冷启动保护**: LSTM D10 头训练初期输出是噪声, 不可用. MupcEnv 通过 `_d10_trained_count` 阈值 (默认 100 epoch) 控制:
+> - count < 100: D10 fallback 到 data 合成 (安全)
+> - count >= 100: D10 用 LSTM 推理结果 (与部署一致)
 
 #### 4.1.5.4 Oracle 后备 (无 PyTorch 时)
 
@@ -525,7 +529,7 @@ python export_onnx.py --lstm checkpoints/lstm_checkpoint.pt
 | 输入来源 | self._data 数组 (MupcEnv 内部) | intercore DataUploadPayload 帧 |
 | D10 处理 | 走 data_loader 合成 | 走 RKNN LSTM D10 头 (47 维完整用上) |
 
-> **训练-部署 gap 风险**: 训练时 predict() 截断 30 维 + D10 走合成, 部署时 RKNN 输出 47 维. 评估影响: 训练管线 D10 行为与 D2 行为解耦 (LSTM D2 头准确, D10 由 data 合成), 部署时 D10 行为依赖 RKNN LSTM 精度. v2.14+ 训练管线 predict() 已能返回 47 维 (model 自身支持), 后续可统一走 LSTM 路径.
+> **训练-部署 gap 风险 (v2.18 已修复)**: 训练时 predict() 截断 30 维 + D10 走合成, 部署时 RKNN 输出 47 维. 评估影响: 训练管线 D10 行为与 D2 行为解耦 (LSTM D2 头准确, D10 由 data 合成), 部署时 D10 行为依赖 RKNN LSTM 精度. v2.18 修复: predict() 返回 47 维 + MupcEnv 冷启动保护 (_d10_trained_count >= 100 才用 LSTM D10 头输出). 训练与部署现在共享同一 D10 数据源.
 
 ---
 

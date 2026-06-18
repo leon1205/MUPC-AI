@@ -166,6 +166,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         # 电压越限
         self._voltage_violation_count: int = 0
 
+        # v2.18: D10 冷启动阈值 (LSTM D10 头训练步数低于此值仍用 data 合成)
+        self._D10_WARMUP_THRESHOLD: int = 100
+
     # ── 电压仿真器初始化 ─────────────────────────────────
 
     def _init_voltage_simulator(self, use_grid2op: bool) -> None:
@@ -252,18 +255,39 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
     # ── 辅助状态构建 ────────────────────────────────────
 
-    def _make_env_state(self) -> observation.EnvState:
-        """从当前 self._* 状态构建 EnvState 快照 (用于观测构建)。"""
-        # D10 概率负荷预测: 优先使用 data 中的合成数据, fallback 到当前 load_power
-        if "load_forecast_quantiles" in self._data:
+    def _make_env_state(self, forecast: np.ndarray | None = None) -> observation.EnvState:
+        """从当前 self._* 状态构建 EnvState 快照 (用于观测构建)。
+
+        v2.18: forecast 参数用于 D10 字段 (LSTM 推理结果, 47 维)
+        - 训练时 D10 走 LSTM 头 (47 维), 消除训练-部署 gap
+        - 冷启动保护: LSTM D10 头 count < 阈值时, D10 fallback 到 data 合成
+        - Oracle / 无 LSTM 时: D10 完全走 data 合成 (向后兼容)
+        """
+        # D10 概率负荷预测: 优先 LSTM 推理 (forecast 47 维), fallback 到 data 合成
+        use_lstm_d10 = (
+            forecast is not None
+            and len(forecast) >= 47
+            and hasattr(self._predictor, "_d10_trained_count")
+            and self._predictor._d10_trained_count >= self._D10_WARMUP_THRESHOLD
+        )
+        if use_lstm_d10:
+            # LSTM D10 头输出: forecast[30:45]=quantiles, [45]=shock_prob, [46]=base_load
+            quantiles = forecast[30:45].astype(np.float32)
+            shock_prob = float(np.clip(forecast[45], 0.0, 1.0))
+            base_load = float(max(0.0, forecast[46]))
+        elif "load_forecast_quantiles" in self._data:
+            # fallback 1: data 合成 (LSTM 未达 warmup 阈值)
             quantiles = self._data["load_forecast_quantiles"][self._step_idx].astype(np.float32)
+            shock_prob = float(self._data["shock_load_probability"][self._step_idx]) \
+                if "shock_load_probability" in self._data else 0.0
+            base_load = float(self._data["base_load"][self._step_idx]) \
+                if "base_load" in self._data else float(self._data["load_power"][self._step_idx])
         else:
+            # fallback 2: 简单数学合成
             base = float(self._data["load_power"][self._step_idx])
             quantiles = (base * np.linspace(0.85, 1.27, 15)).astype(np.float32)
-        shock_prob = float(self._data["shock_load_probability"][self._step_idx]) \
-            if "shock_load_probability" in self._data else 0.0
-        base_load = float(self._data["base_load"][self._step_idx]) \
-            if "base_load" in self._data else float(self._data["load_power"][self._step_idx])
+            shock_prob = 0.0
+            base_load = base
 
         return observation.EnvState(
             soc=self._soc,
@@ -403,8 +427,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             except Exception:
                 pass
 
-        state = self._make_env_state()
         forecast = self._predictor.predict(self._step_idx)
+        state = self._make_env_state(forecast=forecast)
         obs = observation.build_observation(state, forecast)
         info = {"mode": self._current_mode}
         return obs, info
@@ -598,11 +622,12 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             **reward_info,
         }
         if terminated or truncated:
-            state = self._make_env_state()
             forecast = self._predictor.predict(self._step_idx)
+            state = self._make_env_state(forecast=forecast)
             info["terminal_observation"] = observation.build_observation(state, forecast)
 
-        state = self._make_env_state()
+        forecast = self._predictor.predict(self._step_idx)
+        state = self._make_env_state(forecast=forecast)
         forecast = self._predictor.predict(self._step_idx)
         obs = observation.build_observation(state, forecast)
         return obs, float(reward), terminated, truncated, info

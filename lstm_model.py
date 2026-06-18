@@ -65,6 +65,11 @@ class LSTMForecast:
         # 或 30 维 (D2 only) (向后兼容)
         self.output_dim = forecast_steps * 2 + (17 if with_d10 else 0)
 
+        # v2.18: D10 训练步数计数器 (供 MupcEnv 冷启动保护使用)
+        # LSTMTrainer 训练时递增, MupcEnv._make_env_state 据此决定 D10 数据来源
+        # 默认 0 表示 LSTM D10 头未训, MupcEnv 走 data 合成
+        self._d10_trained_count: int = 0
+
         self.lstm = _nn.LSTM(
             input_dim, hidden_dim, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
@@ -185,13 +190,15 @@ class LSTMForecast:
         self._data = data
 
     def predict(self, step_idx: int) -> np.ndarray:
-        """LSTM 预测接口 (向后兼容, 返回 30 维)。
+        """LSTM 预测接口 (v2.18: 返回 47 维, 不再截断).
 
-        v2.14: 模型本身输出 47 维 (pv15+load15+D10_17), 但 predict() 接口
-        保持 30 维向后兼容 (D10 由 data_loader 合成, 不通过 forecast 传递).
+        v2.14 之前: 30 维 (D2 only), D10 由 data_loader 合成.
+        v2.18 修复: 47 维 (D2 + D10), 训练时 D10 头真正用上, 消除训练-部署 gap.
+        部署时 RKNN 模型输出 47 维, 训练时返回 47 维与之对齐.
 
         Returns:
-            (30,) ndarray, 前15维=pv预测, 后15维=load预测
+            (47,) ndarray, [pv(15) + load(15) + quantiles(15) + shock_prob(1) + base_load(1)]
+            或 (30,) ndarray, [pv(15) + load(15)] (with_d10=False 时)
         """
         seq_len = 8
         # 构建 hour sin/cos
@@ -218,10 +225,13 @@ class LSTMForecast:
             # 第7维: 昨日同时段 PV（周期性特征）
             x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
 
-        # predict_numpy 期望 (batch, seq_len, 6)
+        # predict_numpy 期望 (batch, seq_len, 7)
         out = self.predict_numpy(x[np.newaxis, :, :])  # (1, 47) 或 (1, 30)
-        # 向后兼容: 只返回前 30 维 (D2), D10 由 EnvState 从 data 读取
-        return out[0, :30]
+        # v2.18: 返回完整 47 维 (D2 + D10), 不再截断
+        #   - D2 (前 30 维): 喂给 build_observation 的 D2
+        #   - D10 (后 17 维): 由 MupcEnv 解析后喂给 D10 obs 字段
+        # 这样训练时 D10 真正用上 LSTM 推理结果, 消除训练-部署 gap
+        return out[0]
 
 
 # ── 训练器 ─────────────────────────────────────────────────────
@@ -402,6 +412,10 @@ class LSTMTrainer:
             avg_loss = epoch_loss / len(loader)
             history["train_loss"].append(avg_loss)
 
+            # v2.18: 更新 D10 训练计数器, MupcEnv 据此决定 D10 数据来源
+            # 阈值: 100 epoch 后启用 LSTM D10 输出 (避免 D10 头未训时输出噪声)
+            self.model._d10_trained_count = epoch + 1
+
             # ── 验证 ──
             if val_data is not None:
                 self.model.lstm.eval()
@@ -497,6 +511,8 @@ class OraclePredictor:
         self.pv_data = data["pv_power"]
         self.load_data = data["load_power"]
         self.data_len = len(self.pv_data)
+        # v2.18: Oracle 永远不提供 D10, MupcEnv 据此走 data 合成 fallback
+        self._d10_trained_count: int = 0
 
     def predict(self, step_idx: int) -> np.ndarray:
         """返回 (30,) = [pv_15_forecast, load_15_forecast]。
