@@ -80,9 +80,6 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             from lstm_model import OraclePredictor
             self._predictor = OraclePredictor(data)
 
-        # 动作校验器
-        self._validator = ActionValidator()
-
         # 电压仿真器 (Grid2Op 优先，失败降级到 VoltageSimulator)
         self._use_grid2op_requested = use_grid2op
         self._use_grid2op_active = False
