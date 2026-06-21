@@ -190,13 +190,15 @@ def main():
     lstm_cfg = {"epochs": 50, "batch_size": 64}
     if args.config:
         mssa_cfg = parse_mssa_config(args.config)
-        lstm_cfg.update({k: v for k, v in mssa_cfg.items()
-                         if k in ["hidden_size", "num_layers", "lr", "batch_size",
-                                  "input_window", "output_mode", "with_attention"]})
-        # 将 extra 参数送入 args (覆盖 argparse 默认值)
+        # v3.0: MSSA 键名 → 训练配置键名映射
+        KEY_MAP = {"hidden_size": "hidden_dim", "lr": "learning_rate"}
+        mapped = {}
         for k, v in mssa_cfg.items():
-            if hasattr(args, k):
-                setattr(args, k, v)
+            target_k = KEY_MAP.get(k, k)
+            mapped[target_k] = v
+        lstm_cfg.update({k: v for k, v in mapped.items()
+                         if k in ["hidden_dim", "num_layers", "learning_rate", "batch_size",
+                                  "input_window", "output_mode", "with_attention"]})
 
     # ── LSTM / Oracle ────────────────────────────────────
     predictor = None

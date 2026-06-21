@@ -241,7 +241,7 @@ class LSTMForecast:
             self.attention.eval()
         return self
 
-    def train(mode: bool = True) -> "LSTMForecast":
+    def train(self, mode: bool = True) -> "LSTMForecast":
         self.lstm.train(mode)
         if self.output_mode == "p10p50p90":
             for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
@@ -381,14 +381,14 @@ class LSTMForecast:
         pv = out3d[0]    # (15, 3)
         lo = out3d[1]    # (15, 3)
         # D2 pv = P50, D2 load = P50
-        # D10 quantiles = P90 (15 维)
+        # D10 quantiles = load P90 (15 维, 对齐下游 D10 语义: 分位数负荷预测)
         # D10 shock = 简单估计: spread_mean / (base + 1)
-        spread = pv[:, 2] - pv[:, 1]  # P90 - P50
-        shock = float(np.clip(np.mean(spread) / (pv[0, 1] + 1.0), 0.0, 1.0))
-        base = float(pv[0, 1])  # 基荷 = 第一步 P50
+        load_spread = lo[:, 2] - lo[:, 1]  # Load P90 - P50
+        shock = float(np.clip(np.mean(load_spread) / (lo[0, 1] + 1.0), 0.0, 1.0))
+        base = float(lo[0, 1])  # 基荷 = 第一步 Load P50
         return np.concatenate([
             pv[:, 1], lo[:, 1],    # D2: pv_p50(15) + load_p50(15) = 30
-            pv[:, 2],              # D10 quantiles = pv_p90(15)
+            lo[:, 2],              # D10 quantiles = load_p90(15) (修正: load 非 pv)
             [shock],               # D10 shock prob
             [base],                # D10 base load
         ]).astype(np.float32)
@@ -407,8 +407,8 @@ LSTM_TRAIN_CONFIG = {
     "learning_rate": 1e-3,
     "epochs": 200,
     "patience": 20,
-    "output_mode": "p10p50p90",  # v3.0
-    "with_attention": True,       # v3.0
+    "output_mode": "legacy",         # 默认 legacy (v3.0 p10p50p90 由 --config 切换)
+    "with_attention": False,         # 默认无 Attention (由 --config 启用)
 }
 
 
@@ -653,7 +653,9 @@ class LSTMTrainer:
         print(f"  目标: PV_MAPE <= 10%  {'[PASS]' if pv_mape <= 10 else '[WARN]'}")
         print(f"  目标: Load_MAPE <= 15% {'[PASS]' if load_mape <= 15 else '[WARN]'}")
 
-        return {"model": self.model, "history": history}
+        return {"model": self.model, "history": history,
+                "metrics": {"pv_mape": pv_mape / 100.0, "load_mape": load_mape / 100.0,
+                           "pv_mape_step1": pv_mape / 100.0, "load_mape_step1": load_mape / 100.0}}
 
     def _compute_mape(self, X: np.ndarray, y: np.ndarray, is_pv: bool) -> float:
         """计算 MAPE (%).
