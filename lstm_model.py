@@ -94,21 +94,26 @@ class LSTMForecast:
                  num_layers: int = 2, forecast_steps: int = 15,
                  dropout: float = 0.1, with_d10: bool = True,
                  with_attention: bool = True,
-                 output_mode: str = "p10p50p90"):
+                 output_mode: str = "p10p50p90",
+                 bidirectional: bool = False):
         """
         Args:
             input_dim: 输入特征维度
-            hidden_dim: LSTM 隐藏层维度
+            hidden_dim: LSTM 隐藏层维度 (bidirectional 时自动折半以控制参数量)
             num_layers: LSTM 层数
             forecast_steps: 预测步数 (默认 15)
             dropout: dropout 比率
             with_d10: legacy 模式下是否启用 D10 头 (v2.14)
             with_attention: 是否含 Attention 层 (v3.0)
             output_mode: "legacy" 或 "p10p50p90" (v3.0)
+            bidirectional: 是否启用 BiLSTM (v3.0 R2)
         """
         _ensure_torch()
+        self.bidirectional = bidirectional
+        # 双向时折半 hidden_dim 以控制参数量 ≤ 单向的 2.2x
+        lstm_hidden = hidden_dim // 2 if bidirectional else hidden_dim
         self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = hidden_dim  # 对外暴露原始 hidden_dim (metadata)
         self.num_layers = num_layers
         self.forecast_steps = forecast_steps
         self.with_d10 = with_d10
@@ -116,7 +121,7 @@ class LSTMForecast:
         self.output_mode = output_mode
 
         if output_mode == "p10p50p90":
-            self.output_dim = forecast_steps * 2 * 3  # 2 target × 15 steps × 3 quantiles
+            self.output_dim = forecast_steps * 2 * 3
         else:
             self.output_dim = forecast_steps * 2 + (17 if with_d10 else 0)
 
@@ -124,9 +129,12 @@ class LSTMForecast:
         self._d10_trained_count: int = 0
 
         self.lstm = _nn.LSTM(
-            input_dim, hidden_dim, num_layers,
+            input_dim, lstm_hidden, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
         )
+        # LSTM 输出维度 = lstm_hidden * (2 if bidirectional else 1)
+        # 双向时 hidden_dim 不变 (折半后 × 2 = 原始), heads/attention 输入维度始终为 hidden_dim
         # v3.0: AdditiveAttention
         self.attention = AdditiveAttention(hidden_dim) if with_attention else None
 
