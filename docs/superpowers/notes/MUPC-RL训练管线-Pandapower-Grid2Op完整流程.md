@@ -18,6 +18,7 @@
 8. [完整训练循环的规模化运行](#8-完整训练循环的规模化运行)
 9. [为什么这套设计是合理的](#9-为什么这套设计是合理的)
 10. [常见问题与进阶主题](#10-常见问题与进阶主题)
+11. [v3.0 核心改动逻辑与版本对比](#11-v30-核心改动逻辑与版本对比)
 
 ---
 
@@ -1449,6 +1450,188 @@ policy.learn(total_timesteps=1_000_000)
 
 ---
 
+## 11. v3.0 核心改动逻辑与版本对比
+
+> v3.0 预测增强分层混合架构于 2026-06-21 上线, 对训练管线进行系统性升级。
+> 相关文档: `docs/superpowers/specs/2026-06-21-MUPC-RL训练管线-v3.0-设计文档.md` [DESIGN_APPROVED]
+> 下游 PRD: `docs/MUPC/05-MUPC-AI引擎-PRD.md` v3.0 [REVIEWED: PASS]
+
+### 11.1 改动驱动因素
+
+v2.x 训练管线存在以下体系性问题, v3.0 逐一解决:
+
+| 问题 | v2.x 现状 | v3.0 解决 |
+|------|----------|----------|
+| LSTM 缺乏时序注意力 | 取最后步 hidden state, 忽略关键时段 | AdditiveAttention 嵌入 ONNX 计算图 |
+| 输出维度单一 (点预测) | 输出 (B, 47) 无分位数信息 | 输出 (B, 2, 15, 3) P10/P50/P90 三通道 |
+| ONNX 缺少元数据 | 无 metadata_props, 下游无法校验 | metadata_props 10 键交叉校验 |
+| 超参手动调参 | 人工 grid search | MSSA 自动搜索 + --config 接口 |
+| stdout 输出不规范 | 日志混杂, MSSA 无法解析 | stdout 结构化 PV_MAPE= LOAD_MAPE= |
+| 特征选择固定 | 固定 7 维, 无量化依据 | MIC 相关系数筛选 Top-K |
+| 训练-部署 gap | D10 走合成数据, 与部署不同 | v2.18 已修复; v3.0 继续用 LSTM D10 推理 |
+
+### 11.2 分层架构总览 (五层)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    v3.0 预测增强分层混合架构 (五层)                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  原始特征 ──→ [第1层] MIC 特征筛选 (离线 Python 脚本)                   │
+│               └─ 按 MIC 值排序, 取 Top-K (默认 K=7)                    │
+│                                                                       │
+│  筛选特征 ──→ [第2层] VMD 信号分解 (R2 可选, CPU 预处理)               │
+│               └─ 将序列分解为 K 个子模态 (IMF_1..IMF_K)                │
+│                                                                       │
+│  子模态 ──→ [第3层] LSTM + AdditiveAttention (NPU 推理)               │
+│             └─ Attention 自动关注辐照突变、负荷峰谷等关键时段           │
+│             └─ 输出 (B, 2, 15, 3): PV/Load × 15步 × (P10,P50,P90)     │
+│                                                                       │
+│  预测残差 ──→ [第4层] BiLSTM 误差修正 (R2 可选, 独立轻量模型)           │
+│               └─ 修正主模型系统性偏差, Bias > 3% MAPE 才启用            │
+│                                                                       │
+│  训练阶段 ──→ [第5层] MSSA 超参自动搜索 (离线 Python 工具)              │
+│               └─ 雀群算法搜索 10 维超参, 输出最优配置 JSON               │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 LSTM 模型: v2.x vs v3.0
+
+| 维度 | v2.x (v2.18) | v3.0-R1 | v3.0-R2 |
+|------|-------------|---------|---------|
+| **输入窗口** | 8 步 (120 min) | 12/24/36 步 (MSSA 确定) | 同 R1 |
+| **输入特征** | 固定 7 维 | K 维 (MIC 筛选, K ≤ 7) | 同 R1 |
+| **核心架构** | LSTM × 2 层 | LSTM × 2 层 + AdditiveAttention | LSTM + Attention (或 BiLSTM + Attention) |
+| **隐藏层输出** | h_n[-1] (最后层末步) | ctx = Σ(α_i · h_i) (加权求和) | 同 R1 |
+| **输出头** | 2 头 (legacy) 或 5 头 (with_d10) | 6 头: PV/Load × P10/P50/P90 | 同 R1 + K 通道 (VMD) |
+| **输出维度** | (B, 47) 或 (B, 30) | (B, 2, 15, 3) = 90 维 | (B, K, 2, 15, 3) |
+| **ONNX 算子** | LSTM + Linear + ReLU | +Attention (Gemm+Tanh+Softmax+Mul+ReduceSum) | +BiLSTM 方向 |
+
+**关键改动逻辑**:
+
+**v2.x `forward()`** (取最后步):
+```python
+out, (h_n, _) = self.lstm(x)
+last_hidden = h_n[-1]              # (B, H) 只看最后一步
+pv = self.head_pv(last_hidden)     # → (B, 15)
+```
+
+**v3.0 `forward()`** (Attention 加权):
+```python
+h_seq, (h_n, _) = self.lstm(x)     # h_seq: (B, T, H) 全部时间步
+score = self.v(tanh(self.W(h_seq))) # (B, T, 1) 评分
+weights = softmax(score)            # (B, T)  归一化权重
+ctx = sum(weights * h_seq, dim=1)  # (B, H)  加权上下文
+# ctx 自动给予关键时段更高权重, 无需人工指定
+pv_p10 = self.head_pv_p10(ctx)     # → (B, 15) P10 分位
+pv_p50 = self.head_pv_p50(ctx)     # → (B, 15) P50
+pv_p90 = self.head_pv_p90(ctx)     # → (B, 15) P90
+out = stack([pv, load], dim=1)     # → (B, 2, 15, 3) 完整分位数
+```
+
+**为什么用 AdditiveAttention 而非 Self-Attention**:
+- Self-Attention (Q·K^T) 需要 √d_k 缩放 + 多头, 计算量大
+- AdditiveAttention (Bahdanau) 用 Linear→Tanh→Linear, 全是 ONNX 标准算子
+- 24 步短序列场景下, AdditiveAttention 足够捕获时序注意力
+- 参数量 ~hidden_dim² (远小于 Self-Attention 的 3·hidden_dim²)
+
+### 11.4 ONNX 导出: v2.x vs v3.0
+
+| 维度 | v2.x | v3.0 |
+|------|------|------|
+| **导出函数** | `export_lstm()` 硬编码 4 步窗口 | `export_lstm(input_window, with_attention, bidirection, metadata)` |
+| **计算图** | LSTM → Linear → output | LSTM → AdditiveAttention → 6×Linear → stack → output |
+| **metadata_props** | 无 | `mupc_model_type` / `mupc_with_attention` / `mupc_with_vmd` / `mupc_mic_topk` / `mupc_output_horizon` / `mupc_input_window` / `mupc_hidden_size` / `mupc_num_layers` / `mupc_direction` / `mupc_version` (10 键) |
+| **输出节点** | `["forecast"]` | `["forecast" (, "attention_weights")]` |
+| **模型数量** | 1 个 (`lstm_forecast.onnx`) | 最多 3 个: `lstm_attn.onnx` / `bilstm_attn.onnx` / `error_correction.onnx` |
+| **CLI 参数** | `--lstm <path>` + `--to-rknn` | +`--input-window` / `--with-attention` / `--bidirectional` / `--metadata` |
+
+**metadata_props 校验行为** (下游启动时):
+- `mupc_model_type` 与配置 `bilstm.enabled` 交叉校验 → 不一致时: 必选模型拒绝加载, 可选模型记录 WARN
+- `mupc_input_window` 与推理端 `input_window_secs/step_seconds` 交叉校验 → 不一致时拒绝加载
+- `mupc_with_vmd` 与配置 `vmd.enabled` 交叉校验 → 不一致时以 metadata 为准
+
+### 11.5 训练接口: v2.x vs v3.0
+
+| 维度 | v2.x | v3.0 |
+|------|------|------|
+| **超参来源** | argparse 分散参数 | `--config <JSON>` (MSSA 生成) |
+| **stdout 输出** | 自由 `print()` 日志 | `PV_MAPE=0.xxx LOAD_MAPE=0.xxx` (MSSA 正则解析) |
+| **错误处理** | 异常时行为不明确 | `sys.stderr [FATAL]` + `sys.exit(1)` (MSSA 标记无效) |
+| **数据指纹** | 无 | `compute_data_fingerprint()` SHA256 前 16 位 |
+| **特征筛选** | 固定 7 维 | `--mic <JSON>` 按 `features[].selected` 筛选 |
+| **MSSA 结果** | 无 | `--mssa-result <JSON>` 读取最优超参 |
+
+**MSSA 调用流程**:
+```
+MSSA 工具 (tools/mssa_optimizer/)
+  │  生成临时训练配置文件 (JSON)
+  │  {hidden_size, num_layers, attn_score, vmd_k, lr, batch_size, ...}
+  │
+  ├──→ subprocess: python train.py --config /tmp/mssa_iter_42.json
+  │      │
+  │      ├─ 读取 JSON 超参, 初始化 LSTMForecast + LSTMTrainer
+  │      ├─ 训练 LSTM
+  │      ├─ 计算 PV_MAPE / LOAD_MAPE
+  │      └─ stdout: "PV_MAPE=0.073 LOAD_MAPE=0.110"
+  │
+  ├──→ ResultParser: 正则提取 PV_MAPE=(.+).*LOAD_MAPE=(.+)
+  │      │
+  │      └─ 目标函数: weighted_MAPE = 0.5×PV_MAPE + 0.5×LOAD_MAPE
+  │          若 stdout 无输出 → penalty_score = 1e6
+  │          若退出码非零 → penalty_score = 1e6
+  │
+  └──→ 下一轮迭代, 直到收敛 (3 条件: max_iter / no_improvement / timeout)
+```
+
+### 11.6 v2.x → v3.0 迁移清单
+
+| 改动项 | 影响范围 | 向后兼容 |
+|--------|----------|----------|
+| `LSTMForecast(output_mode="legacy")` 默认 | 无变更 | ✅ v2.x 训练脚本不受影响 |
+| `export_lstm()` 新参数 | legacy 调用不传新参数, 行为不变 | ✅ |
+| `--config` 可选参数 | 不传时走 argparse 默认超参 | ✅ |
+| `--mic` / `--mssa-result` 可选参数 | 不传时用固定 7 维特征 | ✅ |
+| stdout `PV_MAPE=` / `LOAD_MAPE=` | 仅在 LSTM 训练后输出 | ✅ |
+| `AdditiveAttention` 新增 | 仅在 `with_attention=True` 时启用 | ✅ |
+| `p10p50p90` 输出格式 | 仅在 `output_mode="p10p50p90"` 时启用 | ✅ |
+
+**核心原则**: v3.0 所有新功能通过 feature flag 控制 (`with_attention`, `output_mode`, `--config`), 不传任何新参数时等价于 v2.18 行为。
+
+### 11.7 R1 vs R2 分轮交付
+
+| 轮次 | 交付物 | 状态 |
+|------|--------|------|
+| **R1** | `AdditiveAttention` ONNX 嵌入, `metadata_props` 10 键, `--config` CLI, stdout MAPE, MIC JSON, 数据指纹 | ✅ 已实现 (commit `4aeb66c`) |
+| **R2** | `bilstm_attn.rknn`, VMD K 通道, `error_correction.rknn`, Quantile Loss | 📋 待实现 |
+
+### 11.8 完整 v2.x → v3.0 数据流对比
+
+**v2.x 训练数据流**:
+```
+SMART-DS CSV
+  → SmartDSLoader.load_all()
+  → LSTMTrainer (固定 7 维, 8 步窗口)
+  → LSTMForecast (LSTM×2 → h_n[-1] → 2 头 → 47 维)
+  → export_lstm() (4 步假输入, 无 metadata)
+  → lstm_forecast.onnx
+```
+
+**v3.0-R1 训练数据流**:
+```
+SMART-DS CSV
+  → compute_data_fingerprint()               ──→ MSSA 缓存命中
+  → MIC 离线分析 (minepy) → JSON             ──→ --mic 特征筛选
+  → LSTMTrainer (K 维, 12 步窗口)
+  → LSTMForecast (LSTM×2 + AdditiveAttention → 6 头 → 90 维)
+  → export_lstm() (12 步, Attention 嵌入, metadata_props)
+  → lstm_attn.onnx
+  → stdout: PV_MAPE=0.xxx LOAD_MAPE=0.xxx  ──→ MSSA 解析
+```
+
+---
+
 ## 总结
 
 整个流程可以一句话概括:
@@ -1459,6 +1642,6 @@ policy.learn(total_timesteps=1_000_000)
 
 ---
 
-**文档版本**: v1.0
-**最后更新**: 2026-06-17
-**适用项目版本**: MUPC v2.17
+**文档版本**: v2.0
+**最后更新**: 2026-06-21
+**适用项目版本**: MUPC v3.0 (含 v2.x 向后兼容)
