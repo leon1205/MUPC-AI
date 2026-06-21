@@ -64,7 +64,7 @@ class ContractConfig:
 class VoltageSimulatorConfig:
     k_p: float = 0.05
     k_q: float = 0.03
-    s_base: float = 500.0
+    s_base: float = 200.0  # v3.0 对齐变压器容量 200kVA
     v_min: float = 0.85
     v_max: float = 1.15
     noise_std: float = 0.005
@@ -87,10 +87,10 @@ class CommConfig:
 class DualControlConfig:
     """双参数下垂控制配置 (v2.15: 2 维动作空间 [p_ref, k_droop])"""
     enabled: bool = True
-    k_droop_min: float = 0.0
-    k_droop_max: float = 30.0
+    k_droop_min: float = -100.0   # v2.17 对齐下游
+    k_droop_max: float = 100.0    # v2.17 对齐下游
     p_ref_ramp_limit_kw: float = 50.0
-    k_droop_ramp_limit: float = 10.0
+    k_droop_ramp_limit: float = 30.0  # v2.17 对齐下游 ACT-02
     pv_limit_min: float = 0.0
 
 

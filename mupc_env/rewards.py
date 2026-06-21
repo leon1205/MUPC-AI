@@ -115,13 +115,14 @@ def _compute_alpha(soc_new: float, q_margin: float,
 
 
 def _compute_overload(lr_unc: float) -> float:
-    """过载惩罚 (R-04 v2.12 分段惩罚)。"""
+    """过载惩罚 (R-04 v2.12 分段惩罚, v3.0 对齐 Rust: [0.90,1.00) 二次)。"""
     if lr_unc < 0.75:
         return 0.0
     elif lr_unc < 0.90:
         return -(lr_unc - 0.75) / 0.15 * 10.0
     elif lr_unc < 1.00:
-        return -(10.0 + (lr_unc - 0.90) / 0.10 * 40.0)
+        excess = (lr_unc - 0.90) / 0.10
+        return -(10.0 + excess * excess * 40.0)  # v3.0: 二次 (对齐 Rust)
     else:
         return -100.0
 
@@ -161,7 +162,9 @@ def _compute_pq_coordination(dev: float, q_margin: float, p_ref: float,
     else:
         r_correct = 0.0
 
-    return w_save * r_lazy + w_support * r_correct
+    # v3.0: 死区平滑因子 (对齐 Rust: 在 [0.05, 0.10] 线性过渡, 避免硬阈值跳变)
+    dead_zone_factor = min(max((dev - VOLTAGE_DEADBAND) / VOLTAGE_DEADBAND, 0.0), 1.0)
+    return (w_save * r_lazy + w_support * r_correct) * dead_zone_factor
 
 
 def _compute_ramp_penalty(p_ref: float, prev_p_batt: float) -> float:
@@ -171,11 +174,14 @@ def _compute_ramp_penalty(p_ref: float, prev_p_batt: float) -> float:
 
 def _compute_voltage_slope(v_avg: float, prev_v_avg: float,
                            base_w6: float) -> tuple[float, float]:
-    """电压变化斜率惩罚 (R-05 v2.12 动态权重)。"""
+    """电压变化斜率 (v3.0: 返回原始斜率 + 动态权重, 对齐 Rust).
+
+    Rust: r_voltage_slope = |ΔV|, w6_dynamic = base_w6 * (1 + k*|ΔV|).
+    """
     r_slope = abs(v_avg - prev_v_avg) if prev_v_avg is not None else 0.0
     k_w6 = 2.0
     w6_dynamic = base_w6 * (1.0 + k_w6 * r_slope)
-    return w6_dynamic * r_slope, r_slope
+    return r_slope, w6_dynamic
 
 
 def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
@@ -295,10 +301,11 @@ def _compute_state_improvement(v_avg: float, prev_v_avg: float,
     - 放电但电压偏差增大 → 负奖励 (放电没效果)
     - 充电且电压偏差减小 → 负奖励 (不该充电)
     """
-    if abs(prev_v_avg) < 1e-6:
-        return 0.0  # 首次调用无奖励
     v_dev_curr = abs(v_avg - 1.0)
     v_dev_prev = abs(prev_v_avg - 1.0)
+    # v3.0: 检查电压偏差 (对齐 Rust v_dev_prev < 1e-6), 非电压绝对值
+    if v_dev_prev < 1e-6:
+        return 0.0  # 首次调用无奖励
     delta_v_dev = v_dev_prev - v_dev_curr
     sign_p = 1.0 if p_ref > 0.0 else -1.0
     return 10.0 * delta_v_dev * sign_p
@@ -348,7 +355,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     r_pq = _compute_pq_coordination(dev, q_margin, p_ref, v_low, v_high,
                                     safety_override_active)
     p_ramp = _compute_ramp_penalty(p_ref, r.get("prev_p_batt", 0.0))
-    p_voltage, r_voltage_slope = _compute_voltage_slope(
+    r_voltage_slope, w6_dynamic = _compute_voltage_slope(
         v_avg, r.get("prev_v_avg", 1.0), w[5] if len(w) > 5 else 0.5)
     r_smooth = _compute_droop_smoothness(r.get("k_droop", 0.0),
                                          r.get("prev_k_droop", 0.0))
@@ -381,14 +388,16 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     raw_reward = w[0] * r_pv - alpha * w[1] * p_batt_deg - w[2] * p_overload + w4 * r_pq
 
     # 子项归一化到 [-1, 1]
-    r_pv_norm = float(np.clip(r_pv, 0.0, 1.0))
-    p_batt_deg_norm = float(np.clip(alpha * (-p_batt_deg / 0.25), -1.0, 0.0)) if p_batt_deg > 0 else 0.0
+    # v3.0: r_pv 可能为负 (高电压放电惩罚=-20), 对齐 Rust r_pv/100 得 [-0.2, 1.0]
+    r_pv_norm = float(np.clip(r_pv / 100.0, -1.0, 1.0))
+    # v3.0: 归一化系数对齐 Rust (w2: 10x, w4: /50, w5: 10x)
+    p_batt_deg_norm = float(np.clip(alpha * (-p_batt_deg * 10.0), -1.0, 0.0)) if p_batt_deg > 0 else 0.0
     p_overload_norm = float(np.clip(p_overload / 100.0, -1.0, 0.0)) if p_overload < 0 else 0.0
     r_pq_norm = float(np.clip(r_pq / 50.0, -1.0, 1.0))
-    p_ramp_norm = float(np.clip(-p_ramp / 0.05, -1.0, 0.0)) if p_ramp > 0 else 0.0
+    p_ramp_norm = float(np.clip(-p_ramp * 10.0, -1.0, 0.0)) if p_ramp > 0 else 0.0
 
-    max_w6 = w[5] * (1.0 + 2.0 * 0.4) if len(w) > 5 else 0.5 * (1.0 + 2.0 * 0.4)
-    p_vs_norm = float(np.clip(-p_voltage / max_w6 / 0.4, -1.0, 0.0)) if p_voltage > 0 and max_w6 > 0 else 0.0
+    # v3.0: 对齐 Rust — 原始斜率 * 10 归一化, 动态权重在 total 中乘
+    p_vs_norm = float(np.clip(-r_voltage_slope * 10.0, -1.0, 0.0)) if r_voltage_slope > 0 else 0.0
 
     r_smooth_norm = float(np.clip(r_smooth / 130.0, -1.0, 0.0)) if r_smooth < 0 else 0.0
     # v2.17 修正: _compute_safety_override 已返回 [-1,0], 不再除 100
@@ -400,7 +409,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
              + w[2] * p_overload_norm
              + w4 * r_pq_norm
              + w5 * p_ramp_norm
-             + w[5] * p_vs_norm
+             + w6_dynamic * p_vs_norm
              + w7 * r_smooth_norm
              + w8 * r_safety_norm
              + w9 * r_readiness
