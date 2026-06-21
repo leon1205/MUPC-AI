@@ -267,11 +267,17 @@ def _verify_onnx_inference(pytorch_model, onnx_path: str, obs_dim: int) -> None:
 
 # ── LSTM 导出 ─────────────────────────────────────────────────
 
-def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/") -> str:
-    """导出 LSTM 模型为 ONNX。
+def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
+                input_window: int = 4, with_attention: bool = False,
+                bidirection: bool = False, metadata: dict | None = None) -> str:
+    """导出 LSTM 模型为 ONNX (v3.0: 支持 Attention + metadata_props).
 
-    Input:  (batch=1, seq_len=4, features=6)
-    Output: (batch=1, 30) = [pv_forecast(15), load_forecast(15)]
+    Args:
+        checkpoint_path: LSTMForecast 权重文件路径
+        input_window: 输入窗口步数 (legacy=4, v3.0=12/24/36)
+        with_attention: 是否嵌入 Attention 计算图
+        bidirection: 是否导出 BiLSTM (R2)
+        metadata: metadata_props 字典 (v3.0 必须), None 则用默认值
     """
     import torch
     import torch.nn as nn
@@ -280,54 +286,110 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/") ->
     _ensure_export_deps()
 
     from lstm_model import LSTMForecast
-    lstm_model = LSTMForecast()
+    lstm_model = LSTMForecast(
+        with_attention=with_attention,
+        output_mode="p10p50p90" if with_attention else "legacy",
+    )
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     lstm_model.load_state_dict(state_dict)
     lstm_model.eval()
 
-    # Wrap in nn.Module for ONNX export
+    # 构建 ONNX 可导出包装器
     class LSTMWrapper(nn.Module):
-        def __init__(self, lstm_model):
+        def __init__(self, m):
             super().__init__()
-            # Use LSTMForecast's actual submodules (already initialized with correct dropout)
-            self.lstm = lstm_model.lstm
-            self.head_pv = lstm_model.head_pv
-            self.head_load = lstm_model.head_load
-            # LSTMForecast.state_dict() returns nested dict, load into nn.Module directly
-            # by flattening it
-            nested_sd = lstm_model.state_dict()
-            flat_sd = {}
-            for submod, params in nested_sd.items():
-                for k, v in params.items():
-                    flat_sd[f"{submod}.{k}"] = v
-            self.load_state_dict(flat_sd)
+            self.lstm = m.lstm
+            if m.attention is not None:
+                self.attn_W = m.attention.W
+                self.attn_v = m.attention.v
+                self.has_attn = True
+            else:
+                self.has_attn = False
+            self.output_mode = m.output_mode
+            if self.output_mode == "p10p50p90":
+                self.head_pv_p10 = m.head_pv_p10
+                self.head_pv_p50 = m.head_pv_p50
+                self.head_pv_p90 = m.head_pv_p90
+                self.head_load_p10 = m.head_load_p10
+                self.head_load_p50 = m.head_load_p50
+                self.head_load_p90 = m.head_load_p90
+            else:
+                self.head_pv = m.head_pv
+                self.head_load = m.head_load
+                self.with_d10 = m.with_d10
+                if m.with_d10:
+                    self.head_d10_quantiles = m.head_d10_quantiles
+                    self.head_d10_shock = m.head_d10_shock
+                    self.head_d10_base = m.head_d10_base
 
         def forward(self, x):
-            _, (h_n, _) = self.lstm(x)
-            last_hidden = h_n[-1]
-            pv_pred = self.head_pv(last_hidden)
-            load_pred = self.head_load(last_hidden)
-            return torch.cat([pv_pred, load_pred], dim=-1)
+            h_seq, (h_n, _) = self.lstm(x)
+            if self.has_attn:
+                score = self.attn_v(torch.tanh(self.attn_W(h_seq)))
+                weights = torch.softmax(score.squeeze(-1), dim=1)
+                ctx = torch.sum(weights.unsqueeze(-1) * h_seq, dim=1)
+            else:
+                ctx = h_n[-1]
+
+            if self.output_mode == "p10p50p90":
+                pv_p10 = torch.relu(self.head_pv_p10(ctx))
+                pv_p50 = torch.relu(self.head_pv_p50(ctx))
+                pv_p90 = torch.relu(self.head_pv_p90(ctx))
+                load_p10 = torch.relu(self.head_load_p10(ctx))
+                load_p50 = torch.relu(self.head_load_p50(ctx))
+                load_p90 = torch.relu(self.head_load_p90(ctx))
+                pv = torch.stack([pv_p10, pv_p50, pv_p90], dim=-1)
+                lo = torch.stack([load_p10, load_p50, load_p90], dim=-1)
+                out = torch.stack([pv, lo], dim=1)  # (B, 2, 15, 3)
+                if self.has_attn:
+                    return out, weights
+                return out
+            else:
+                pv = torch.relu(self.head_pv(ctx))
+                lo = torch.relu(self.head_load(ctx))
+                return torch.cat([pv, lo], dim=-1)
 
     model = LSTMWrapper(lstm_model)
     model.eval()
 
     os.makedirs(output_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    onnx_path = os.path.join(output_dir, f"lstm_forecast_{ts}.onnx")
+    prefix = "bilstm_attn" if bidirection else ("lstm_attn" if with_attention else "lstm_forecast")
+    onnx_path = os.path.join(output_dir, f"{prefix}_{ts}.onnx")
 
-    dummy_input = torch.randn(1, 4, 6)
+    dummy_input = torch.randn(1, input_window, 7)
+    output_names = ["forecast", "attention_weights"] if with_attention else ["forecast"]
+
+    # v3.0: metadata_props 注入
+    export_metadata = metadata or {
+        "mupc_model_type": "bilstm" if bidirection else "lstm",
+        "mupc_with_attention": str(with_attention).lower(),
+        "mupc_with_vmd": "false",
+        "mupc_mic_topk": "7",
+        "mupc_output_horizon": "15",
+        "mupc_input_window": str(input_window),
+        "mupc_hidden_size": str(lstm_model.hidden_dim),
+        "mupc_num_layers": str(lstm_model.num_layers),
+        "mupc_direction": "bidirectional" if bidirection else "forward",
+        "mupc_version": "v3.0.1",
+    }
+
     torch.onnx.export(
         model, dummy_input, onnx_path,
         input_names=["history"],
-        output_names=["forecast"],
+        output_names=output_names,
         opset_version=13,
         dynamic_axes={"history": {0: "batch"}, "forecast": {0: "batch"}},
+        metadata_props=export_metadata,
     )
 
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+
+    # 验证 metadata
+    meta = {p.key: p.value for p in onnx_model.metadata_props}
     print(f"LSTM ONNX 导出: {onnx_path}")
+    print(f"  metadata keys: {sorted(meta.keys())}")
     print("  ONNX checker: 通过")
 
     return onnx_path
@@ -387,6 +449,14 @@ def main():
                         help="观测维度 (default: 78, v2.14 单模式; 多模式用 79)")
     parser.add_argument("--lstm", type=str, default=None,
                         help="导出 LSTM 模型 (提供 checkpoint 路径)")
+    parser.add_argument("--input-window", type=int, default=4,
+                        help="输入窗口步数 (legacy=4, v3.0=12/24/36)")
+    parser.add_argument("--with-attention", action="store_true",
+                        help="嵌入 Attention 计算图 (v3.0)")
+    parser.add_argument("--bidirectional", action="store_true",
+                        help="导出 BiLSTM (v3.0 R2)")
+    parser.add_argument("--metadata", type=str, default=None,
+                        help="metadata JSON 文件路径 (v3.0)")
     parser.add_argument("--to-rknn", action="store_true",
                         help="同时导出 RKNN (需要 rknn-toolkit2)")
     parser.add_argument("--dual-mode", action="store_true",
@@ -396,7 +466,16 @@ def main():
     try:
         # LSTM 导出
         if args.lstm:
-            onnx_path = export_lstm(args.lstm, args.output_dir)
+            import json
+            metadata = None
+            if getattr(args, 'metadata', None):
+                with open(args.metadata) as f:
+                    metadata = json.load(f)
+            onnx_path = export_lstm(args.lstm, args.output_dir,
+                                    input_window=getattr(args, 'input_window', 4),
+                                    with_attention=getattr(args, 'with_attention', False),
+                                    bidirection=getattr(args, 'bidirectional', False),
+                                    metadata=metadata)
             if args.to_rknn:
                 export_to_rknn(onnx_path, args.output_dir)
             return

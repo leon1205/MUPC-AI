@@ -1462,6 +1462,32 @@ class ChinaMeteorologicalDownloader:
         }
 
 
+# ── v3.0: 训练侧数据工具 ──────────────────────────────────
+
+def compute_data_fingerprint(data_dir: str) -> str:
+    """计算训练数据指纹 (CSV 文件 SHA256 前 16 位)。
+
+    MSSA 用此指纹检测训练数据变更并自动使缓存失效。
+    """
+    import hashlib
+    from pathlib import Path
+
+    dd = Path(data_dir)
+    if not dd.exists():
+        return "0" * 16
+    hasher = hashlib.sha256()
+    csv_files = sorted(dd.rglob("*.csv"))
+    if not csv_files:
+        # 尝试从 SMART-DS 缓存文件取指纹
+        cache_files = sorted(dd.rglob("*.npz"))
+        for fp in cache_files:
+            hasher.update(fp.read_bytes())
+        return hasher.hexdigest()[:16] if cache_files else "0" * 16
+    for fp in csv_files:
+        hasher.update(fp.read_bytes())
+    return hasher.hexdigest()[:16]
+
+
 # ── 自测入口 ──────────────────────────────────────────────────
 
 if __name__ == "__main__":

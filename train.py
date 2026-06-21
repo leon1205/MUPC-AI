@@ -8,6 +8,8 @@ MUPC RL 模型训练主入口。
   python train.py --total-timesteps 50000  # 快速测试
   python train.py --reward-weights MODE-01=1.5,0.3,3.0  # 自定义权重
   python train.py --no-lstm                # 使用 Oracle 预测
+  python train.py --config tmp.json        # v3.0: MSSA 超参配置文件
+  python train.py --mic mic_result.json    # v3.0: MIC 特征筛选结果
 """
 
 import argparse
@@ -91,6 +93,13 @@ def parse_args():
                    help="数据源: smartds/china/unified (default: smartds)")
     p.add_argument("--export-onnx", action="store_true",
                    help="训练完成后自动导出 ONNX")
+    # v3.0: MSSA 接口
+    p.add_argument("--config", type=str, default=None,
+                   help="MSSA 生成的临时训练配置文件 (JSON)")
+    p.add_argument("--mic", type=str, default=None,
+                   help="MIC 离线分析输出 JSON 文件路径 (v3.0)")
+    p.add_argument("--mssa-result", type=str, default=None,
+                   help="MSSA 搜索结果 JSON 文件路径 (v3.0)")
     return p.parse_args()
 
 
@@ -108,6 +117,37 @@ def parse_custom_weights(raw: str) -> dict[str, list[float]]:
         key = key.strip()
         result[key] = [float(v) for v in vals.split("/")]
     return result
+
+
+# ── v3.0: MSSA 配置解析 ────────────────────────────────────
+
+def parse_mssa_config(config_path: str) -> dict:
+    """解析 MSSA 生成的临时训练配置文件 (JSON).
+
+    Raises SystemExit(1) 若缺少必须字段.
+    """
+    REQUIRED = ["hidden_size", "num_layers", "lr", "batch_size"]
+    with open(config_path) as f:
+        cfg = json.load(f)
+    for k in REQUIRED:
+        if k not in cfg:
+            sys.stderr.write(f"[FATAL] Missing required config key: {k}\n")
+            sys.exit(1)
+    return cfg
+
+def load_mic_features(json_path: str) -> list[str]:
+    """读取 MIC 分析结果, 返回 selected 特征名列表."""
+    with open(json_path) as f:
+        mic = json.load(f)
+    return [feat["name"] for feat in mic["features"] if feat["selected"]]
+
+def load_mssa_result(json_path: str) -> dict:
+    """读取 MSSA 搜索结果, 返回最优超参字典."""
+    with open(json_path) as f:
+        mssa = json.load(f)
+    if mssa.get("quality_flag") == "unusable":
+        sys.stderr.write("[WARN] MSSA quality_flag=unusable, using manual baseline\n")
+    return mssa["best_hyperparameters"]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -146,8 +186,21 @@ def main():
     data = loader.load_all()
     train_data, val_data = loader.split(data)
 
+    # ── v3.0: MSSA 配置覆盖 ────────────────────────────────
+    lstm_cfg = {"epochs": 50, "batch_size": 64}
+    if args.config:
+        mssa_cfg = parse_mssa_config(args.config)
+        lstm_cfg.update({k: v for k, v in mssa_cfg.items()
+                         if k in ["hidden_size", "num_layers", "lr", "batch_size",
+                                  "input_window", "output_mode", "with_attention"]})
+        # 将 extra 参数送入 args (覆盖 argparse 默认值)
+        for k, v in mssa_cfg.items():
+            if hasattr(args, k):
+                setattr(args, k, v)
+
     # ── LSTM / Oracle ────────────────────────────────────
     predictor = None
+    lstm_metrics = {}  # v3.0: 训练指标供 stdout 输出
     if not args.no_lstm and args.lstm_checkpoint:
         from lstm_model import LSTMForecast
         import torch as _torch_lstm
@@ -159,17 +212,23 @@ def main():
         predictor = model
     elif not args.no_lstm and has_torch:
         print("\n── LSTM 模型训练 ──")
-        from lstm_model import LSTMTrainer
-        trainer = LSTMTrainer({"epochs": 50, "batch_size": 64})
-        result = trainer.train(train_data, val_data)
-        predictor = result["model"]
-        predictor.set_data(train_data)  # 绑定 data 引用供 predict(step_idx) 使用
-        # 保存 LSTM checkpoint
-        lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
-        os.makedirs(args.checkpoint_path, exist_ok=True)
-        import torch
-        torch.save(predictor.state_dict(), lstm_path)
-        print(f"LSTM checkpoint 已保存: {lstm_path}")
+        try:
+            from lstm_model import LSTMTrainer
+            trainer = LSTMTrainer(lstm_cfg)
+            result = trainer.train(train_data, val_data)
+            predictor = result["model"]
+            predictor.set_data(train_data)
+            lstm_metrics = result.get("metrics", {})
+
+            # 保存 LSTM checkpoint
+            lstm_path = os.path.join(args.checkpoint_path, "lstm_checkpoint.pt")
+            os.makedirs(args.checkpoint_path, exist_ok=True)
+            import torch
+            torch.save(predictor.state_dict(), lstm_path)
+            print(f"LSTM checkpoint 已保存: {lstm_path}")
+        except Exception as e:
+            sys.stderr.write(f"[FATAL] LSTM training failed: {e}\n")
+            sys.exit(1)
     else:
         from lstm_model import OraclePredictor
         print("\n── 使用 Oracle 预测 ──")
@@ -215,6 +274,12 @@ def main():
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
     print(f"{'=' * 56}")
+
+    # v3.0: stdout MAPE 输出 (供 MSSA 解析)
+    if lstm_metrics:
+        pv_mape = lstm_metrics.get("pv_mape_step1", lstm_metrics.get("pv_mape", -1.0))
+        load_mape = lstm_metrics.get("load_mape_step1", lstm_metrics.get("load_mape", -1.0))
+        print(f"PV_MAPE={pv_mape:.4f} LOAD_MAPE={load_mape:.4f}")
 
     # ── ONNX 导出 ──────────────────────────────────────
     if args.export_onnx and has_torch:

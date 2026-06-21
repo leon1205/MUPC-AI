@@ -1,12 +1,12 @@
 """
 LSTM 时序预测模型 — 光伏出力与负荷功率联合预测。
 
-用途: 为 RL 环境提供 D2 预测数据 (pv_forecast_15min + load_forecast_15min)。
-      也可由 train.py 独立训练并导出 ONNX。
+用途: 为 RL 环境提供 D2 预测数据, 也可独立训练并导出 ONNX。
 
-架构: 2 层 LSTM (hidden=64) + 双头 Linear (pv_head, load_head)
-输入: (batch, seq_len=4, 6) — 过去 60 分钟历史
-输出: (batch, 30) — 未来 15 分钟 pv(15维) + load(15维)
+v3.0 增强: AdditiveAttention + 分位数三通道输出 (P10/P50/P90).
+架构: LSTM 2层 (hidden=64) + AdditiveAttention + 6头 Linear
+  legacy 模式: 输入 (B, 8, 7) → 输出 (B, 47)  向后兼容
+  p10p50p90 模式: 输入 (B, T, K) → 输出 (B, 2, 15, 3)  v3.0
 """
 
 import math
@@ -34,26 +34,77 @@ def _ensure_torch():
 # ── 初始化 PyTorch（立即尝试加载，确保 _TORCH_AVAILABLE 正确） ──
 _ensure_torch()
 
+# ── v3.0: AdditiveAttention ──────────────────────────────────
+
+class AdditiveAttention:
+    """加法注意力 (Bahdanau), 全 ONNX 标准算子组合.
+
+    MatMul + Tanh + Softmax + ReduceSum, 均可在 RKNN Toolkit 2 中转换.
+
+    Input:  (B, T, H)  LSTM hidden states
+    Output: (B, H)      上下文向量
+    Optional: (B, T)    注意力权重 (可视化, ONNX 额外输出节点)
+    """
+    def __init__(self, hidden_dim: int):
+        self.W = _nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = _nn.Linear(hidden_dim, 1, bias=False)
+
+    def to(self, device: str):
+        self.W.to(device)
+        self.v.to(device)
+
+    def parameters(self):
+        return list(self.W.parameters()) + list(self.v.parameters())
+
+    def state_dict(self):
+        return {"W": self.W.state_dict(), "v": self.v.state_dict()}
+
+    def load_state_dict(self, sd: dict):
+        self.W.load_state_dict(sd["W"])
+        self.v.load_state_dict(sd["v"])
+
+    def eval(self):
+        self.W.eval()
+        self.v.eval()
+
+    def train(self, mode: bool = True):
+        self.W.train(mode)
+        self.v.train(mode)
+
+    def forward(self, h):
+        """h: (B, T, H) → ctx: (B, H), weights: (B, T)."""
+        score = self.v(_torch.tanh(self.W(h)))   # (B, T, 1)
+        weights = _torch.softmax(score.squeeze(-1), dim=1)  # (B, T)
+        weights3d = weights.unsqueeze(-1)          # (B, T, 1)
+        ctx = _torch.sum(weights3d * h, dim=1)    # (B, H)
+        return ctx, weights
+
+
 # ── 模型定义 ──────────────────────────────────────────────────
 
 class LSTMForecast:
-    """LSTM 时序预测模型 (PyTorch)。
+    """LSTM 时序预测模型 (v3.0: AdditiveAttention + 分位数三通道).
 
-    v2.14 扩展: 增加 D10 概率负荷预测输出 (17 维), 总输出 47 维.
+    两种输出模式:
+      - "legacy":   (B, 47)    向后兼容 (D2 30维 + D10 17维)
+      - "p10p50p90": (B, 2, 15, 3)  v3.0 分位数预测 (PV/Load × 15步 × P10/P50/P90)
     """
 
     def __init__(self, input_dim: int = 7, hidden_dim: int = 64,
                  num_layers: int = 2, forecast_steps: int = 15,
-                 dropout: float = 0.1, with_d10: bool = True):
+                 dropout: float = 0.1, with_d10: bool = True,
+                 with_attention: bool = True,
+                 output_mode: str = "p10p50p90"):
         """
         Args:
-            input_dim: 输入特征维度（默认 7）
-                [pv_power, load_power, ghi, temperature, sin_hour, cos_hour, yesterday_pv]
+            input_dim: 输入特征维度
             hidden_dim: LSTM 隐藏层维度
             num_layers: LSTM 层数
-            forecast_steps: 预测步数 (默认 15 = 15 分钟)
+            forecast_steps: 预测步数 (默认 15)
             dropout: dropout 比率
-            with_d10: 是否启用 D10 概率负荷预测头 (v2.14, 默认 True)
+            with_d10: legacy 模式下是否启用 D10 头 (v2.14)
+            with_attention: 是否含 Attention 层 (v3.0)
+            output_mode: "legacy" 或 "p10p50p90" (v3.0)
         """
         _ensure_torch()
         self.input_dim = input_dim
@@ -61,121 +112,211 @@ class LSTMForecast:
         self.num_layers = num_layers
         self.forecast_steps = forecast_steps
         self.with_d10 = with_d10
-        # 30 维 (D2 pv+load) + 17 维 (D10) = 47 维 (启用 D10)
-        # 或 30 维 (D2 only) (向后兼容)
-        self.output_dim = forecast_steps * 2 + (17 if with_d10 else 0)
+        self.with_attention = with_attention
+        self.output_mode = output_mode
 
-        # v2.18: D10 训练步数计数器 (供 MupcEnv 冷启动保护使用)
-        # LSTMTrainer 训练时递增, MupcEnv._make_env_state 据此决定 D10 数据来源
-        # 默认 0 表示 LSTM D10 头未训, MupcEnv 走 data 合成
+        if output_mode == "p10p50p90":
+            self.output_dim = forecast_steps * 2 * 3  # 2 target × 15 steps × 3 quantiles
+        else:
+            self.output_dim = forecast_steps * 2 + (17 if with_d10 else 0)
+
+        # v2.18: D10 训练步数计数器
         self._d10_trained_count: int = 0
 
         self.lstm = _nn.LSTM(
             input_dim, hidden_dim, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head_pv = _nn.Linear(hidden_dim, forecast_steps)
-        self.head_load = _nn.Linear(hidden_dim, forecast_steps)
-        # D10 预测头 (v2.14): 15 维分位数 + 1 维冲击概率 + 1 维基荷
-        if with_d10:
-            self.head_d10_quantiles = _nn.Linear(hidden_dim, forecast_steps)
-            self.head_d10_shock = _nn.Linear(hidden_dim, 1)
-            self.head_d10_base = _nn.Linear(hidden_dim, 1)
+        # v3.0: AdditiveAttention
+        self.attention = AdditiveAttention(hidden_dim) if with_attention else None
+
+        if output_mode == "p10p50p90":
+            # v3.0: 6 头 Linear — PV/Load × P10/P50/P90
+            self.head_pv_p10 = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_pv_p50 = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_pv_p90 = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_load_p10 = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_load_p50 = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_load_p90 = _nn.Linear(hidden_dim, forecast_steps)
+        else:
+            # legacy 模式
+            self.head_pv = _nn.Linear(hidden_dim, forecast_steps)
+            self.head_load = _nn.Linear(hidden_dim, forecast_steps)
+            if with_d10:
+                self.head_d10_quantiles = _nn.Linear(hidden_dim, forecast_steps)
+                self.head_d10_shock = _nn.Linear(hidden_dim, 1)
+                self.head_d10_base = _nn.Linear(hidden_dim, 1)
 
         self.device = "cpu"
         self._initialized = True
 
     def to(self, device: str) -> "LSTMForecast":
         self.lstm.to(device)
-        self.head_pv.to(device)
-        self.head_load.to(device)
-        if self.with_d10:
-            self.head_d10_quantiles.to(device)
-            self.head_d10_shock.to(device)
-            self.head_d10_base.to(device)
+        if self.output_mode == "p10p50p90":
+            for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
+                      self.head_load_p10, self.head_load_p50, self.head_load_p90]:
+                h.to(device)
+        else:
+            self.head_pv.to(device)
+            self.head_load.to(device)
+            if self.with_d10:
+                self.head_d10_quantiles.to(device)
+                self.head_d10_shock.to(device)
+                self.head_d10_base.to(device)
+        if self.attention is not None:
+            self.attention.to(device)
         self.device = device
         return self
 
     def parameters(self):
-        params = list(self.lstm.parameters()) + \
-                 list(self.head_pv.parameters()) + \
-                 list(self.head_load.parameters())
-        if self.with_d10:
-            params += list(self.head_d10_quantiles.parameters()) + \
-                      list(self.head_d10_shock.parameters()) + \
-                      list(self.head_d10_base.parameters())
+        params = list(self.lstm.parameters())
+        if self.output_mode == "p10p50p90":
+            for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
+                      self.head_load_p10, self.head_load_p50, self.head_load_p90]:
+                params += list(h.parameters())
+        else:
+            params += list(self.head_pv.parameters()) + list(self.head_load.parameters())
+            if self.with_d10:
+                params += (list(self.head_d10_quantiles.parameters()) +
+                           list(self.head_d10_shock.parameters()) +
+                           list(self.head_d10_base.parameters()))
+        if self.attention is not None:
+            params += self.attention.parameters()
         return params
 
     def state_dict(self) -> dict:
-        d = {
-            "lstm": self.lstm.state_dict(),
-            "head_pv": self.head_pv.state_dict(),
-            "head_load": self.head_load.state_dict(),
-        }
-        if self.with_d10:
-            d["head_d10_quantiles"] = self.head_d10_quantiles.state_dict()
-            d["head_d10_shock"] = self.head_d10_shock.state_dict()
-            d["head_d10_base"] = self.head_d10_base.state_dict()
+        d = {"lstm": self.lstm.state_dict()}
+        if self.output_mode == "p10p50p90":
+            d.update({
+                "head_pv_p10": self.head_pv_p10.state_dict(),
+                "head_pv_p50": self.head_pv_p50.state_dict(),
+                "head_pv_p90": self.head_pv_p90.state_dict(),
+                "head_load_p10": self.head_load_p10.state_dict(),
+                "head_load_p50": self.head_load_p50.state_dict(),
+                "head_load_p90": self.head_load_p90.state_dict(),
+            })
+        else:
+            d["head_pv"] = self.head_pv.state_dict()
+            d["head_load"] = self.head_load.state_dict()
+            if self.with_d10:
+                d["head_d10_quantiles"] = self.head_d10_quantiles.state_dict()
+                d["head_d10_shock"] = self.head_d10_shock.state_dict()
+                d["head_d10_base"] = self.head_d10_base.state_dict()
+        if self.attention is not None:
+            d["attention"] = self.attention.state_dict()
         return d
 
     def load_state_dict(self, d: dict) -> None:
         self.lstm.load_state_dict(d["lstm"])
-        self.head_pv.load_state_dict(d["head_pv"])
-        self.head_load.load_state_dict(d["head_load"])
-        if self.with_d10 and "head_d10_quantiles" in d:
-            self.head_d10_quantiles.load_state_dict(d["head_d10_quantiles"])
-            self.head_d10_shock.load_state_dict(d["head_d10_shock"])
-            self.head_d10_base.load_state_dict(d["head_d10_base"])
+        if self.output_mode == "p10p50p90":
+            self.head_pv_p10.load_state_dict(d["head_pv_p10"])
+            self.head_pv_p50.load_state_dict(d["head_pv_p50"])
+            self.head_pv_p90.load_state_dict(d["head_pv_p90"])
+            self.head_load_p10.load_state_dict(d["head_load_p10"])
+            self.head_load_p50.load_state_dict(d["head_load_p50"])
+            self.head_load_p90.load_state_dict(d["head_load_p90"])
+        else:
+            self.head_pv.load_state_dict(d["head_pv"])
+            self.head_load.load_state_dict(d["head_load"])
+            if self.with_d10 and "head_d10_quantiles" in d:
+                self.head_d10_quantiles.load_state_dict(d["head_d10_quantiles"])
+                self.head_d10_shock.load_state_dict(d["head_d10_shock"])
+                self.head_d10_base.load_state_dict(d["head_d10_base"])
+        if "attention" in d and self.attention is not None:
+            self.attention.load_state_dict(d["attention"])
 
     def eval(self) -> "LSTMForecast":
-        """切换到评估模式。"""
         self.lstm.eval()
-        self.head_pv.eval()
-        self.head_load.eval()
-        if self.with_d10:
-            self.head_d10_quantiles.eval()
-            self.head_d10_shock.eval()
-            self.head_d10_base.eval()
+        if self.output_mode == "p10p50p90":
+            for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
+                      self.head_load_p10, self.head_load_p50, self.head_load_p90]:
+                h.eval()
+        else:
+            self.head_pv.eval(); self.head_load.eval()
+            if self.with_d10:
+                self.head_d10_quantiles.eval()
+                self.head_d10_shock.eval()
+                self.head_d10_base.eval()
+        if self.attention is not None:
+            self.attention.eval()
         return self
 
     def train(mode: bool = True) -> "LSTMForecast":
-        """切换到训练/评估模式。"""
         self.lstm.train(mode)
-        self.head_pv.train(mode)
-        self.head_load.train(mode)
-        if self.with_d10:
-            self.head_d10_quantiles.train(mode)
-            self.head_d10_shock.train(mode)
-            self.head_d10_base.train(mode)
+        if self.output_mode == "p10p50p90":
+            for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
+                      self.head_load_p10, self.head_load_p50, self.head_load_p90]:
+                h.train(mode)
+        else:
+            self.head_pv.train(mode); self.head_load.train(mode)
+            if self.with_d10:
+                self.head_d10_quantiles.train(mode)
+                self.head_d10_shock.train(mode)
+                self.head_d10_base.train(mode)
+        if self.attention is not None:
+            self.attention.train(mode)
         return self
 
     def forward(self, x) -> "torch.Tensor":
         """
         Args:
-            x: (batch, seq_len, input_dim) = (batch, 8, 7)
+            x: (B, T, K) = (B, input_window, input_dim)
+               legacy: T=8, K=7
+               p10p50p90: T=12/24/36, K=MIC-selected features
         Returns:
-            (batch, 47) 启用 D10: [pv(15) + load(15) + quantiles(15) + shock_prob(1) + base_load(1)]
-            (batch, 30) 不启用 D10: [pv(15) + load(15)]
+            legacy: (B, 47) 或 (B, 30)
+            p10p50p90: (B, 2, 15, 3) PV/Load × 15步 × (P10,P50,P90)
+                     + attn_weights (B, T) 当 with_attention=True
             使用 ReLU 保证 PV/load/分位数/基荷输出非负。
         """
-        out, (h_n, _) = self.lstm(x)
-        last_hidden = h_n[-1]  # (batch, hidden_dim)
-        pv_pred = _torch.relu(self.head_pv(last_hidden))   # 非负约束
-        load_pred = _torch.relu(self.head_load(last_hidden))  # 非负约束
+        h_seq, (h_n, _) = self.lstm(x)                # h_seq: (B, T, H), h_n: (L, B, H)
+
+        if self.attention is not None:
+            ctx, attn_weights = self.attention.forward(h_seq)  # ctx: (B, H)
+        else:
+            ctx = h_n[-1]                                      # (B, H) 取最后层末步
+            attn_weights = None
+
+        if self.output_mode == "p10p50p90":
+            pv_p10 = _torch.relu(self.head_pv_p10(ctx))
+            pv_p50 = _torch.relu(self.head_pv_p50(ctx))
+            pv_p90 = _torch.relu(self.head_pv_p90(ctx))
+            load_p10 = _torch.relu(self.head_load_p10(ctx))
+            load_p50 = _torch.relu(self.head_load_p50(ctx))
+            load_p90 = _torch.relu(self.head_load_p90(ctx))
+            pv = _torch.stack([pv_p10, pv_p50, pv_p90], dim=-1)    # (B, 15, 3)
+            lo = _torch.stack([load_p10, load_p50, load_p90], dim=-1)
+            out = _torch.stack([pv, lo], dim=1)                    # (B, 2, 15, 3)
+            if attn_weights is not None:
+                return out, attn_weights
+            return out
+
+        # legacy 模式 (向后兼容)
+        pv_pred = _torch.relu(self.head_pv(ctx))
+        load_pred = _torch.relu(self.head_load(ctx))
         if self.with_d10:
-            q_pred = _torch.relu(self.head_d10_quantiles(last_hidden))  # 15 维分位数, 非负
-            shock_pred = _torch.sigmoid(self.head_d10_shock(last_hidden))  # 1 维概率, [0,1]
-            base_pred = _torch.relu(self.head_d10_base(last_hidden))  # 1 维基荷, 非负
+            q_pred = _torch.relu(self.head_d10_quantiles(ctx))
+            shock_pred = _torch.sigmoid(self.head_d10_shock(ctx))
+            base_pred = _torch.relu(self.head_d10_base(ctx))
             return _torch.cat([pv_pred, load_pred, q_pred, shock_pred, base_pred], dim=-1)
         return _torch.cat([pv_pred, load_pred], dim=-1)
 
     def predict_numpy(self, x: np.ndarray) -> np.ndarray:
-        """NumPy 接口: 输入 (batch, 4, 6) → 输出 (batch, 47) 或 (batch, 30)。"""
+        """NumPy 接口: 输入 (B, T, K) → 输出按 output_mode 而定.
+
+        legacy:   (B, 47) 或 (B, 30)
+        p10p50p90: (B, 2, 15, 3) 不含 attn_weights
+        """
         _ensure_torch()
         self.lstm.eval()
+        if self.attention is not None:
+            self.attention.eval()
         with _torch.no_grad():
             t = _torch.tensor(x, dtype=_torch.float32).to(self.device)
             out = self.forward(t)
+            # v3.0: forward 可能返回 (out, attn_weights) tuple
+            if self.attention is not None and self.output_mode == "p10p50p90":
+                out = out[0]  # 取预测值, 丢弃 attn_weights
         return out.cpu().numpy()
 
     def __call__(self, x):
@@ -190,17 +331,14 @@ class LSTMForecast:
         self._data = data
 
     def predict(self, step_idx: int) -> np.ndarray:
-        """LSTM 预测接口 (v2.18: 返回 47 维, 不再截断).
-
-        v2.14 之前: 30 维 (D2 only), D10 由 data_loader 合成.
-        v2.18 修复: 47 维 (D2 + D10), 训练时 D10 头真正用上, 消除训练-部署 gap.
-        部署时 RKNN 模型输出 47 维, 训练时返回 47 维与之对齐.
+        """LSTM 预测接口 (v2.18 legacy / v3.0 p10p50p90 双模式).
 
         Returns:
-            (47,) ndarray, [pv(15) + load(15) + quantiles(15) + shock_prob(1) + base_load(1)]
-            或 (30,) ndarray, [pv(15) + load(15)] (with_d10=False 时)
+            legacy:   (47,) 或 (30,)  向后兼容 MupcEnv
+            p10p50p90: (47,)          p10p50p90 模式转 legacy 格式供 MupcEnv 消费
         """
-        seq_len = 8
+        # v3.0: 使用模型配置的 input_window (默认 12), legacy 模式仍用 8
+        seq_len = getattr(self, 'input_window', 8)
         # 构建 hour sin/cos
         if "hours" in self._data:
             hours = self._data["hours"]
@@ -212,40 +350,65 @@ class LSTMForecast:
         seq_indices = [step_idx - seq_len + 1 + k for k in range(seq_len)]
         seq_indices = [max(0, min(i, len(self._data["pv_power"]) - 1)) for i in seq_indices]
 
-        # 构建 (seq_len, 7) 输入（含昨日同时段 PV）
-        x = np.zeros((seq_len, 7), dtype=np.float32)
+        # 构建 (seq_len, input_dim) 输入
+        x = np.zeros((seq_len, self.input_dim), dtype=np.float32)
         for i, idx in enumerate(seq_indices):
             x[i, 0] = self._data["pv_power"][idx]
             x[i, 1] = self._data["load_power"][idx]
-            x[i, 2] = self._data["solar_irradiance"][idx]
-            x[i, 3] = self._data["temperature"][idx]
-            h = hours[idx]
-            x[i, 4] = np.sin(2 * np.pi * h / 24)
-            x[i, 5] = np.cos(2 * np.pi * h / 24)
-            # 第7维: 昨日同时段 PV（周期性特征）
-            x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
+            if self.input_dim >= 4:
+                x[i, 2] = self._data["solar_irradiance"][idx]
+                x[i, 3] = self._data["temperature"][idx]
+            if self.input_dim >= 6:
+                h = hours[idx]
+                x[i, 4] = np.sin(2 * np.pi * h / 24)
+                x[i, 5] = np.cos(2 * np.pi * h / 24)
+            if self.input_dim >= 7:
+                x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
 
-        # predict_numpy 期望 (batch, seq_len, 7)
-        out = self.predict_numpy(x[np.newaxis, :, :])  # (1, 47) 或 (1, 30)
-        # v2.18: 返回完整 47 维 (D2 + D10), 不再截断
-        #   - D2 (前 30 维): 喂给 build_observation 的 D2
-        #   - D10 (后 17 维): 由 MupcEnv 解析后喂给 D10 obs 字段
-        # 这样训练时 D10 真正用上 LSTM 推理结果, 消除训练-部署 gap
+        out = self.predict_numpy(x[np.newaxis, :, :])
+
+        if self.output_mode == "p10p50p90":
+            # (1, 2, 15, 3) → 转 legacy 47-dim 供 MupcEnv
+            return self._p10p50p90_to_legacy(out[0])
         return out[0]
+
+    def _p10p50p90_to_legacy(self, out3d: np.ndarray) -> np.ndarray:
+        """将 (2, 15, 3) p10p50p90 输出转为 47 维 legacy 格式.
+
+        pv_p50(15) + load_p50(15) + pv_p90(15) as d10_quantiles
+        + shock_prob from spread + base = pv_p50[0]
+        """
+        pv = out3d[0]    # (15, 3)
+        lo = out3d[1]    # (15, 3)
+        # D2 pv = P50, D2 load = P50
+        # D10 quantiles = P90 (15 维)
+        # D10 shock = 简单估计: spread_mean / (base + 1)
+        spread = pv[:, 2] - pv[:, 1]  # P90 - P50
+        shock = float(np.clip(np.mean(spread) / (pv[0, 1] + 1.0), 0.0, 1.0))
+        base = float(pv[0, 1])  # 基荷 = 第一步 P50
+        return np.concatenate([
+            pv[:, 1], lo[:, 1],    # D2: pv_p50(15) + load_p50(15) = 30
+            pv[:, 2],              # D10 quantiles = pv_p90(15)
+            [shock],               # D10 shock prob
+            [base],                # D10 base load
+        ]).astype(np.float32)
 
 
 # ── 训练器 ─────────────────────────────────────────────────────
 
 LSTM_TRAIN_CONFIG = {
-    "input_seq_len": 8,          # 120 分钟 / 15 分钟（更长上下文）
+    "input_seq_len": 8,          # legacy: 120 分钟 / 15 分钟
+    "input_window": 12,           # v3.0: 输入窗口步数 (12/24/36)
     "forecast_steps": 15,        # 预测 15 步
     "hidden_dim": 64,
     "num_layers": 2,
     "dropout": 0.1,
     "batch_size": 64,
     "learning_rate": 1e-3,
-    "epochs": 200,               # 增加训练轮数
-    "patience": 20,              # 配合更多 epochs 调整早停
+    "epochs": 200,
+    "patience": 20,
+    "output_mode": "p10p50p90",  # v3.0
+    "with_attention": True,       # v3.0
 }
 
 
@@ -297,59 +460,79 @@ class LSTMTrainer:
         n_samples = len(balanced)
         print(f"  样本平衡: 白天={n_day}, 夜间={n_night}, 总计={n_samples}")
 
-        # D2: pv(15) + load(15) = 30
-        # D10: quantiles(15) + shock_prob(1) + base_load(1) = 17
-        # 总计 47 维
-        d10_dim = 17
-        total_output = forecast * 2 + d10_dim  # 30 + 17 = 47
-        X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
-        y = np.zeros((n_samples, total_output), dtype=np.float32)
+        # v3.0: 根据 output_mode 决定 target 格式
+        output_mode = self.config.get("output_mode", "legacy")
+        if output_mode == "p10p50p90":
+            # (N, 2, 15, 3): PV/Load × 15步 × (P10, P50, P90)
+            X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
+            y = np.zeros((n_samples, 2, forecast, 3), dtype=np.float32)
 
-        # D10 分位数索引: 5个分位点 × 3个预测步 = 15维
-        # 分位点: P10, P30, P50, P70, P90
-        # 预测步: step_5, step_10, step_15 (forecast horizon的1/3, 2/3, 3/3)
-        d10_horizon_steps = [forecast // 3, forecast * 2 // 3, forecast - 1]
+            for out_i, src_i in enumerate(balanced):
+                for j in range(seq_len):
+                    idx = src_i + j
+                    h = hours[idx]
+                    X[out_i, j, 0] = pv[idx]
+                    X[out_i, j, 1] = load[idx]
+                    X[out_i, j, 2] = ghi[idx]
+                    X[out_i, j, 3] = temp[idx]
+                    X[out_i, j, 4] = math.sin(h * 2 * math.pi / 24)
+                    X[out_i, j, 5] = math.cos(h * 2 * math.pi / 24)
+                    X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
 
-        for out_i, src_i in enumerate(balanced):
-            for j in range(seq_len):
-                idx = src_i + j
-                h = hours[idx]
-                X[out_i, j, 0] = pv[idx]
-                X[out_i, j, 1] = load[idx]
-                X[out_i, j, 2] = ghi[idx]
-                X[out_i, j, 3] = temp[idx]
-                X[out_i, j, 4] = math.sin(h * 2 * math.pi / 24)
-                X[out_i, j, 5] = math.cos(h * 2 * math.pi / 24)
-                # 第7维: 昨日同时段 PV（周期性特征，96步=24小时前）
-                X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
+                for k in range(forecast):
+                    target_idx = src_i + seq_len + k
+                    pv_val = pv[target_idx]
+                    load_val = load[target_idx]
+                    # PV 分位数: P10=0.85×, P50=1.0×, P90=1.15×
+                    y[out_i, 0, k, 0] = max(0.0, pv_val * 0.7)
+                    y[out_i, 0, k, 1] = pv_val
+                    y[out_i, 0, k, 2] = max(0.0, pv_val * 1.3)
+                    # Load 分位数: P10=0.9×, P50=1.0×, P90=1.1×
+                    y[out_i, 1, k, 0] = max(0.0, load_val * 0.9)
+                    y[out_i, 1, k, 1] = load_val
+                    y[out_i, 1, k, 2] = load_val * 1.1
+        else:
+            # legacy: (N, 47) 或 (N, 30)
+            d10_dim = 17
+            total_output = forecast * 2 + d10_dim
+            X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
+            y = np.zeros((n_samples, total_output), dtype=np.float32)
 
-            # D2: PV(15) + Load(15)
-            for k in range(forecast):
-                target_idx = src_i + seq_len + k
-                y[out_i, k] = pv[target_idx]
-                y[out_i, k + forecast] = load[target_idx]
+            d10_horizon_steps = [forecast // 3, forecast * 2 // 3, forecast - 1]
 
-            # D10: 分位数 + 冲击概率 + 基荷
-            d10_start = forecast * 2  # = 30
-            for qi, hs in enumerate(d10_horizon_steps):
-                target_idx = src_i + seq_len + hs
-                actual_load = load[target_idx]
-                # 5个分位点: P10, P30, P50, P70, P90
-                spread = max(actual_load * 0.15, 5.0)  # 最小 5kW 展宽
-                y[out_i, d10_start + qi * 5 + 0] = actual_load - spread * 1.0   # P10
-                y[out_i, d10_start + qi * 5 + 1] = actual_load - spread * 0.5   # P30
-                y[out_i, d10_start + qi * 5 + 2] = actual_load                 # P50
-                y[out_i, d10_start + qi * 5 + 3] = actual_load + spread * 0.5   # P70
-                y[out_i, d10_start + qi * 5 + 4] = actual_load + spread * 1.0   # P90
+            for out_i, src_i in enumerate(balanced):
+                for j in range(seq_len):
+                    idx = src_i + j
+                    h = hours[idx]
+                    X[out_i, j, 0] = pv[idx]
+                    X[out_i, j, 1] = load[idx]
+                    X[out_i, j, 2] = ghi[idx]
+                    X[out_i, j, 3] = temp[idx]
+                    X[out_i, j, 4] = math.sin(h * 2 * math.pi / 24)
+                    X[out_i, j, 5] = math.cos(h * 2 * math.pi / 24)
+                    X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
 
-            # 冲击负荷概率: 基于 P90-P50 差值
-            p90_last = y[out_i, d10_start + 2 * 5 + 4]  # 最后一个 horizon 的 P90
-            p50_last = y[out_i, d10_start + 2 * 5 + 2]  # 最后一个 horizon 的 P50
-            shock_spread = (p90_last - p50_last) / max(p50_last, 1e-6)
-            y[out_i, d10_start + 15] = float(np.clip(shock_spread / 0.2, 0.0, 1.0))
+                for k in range(forecast):
+                    target_idx = src_i + seq_len + k
+                    y[out_i, k] = pv[target_idx]
+                    y[out_i, k + forecast] = load[target_idx]
 
-            # 基荷: 中间 horizon 的 P50
-            y[out_i, d10_start + 16] = y[out_i, d10_start + 1 * 5 + 2]
+                d10_start = forecast * 2
+                for qi, hs in enumerate(d10_horizon_steps):
+                    target_idx = src_i + seq_len + hs
+                    actual_load = load[target_idx]
+                    spread = max(actual_load * 0.15, 5.0)
+                    y[out_i, d10_start + qi * 5 + 0] = actual_load - spread * 1.0
+                    y[out_i, d10_start + qi * 5 + 1] = actual_load - spread * 0.5
+                    y[out_i, d10_start + qi * 5 + 2] = actual_load
+                    y[out_i, d10_start + qi * 5 + 3] = actual_load + spread * 0.5
+                    y[out_i, d10_start + qi * 5 + 4] = actual_load + spread * 1.0
+
+                p90_last = y[out_i, d10_start + 2 * 5 + 4]
+                p50_last = y[out_i, d10_start + 2 * 5 + 2]
+                shock_spread = (p90_last - p50_last) / max(p50_last, 1e-6)
+                y[out_i, d10_start + 15] = float(np.clip(shock_spread / 0.2, 0.0, 1.0))
+                y[out_i, d10_start + 16] = y[out_i, d10_start + 1 * 5 + 2]
 
         return X, y
 
@@ -374,7 +557,12 @@ class LSTMTrainer:
             input_dim=7, hidden_dim=cfg["hidden_dim"],
             num_layers=cfg["num_layers"], forecast_steps=cfg["forecast_steps"],
             dropout=cfg["dropout"],
-        ).to(self.device)
+            with_d10=cfg.get("with_d10", True),
+            with_attention=cfg.get("with_attention", True),
+            output_mode=cfg.get("output_mode", "p10p50p90"),
+        )
+        self.model.input_window = cfg.get("input_window", 12)
+        self.model.to(self.device)
 
         optimizer = _torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])
         loss_fn = _nn.HuberLoss()
