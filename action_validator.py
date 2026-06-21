@@ -6,7 +6,7 @@
   ACT-02: |Δk_droop| <= 10 kW/V/步
   ACT-03: √(p_ref² + k_droop²) <= 200 kVA (视在功率圆, 对齐下游 S-circle)
   ACT-04: k_droop ∈ [-100, 100] kW/V (最终值域 clamp)
-  ACT-05: |p_ref| <= |dispatch_p| (调度权限约束)
+  ACT-05: |p_ref| <= |dispatch_p| + 方向约束 (v3.1: dispatch>0 → p_ref>=0)
 
 v2.17 变更:
   - k_droop 范围 [0,30] → [-100,100] (对齐下游 Dual 模式默认值)
@@ -130,11 +130,17 @@ class ActionValidator:
             k_droop = self.K_DROOP_MAX
             violations["ACT-04"] = True
 
-        # ACT-05: |p_ref| <= |dispatch_p| (调度权限约束)
+        # ACT-05: 调度指令 Action Mask (v3.1 增强方向约束)
+        # 基础约束: |p_ref| <= |dispatch_p| (调度权限)
+        # 方向约束: dispatch_p > 0 (调度要求放电) → p_ref >= 0 (不可充电)
         if dispatch_p is not None and abs(dispatch_p) > 1e-6:
             limit = abs(dispatch_p)
             if abs(p_ref) > limit:
                 p_ref = max(-limit, min(limit, p_ref))
+                violations["ACT-05"] = True
+            # v3.1: 方向约束 — 调度要求放电时 AI 不可选择充电方向
+            if dispatch_p > 0 and p_ref < 0:
+                p_ref = 0.0
                 violations["ACT-05"] = True
 
         # 最终安全 clamp: p_ref ∈ [-50, 50] (对齐下游最终值域 clamp)

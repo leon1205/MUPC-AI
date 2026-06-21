@@ -197,6 +197,13 @@ class SmartDSLoader:
 
         # Step 7: 天气 (solar_irradiance, temperature 已在 Step 1 加载)
 
+        # v3.1: 数据质量标注 (在 D10 合成之后, 需要 dispatch_p_set)
+        quality = self._annotate_data_quality({
+            "n_steps": n_steps, "pv_power": solar_data["pv_power"][:n_steps],
+            "load_power": load_data["load_power"][:n_steps],
+            "dispatch_p_set": dispatch["dispatch_p_set"],
+        })
+
         # 截断各数组到 n_steps
         result = {
             # D1: 实时数据
@@ -227,6 +234,8 @@ class SmartDSLoader:
             "hours": hours.astype(np.float32),
             "months": months.astype(np.float32),
             "n_steps": n_steps,
+            # v3.1: 数据质量标注
+            "data_quality": quality,
         }
         result["norm_params"] = self._compute_norm_params(result)
 
@@ -418,6 +427,65 @@ class SmartDSLoader:
             "dispatch_p_set": np.zeros(n_steps, dtype=np.float32),
             "dispatch_q_set": np.zeros(n_steps, dtype=np.float32),
         }
+
+    # ── v3.1: 训练数据质量标注 ─────────────────────────
+
+    def _annotate_data_quality(self, data: dict[str, np.ndarray]) -> np.ndarray:
+        """v3.1: 对训练数据进行质量标注。
+
+        quality 编码:
+          0 = 正常数据
+          1 = 传感器疑似故障 (数值跳变 > 3σ 或连续恒值 > 2h)
+          2 = 通信中断 (数据缺失 > 2 个连续采样点, 已插值)
+          3 = 调度接管时段 (dispatch_p_set 有效)
+
+        quality >= 1 的样本不参与 LSTM 训练, 但保留供离线审计。
+        quality == 3 的样本参与 RL 训练 (通过 Action Mask 约束).
+        """
+        n = data["n_steps"]
+        pv = data["pv_power"]
+        load = data["load_power"]
+        quality = np.zeros(n, dtype=np.int32)
+
+        # quality=1: 传感器异常检测
+        # 连续恒值 > 2h (= 8 步 × 15min)
+        const_min_steps = 8
+        for arr, name in [(pv, "pv_power"), (load, "load_power")]:
+            for i in range(n - const_min_steps + 1):
+                if np.std(arr[i:i + const_min_steps]) < 1e-6 and arr[i] > 1e-3:
+                    quality[i:i + const_min_steps] = np.maximum(
+                        quality[i:i + const_min_steps], 1)
+
+            # 数值跳变 > 3σ (相邻步差值超过 3 倍标准差)
+            diffs = np.abs(np.diff(arr))
+            mean_diff = np.mean(diffs)
+            std_diff = np.std(diffs) + 1e-6
+            spike_mask = diffs > mean_diff + 3 * std_diff
+            spike_indices = np.where(spike_mask)[0]
+            for idx in spike_indices:
+                # 标记跳变点前后各 1 步
+                start = max(0, idx - 1)
+                end = min(n, idx + 2)
+                quality[start:end] = np.maximum(quality[start:end], 1)
+
+        # quality=2: 通信中断 (数据缺失 > 2 个连续采样点)
+        # 注: SmartDSLoader 在 Step 2 已做线性插值, 此处在插值后的数据上检测.
+        # 检测标准: 连续恒值 > 4h (16步), 且值在合理范围外
+        missing_min_steps = 16
+        for arr in [pv, load]:
+            for i in range(n - missing_min_steps + 1):
+                window = arr[i:i + missing_min_steps]
+                if np.std(window) < 1e-4 and np.mean(window) > 0:
+                    quality[i:i + missing_min_steps] = np.maximum(
+                        quality[i:i + missing_min_steps], 2)
+
+        # quality=3: 调度接管时段
+        dispatch_p = data.get("dispatch_p_set")
+        if dispatch_p is not None:
+            dispatched_mask = np.abs(dispatch_p) > 1e-6
+            quality = np.where(dispatched_mask, np.maximum(quality, 3), quality)
+
+        return quality
 
     # ── D10 概率负荷预测合成 ────────────────────────────
 

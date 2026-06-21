@@ -293,6 +293,9 @@ def main():
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
+    # v3.1: 调度时段统计
+    if dispatch_stats._total_steps > 0:
+        print(f"  {dispatch_stats.summary()}")
     print(f"{'=' * 56}")
 
     # v3.0: stdout MAPE 输出 (供 MSSA 解析)
@@ -329,12 +332,42 @@ def _resolve_backend(requested: str, has_sb3: bool) -> str:
     return requested
 
 
+# ── v3.1: 调度时段统计回调 ──────────────────────────────────
+
+class DispatchStatsCallback:
+    """v3.1: 累计调度接管时段占比，训练结束时输出。
+    通过包装 EvalCallback 的 _on_step 收集 dispatched 标记。
+    """
+    def __init__(self):
+        self._total_steps = 0
+        self._dispatched_steps = 0
+
+    def record(self, infos: list[dict]):
+        for info in infos:
+            self._total_steps += 1
+            if info.get("dispatched", False):
+                self._dispatched_steps += 1
+
+    @property
+    def dispatch_ratio(self) -> float:
+        if self._total_steps == 0:
+            return 0.0
+        return self._dispatched_steps / self._total_steps
+
+    def summary(self) -> str:
+        return (f"调度接管: {self._dispatched_steps}/{self._total_steps} 步 "
+                f"({self.dispatch_ratio:.1%})")
+
+
 def _train_sb3(env, eval_env, args):
     import gymnasium
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.callbacks import EvalCallback
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
+
+    # v3.1: 调度时段统计
+    dispatch_stats = DispatchStatsCallback()
 
     algo_cls = PPO if args.algo == "ppo" else SAC
     algo_name = "PPO" if args.algo == "ppo" else "SAC"
@@ -359,6 +392,17 @@ def _train_sb3(env, eval_env, args):
         "activation_fn": nn.ReLU,
     }
 
+    # v3.1: 包装 eval 环境以收集 dispatch stats
+    from stable_baselines3.common.callbacks import BaseCallback
+    class _DispatchWrapper(BaseCallback):
+        def _on_step(self) -> bool:
+            infos = self.locals.get("infos", [])
+            dispatch_stats.record(infos)
+            return True
+
+    dispatch_cb = _DispatchWrapper()
+    callbacks = [eval_callback, dispatch_cb]
+
     model = algo_cls(
         "MlpPolicy", vec_env,
         learning_rate=3e-4,
@@ -378,7 +422,7 @@ def _train_sb3(env, eval_env, args):
     try:
         model.learn(
             total_timesteps=args.total_timesteps,
-            callback=eval_callback,
+            callback=callbacks,
             tb_log_name=f"mupc_{args.algo}_{args.mode}_{datetime.datetime.now():%Y%m%d_%H%M%S}",
         )
         # 保存最终模型

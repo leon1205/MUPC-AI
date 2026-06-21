@@ -34,7 +34,36 @@ def _ensure_torch():
 # ── 初始化 PyTorch（立即尝试加载，确保 _TORCH_AVAILABLE 正确） ──
 _ensure_torch()
 
-# ── v3.0: AdditiveAttention ──────────────────────────────────
+# ── v3.1: 真分位数回归损失 (Quantile Loss / Pinball Loss) ─────
+
+class QuantileLoss:
+    """分位数回归损失 (Pinball Loss), v3.1 真分位数训练。
+
+    替换 MSE/Huber Loss, 使 P10/P50/P90 通道输出为真分位数回归结果。
+    下游要求: P90 覆盖率验证 (实际值 ≤ P90 的比例应接近 90%, ±2%).
+
+    L_tau(y, ŷ) = max(tau * (y - ŷ), (tau - 1) * (y - ŷ))
+    tau ∈ {0.10, 0.50, 0.90} 对应 P10/P50/P90
+
+    用法: loss_fn = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
+    """
+    def __init__(self, quantiles: list[float] | None = None):
+        self.quantiles = quantiles or [0.1, 0.5, 0.9]
+
+    def __call__(self, pred, target):
+        """计算多分位数 Pinball Loss。
+
+        Args:
+            pred: (B, 2, 15, 3) 预测分位数 [PV/Load, 步, P10/P50/P90]
+            target: (B, 2, 15, 3) 真实值 (三通道相同)
+        Returns:
+            scalar loss
+        """
+        losses = []
+        for i, q in enumerate(self.quantiles):
+            error = target[..., i] - pred[..., i]
+            losses.append(_torch.max(q * error, (q - 1) * error))
+        return _torch.mean(_torch.stack(losses))
 
 class AdditiveAttention:
     """加法注意力 (Bahdanau), 全 ONNX 标准算子组合.
@@ -417,6 +446,8 @@ LSTM_TRAIN_CONFIG = {
     "patience": 20,
     "output_mode": "legacy",         # 默认 legacy (v3.0 p10p50p90 由 --config 切换)
     "with_attention": False,         # 默认无 Attention (由 --config 启用)
+    "loss": "Huber",                 # v3.1: "Huber" / "quantile" 真分位数回归
+    "quantile_taus": [0.1, 0.5, 0.9],  # v3.1: 分位数目标 (仅 loss="quantile" 时使用)
 }
 
 
@@ -434,12 +465,15 @@ class LSTMTrainer:
 
         夜间 PV=0 样本占 ~50%, 导致模型恒输出 0。
         保留全部白天样本 (PV目标>10kW), 随机下采样夜间样本至 1:1。
+
+        v3.1: 排除 data_quality >= 1 的异常样本 (不参与 LSTM 训练).
         """
         pv = data["pv_power"]
         load = data["load_power"]
         ghi = data["solar_irradiance"]
         temp = data["temperature"]
         hours = data.get("hours", np.arange(len(pv), dtype=np.float32) * 15 / 60 % 24)
+        quality = data.get("data_quality")  # v3.1: 质量标注
 
         # v3.0: MSSA 搜索的 input_window 优先, legacy input_seq_len 作为 fallback
         seq_len = self.config.get("input_window") or self.config["input_seq_len"]
@@ -450,13 +484,24 @@ class LSTMTrainer:
         # 第一遍: 构建所有样本并分类
         day_idx = []
         night_idx = []
+        skipped_quality = 0
         for i in range(max_samples):
+            # v3.1: 跳过低质量样本 (quality >= 1, 但 quality=3 调度接管仅用于 RL)
+            if quality is not None:
+                q_window = quality[i:i + seq_len + forecast]
+                if np.any(q_window >= 1):
+                    skipped_quality += 1
+                    continue
+
             # 检查预测窗口内是否有有效光伏 (>5kW，降低阈值保留更多样本)
             pv_target_max = np.max(pv[i + seq_len : i + seq_len + forecast])
             if pv_target_max > 5.0:
                 day_idx.append(i)
             else:
                 night_idx.append(i)
+
+        if skipped_quality > 0:
+            print(f"  数据质量: 跳过 {skipped_quality} 个低质量样本 (quality>=1)")
 
         # 均衡: 白天全保留, 夜间下采样至白天数量的2倍（改善夜间预测）
         n_day = len(day_idx)
@@ -545,6 +590,27 @@ class LSTMTrainer:
 
         return X, y
 
+    def _compute_p90_coverage(self, X: np.ndarray, y_true: np.ndarray) -> float:
+        """v3.1: 计算 P90 覆盖率 — 实际值 ≤ P90 预测值的比例。
+
+        预期: 接近 90% (允许 ±2% 偏差).
+        """
+        self.model.lstm.eval()
+        with _torch.no_grad():
+            t_x = _torch.tensor(X[:2000], dtype=_torch.float32).to(self.device)
+            pred = self.model(t_x)
+            if self.model.output_mode == "p10p50p90":
+                pred_np = pred.cpu().numpy()  # (B, 2, 15, 3)
+                y_sub = y_true[:2000] if y_true.ndim == 4 else y_true[:2000].reshape(-1, 2, 15, 3)
+                p90_pred = pred_np[..., 2].flatten()  # P90 通道
+                y_flat = y_sub[..., 1].flatten()       # P50 = 真实值
+            else:
+                return 0.0
+        mask = y_flat > 1e-3
+        if mask.sum() == 0:
+            return 0.0
+        return float((y_flat[mask] <= p90_pred[mask]).mean())
+
     def train(self, data: dict, val_data: dict | None = None) -> dict:
         """训练 LSTM 模型。
 
@@ -574,7 +640,13 @@ class LSTMTrainer:
         self.model.to(self.device)
 
         optimizer = _torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])
-        loss_fn = _nn.HuberLoss()
+        # v3.1: 支持 QuantileLoss 真分位数训练
+        if cfg.get("loss") == "quantile" and cfg.get("output_mode") == "p10p50p90":
+            loss_fn = QuantileLoss(quantiles=cfg.get("quantile_taus", [0.1, 0.5, 0.9]))
+            print("  损失函数: QuantileLoss (真分位数回归, tau=[0.1,0.5,0.9])")
+        else:
+            loss_fn = _nn.HuberLoss()
+            print(f"  损失函数: HuberLoss")
         scheduler = _torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", patience=5, factor=0.5,
         )
@@ -660,6 +732,14 @@ class LSTMTrainer:
                                         y_val if val_data is not None else y, is_pv=False)
         print(f"\n  最终: PV_MAPE={pv_mape:.1f}%  Load_MAPE={load_mape:.1f}%")
         print(f"  目标: PV_MAPE <= 10%  {'[PASS]' if pv_mape <= 10 else '[WARN]'}")
+
+        # v3.1: P90 覆盖率验证 (仅在 quantile loss 时执行)
+        if cfg.get("loss") == "quantile":
+            test_X = X_val if val_data is not None else X
+            test_y = y_val if val_data is not None else y
+            p90_coverage = self._compute_p90_coverage(test_X, test_y)
+            in_range = 0.88 <= p90_coverage <= 0.92
+            print(f"  P90覆盖率: {p90_coverage:.1%} (预期 90%±2%) {'[PASS]' if in_range else '[WARN]'}")
         print(f"  目标: Load_MAPE <= 15% {'[PASS]' if load_mape <= 15 else '[WARN]'}")
 
         return {"model": self.model, "history": history,

@@ -598,6 +598,8 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         truncated = self._step_idx >= self._data_len - 16
 
         # 13. 构建 info
+        # v3.1: 标记调度接管时段 (用于自主/调度分段评估)
+        dispatched = dispatch_p_use is not None
         info = {
             "mode": self._current_mode,
             "soc": self._soc,
@@ -619,6 +621,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "violations": str(violations) if violations else "",
             "voltage_violation_count": self._voltage_violation_count,
             "has_illegal": has_illegal,  # Grid2Op 潮流不收敛/电压越限标记
+            "dispatched": dispatched,     # v3.1: 调度接管标记
             **reward_info,
         }
         if terminated or truncated:

@@ -1002,6 +1002,23 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 
 > **v2.15 说明：** load_shedding、pv_limit 的约束校验（原 ACT-05、ACT-06）已下沉至策略引擎独立执行，不再纳入 AI 动作约束规则。confidence 校验移至 ActionValidator → ModelOutput 流程。
 
+#### 6.5.1 调度指令与 AI 目标冲突消解（v3.1）
+
+当调度主站下发强制指令（如紧急功率支撑、计划性充放电）与 AI 最优策略发生持续冲突时，需明确调度优先级的硬约束逻辑，防止 AI 价值网络因长期被迫执行次优动作而估计失真。
+
+**硬约束规则：**
+
+| 规则 | 条件 | 行为 |
+|------|------|------|
+| 调度绝对优先 | `dispatch_p_set` 有效（非 None）且 `dispatch_p_set` 来源为调度主站（IEC 104/IEC 61850） | AI 动作的 `p_ref` 通过 ACT-05 约束至 `[-|dispatch_p|, |dispatch_p|]` |
+| 调度时段标记 | `dispatch_p_set` 有效 | FusedSystemState D6 写入实际调度值，RL 观测到调度接管状态 |
+| AI 自主时段 | `dispatch_p_set` 为 None | AI 自由决策，D6 置 0.0 |
+
+**训练阶段建议（属 MUPC-AI2 训练管线范畴）：**
+
+- 将 `dispatch_p_set` 作为条件输入（非普通状态特征），在训练时对调度接管时段施加动作掩码（Action Mask），使 AI 学会"在服从调度的前提下寻优"
+- 在评估指标中区分"自主决策时段"与"调度接管时段"的性能表现，避免调度时段的强制次优动作污染自主决策时段的评估结果
+
 ### 6.6 接口定义
 
 ```rust
@@ -1816,6 +1833,20 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 误差修正 BiLSTM 推理延迟 | <= 200ms | 性能测试 |
 | 误差修正 + 主预测总延迟 | < 1s | 性能测试 |
 
+**v3.1 最坏情况执行时间（WCET）分析：**
+
+在多任务并发或 NPU 负载较高时，增强模型推理可能超时。以下为各降级路径的 WCET 预算与备份策略：
+
+| 路径 | 组合 | WCET 预算 | 超时策略 |
+|------|------|-----------|----------|
+| Go 全功能 | VMD(CPU 50ms) + BiLSTM(NPU 80ms) + EC(NPU 200ms) | 430ms（含串行开销） | 超时1s→降级至 Level 2 |
+| No-Go A | VMD(CPU 50ms) + LSTM(NPU 40ms) + EC(NPU 200ms) | 350ms | 超时1s→降级至 Level 3 |
+| No-Go B | VMD(CPU 50ms) + LSTM(NPU 40ms) | 150ms | 超时1s→降级至 Level 3 |
+| Level 3 | LSTM/Attention(NPU 60ms) | 100ms | 超时500ms→降级至 Level 4 |
+| **Level 4 轻量备份** | **纯 LSTM v2.16 基线(NPU 40ms)** | **60ms** | **超时500ms→Level 5 安全兜底** |
+
+**轻量级备份策略：** Level 4（Baseline）即 v2.16 纯 LSTM 模型，不依赖 VMD/Attention/BiLSTM/误差修正任何增强模块。当增强模型推理超时或内存溢出时，8 级降级机制自动逐级回退至 Level 4，保障业务连续性。Level 4 模型与增强模型独立 OTA，增强模型升级失败不影响轻量备份可用性。
+
 ### 10.2 模型精度
 
 | 指标 | 要求 | 测量方法 |
@@ -2050,6 +2081,28 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 | VMD + Attention 均失败 | 回退至 v2.16 基线纯 LSTM 推理 |
 | 误差修正失败 | 主预测值直接输出，不修正 |
 | BiLSTM 启用但 Attention 禁用 | BiLSTM 输出直接到全连接层（跳过 Attention），记录 INFO |
+
+#### 11.4.6 数据缺失值语义与处理（v3.1）
+
+78 维状态空间中包含多个 `Option` 字段和外部 API 数据（气象、电价）。`unwrap_or(0.0)` 的简单补零策略对不同类型的缺失值应区分处理：
+
+| 缺失类型 | 典型字段 | 语义 | 处理策略 |
+|----------|----------|------|----------|
+| **正常零值** | pv_power=0（夜间）、load_power≈0（空载） | 物理合法值 | 直接使用，不做特殊处理 |
+| **通信中断** | dispatch_p_set=None（intercore 断连）、气象数据超时 | 临时不可用，预期短期内恢复 | **Hold Last Value**：使用上一周期有效值回填，连续 3 周期无效后 WARN |
+| **传感器故障** | voltage_phase_a=NaN、battery_soc 跳变 | 硬件故障，预期持续不可用 | **触发降级**：电压缺失→降级至本地策略；SOC 缺失→冻结充放电动作 |
+| **首次启动** | 所有 Option 字段为 None（尚无上一周期值） | 冷启动 | **安全默认值**：soc=0.5、voltage=1.0、dispatch=None→0.0 |
+
+**关键安全字段缺失处理：**
+
+| 字段 | 缺失时行为 | 理由 |
+|------|-----------|------|
+| battery_soc | 保持上一有效值 + WARN；连续 10 周期无更新→冻结充放电（p_ref=0） | SOC 0.0 会导致 AI 认为电池已耗尽，做出过激放电决策 |
+| voltage_phase_a/b/c | 保持上一有效值 + WARN；连续 3 周期无更新→降级至本地策略 | 电压 0.0 会导致下垂公式输出异常、安全校验失效 |
+| transformer_load | 保持上一有效值 | 0.0 会屏蔽过载保护逻辑 |
+| dispatch_p_set | None→0.0（表示无调度约束） | 0.0 语义为"无调度"，与"调度命令充/放 0kW"一致 |
+
+**实现方式：** `DataFusionEngine.fuse()` 已在融合层做 Hold Last Value 回填。`to_input_vector()` 中的 `unwrap_or(0.0)` 仅作为融合层回填失败时的最终兜底，不应跳过融合层的回填逻辑。
 
 ---
 

@@ -3599,6 +3599,31 @@ impl AdaptiveWeightOptimizer {
         }
         ((optimized_reward - original_reward) / original_reward).abs() < 0.05
     }
+
+    /// v3.1: 权重健康度检查 — 累计漂移监控
+    ///
+    /// 当优化后的权重组合导致关键性能指标连续 N 个周期劣于基线时，
+    /// 自动触发权重冻结，回退到基线权重。
+    ///
+    /// 监控指标：
+    ///   - 变压器过载次数（overload_count）
+    ///   - 电压越限次数（voltage_violation_count）
+    ///   - 累积奖励（cumulative_reward）
+    ///
+    /// 退化判定：任意 2 项劣于基线 → 计为一次退化周期
+    /// 冻结阈值：连续 health_freeze_threshold（默认 3）个周期退化 → 自动冻结
+    pub async fn check_cumulative_health(&self) -> WeightHealthStatus {
+        // ... 见 adaptive_weight_optimizer.rs 实现
+    }
+}
+
+/// v3.1: 权重健康度状态
+pub enum WeightHealthStatus {
+    Healthy,                              // 不劣于基线
+    Degraded { consecutive: u32 },        // 连续 N 周期退化
+    Frozen,                               // 退化超阈值，自动冻结
+    NoBaseline,                           // 首次运行，无基线
+    CollectorError,                       // 采集失败
 }
 
 pub trait PerformanceCollector: Send + Sync {
