@@ -2,10 +2,11 @@
 
 # MUPC AI 引擎 - 模块设计文档
 
-[DESIGN_APPROVED] — v3.0 合并预测增强分层混合架构设计（VMD + Attention + BiLSTM + 误差修正 + MSSA）
+[DESIGN_APPROVED] — v3.1 第 2 章精简 + 预测增强管线统一描述
 
 | 版本 | 日期       | 作者   | 状态 |
 | ---- | ---------- | ------ | ---- |
+| v3.1 | 2026-06-21 | 架构师 | [DESIGN_APPROVED] — 第 2 章精简（移除过时字段与 TCN 引用，新增第 14 章交叉引用），对齐 PRD v3.1 |
 | v3.0 | 2026-06-21 | 架构师 | [DESIGN_APPROVED] — 合并预测增强分层混合架构（~1876行） |
 | v2.15 | 2026-06-17 | 架构师 | [DESIGN_APPROVED] |
 | v2.14 | 2026-06-15 | 架构师 | [DESIGN_APPROVED] |
@@ -18,7 +19,7 @@
 | v2.7 | 2026-06-13 | 架构师 | 历史版本 |
 | v2.6 | 2026-06-10 | 架构师 | 历史版本 |
 
-**对应 PRD:** `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md` v2.15 (`[REVIEWED: PASS]`)
+**对应 PRD:** `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md` v3.1 (`[REVIEWED: PASS]`)
 **合并来源:** `docs/superpowers/plans/2026-06-21-预测增强分层混合架构-DESIGN.md` v3.0 (`[DESIGN_APPROVED]`，覆盖三轮：VMD+Attention / BiLSTM+误差修正 / MSSA)
 
 ---
@@ -243,9 +244,11 @@ full_decision_cycle():
 
 ## 2. LSTM 模型设计
 
+> **本章定义 LSTM 网络架构和基础推理接口。完整的预测管线设计（VMD 分解、Attention、误差修正、降级层级）见第 14 章「LSTM 预测增强管线设计」。**
+
 ### 2.1 功能概述
 
-LSTM 时序预测模型负责预测未来 15~30 分钟（默认 15 分钟，可配置）的光伏出力和负荷功率，为 RL 决策模型提供前瞻性输入。模型架构支持 LSTM 作为主模型，TCN 作为备选方案，两者均通过 ONNX 导出并部署为 .rknn。
+LSTM 时序预测模型负责预测未来 225 分钟（15 步 × 15 分钟）的光伏出力和负荷功率，为 RL 决策模型提供前瞻性输入。模型通过 ONNX 导出并部署为 .rknn，在 RK3588 NPU 上执行 INT8 推理。
 
 ### 2.2 预测规格
 
@@ -253,35 +256,35 @@ LSTM 时序预测模型负责预测未来 15~30 分钟（默认 15 分钟，可�
 |------|------|
 | 预测目标 | 光伏出力 (PV forecast)、负荷功率 (Load forecast) |
 | 负荷分类 | 基荷（基础用电）、可调负荷（柔性负荷）、冲击负荷（概率预测） |
-| 预测范围 | 225 分钟（默认 15 步 × 15 分钟，可配置调整） |
-| 采样间隔 | 每 15 分钟 1 个采样点（v2.16 统一，与 MUPC-AI2 训练管线对齐） |
-| 输入数据 | 历史光伏出力、历史负荷功率、气象数据（光照、温度） |
-| 输入窗口 | 6 小时（24 步 × 15 分钟），由 `LstmConfig.input_window_secs / step_seconds` 计算 |
-| 输出窗口 | 225 分钟（15 步 × 15 分钟），由 `LstmConfig.output_horizon_secs / step_seconds` 计算 |
-| 模型格式 | ONNX（训练）--> INT8 量化 --> .rknn（部署）|
-| 精度要求 | 光伏 MAPE <= 10%, 负荷 MAPE <= 15% |
+| 预测范围 | 225 分钟（15 步 × 15 分钟） |
+| 采样间隔 | 15 分钟（900s step_seconds，与 MUPC-AI2 训练管线对齐） |
+| 输入窗口 | 6 小时（24 步 × 15 分钟），MSSA 可搜索 {12, 24, 36} |
+| 输出窗口 | 225 分钟（15 步 × 15 分钟），固定不可配 |
+| 模型格式 | ONNX（训练）→ INT8 量化 → .rknn（部署）|
+| 精度要求 | 光伏 MAPE ≤ 8.5%（R1）/ ≤ 7.5%（R2）；负荷 MAPE ≤ 13%（R1）/ ≤ 12%（R2），详见 PRD §3.11 |
 
 ### 2.3 接口定义
 
 ```rust
-/// LSTM 模型输入
-#[derive(Debug, Clone)]
+/// LSTM 模型输入（经 MIC 筛选后的特征序列）
 pub struct LstmInput {
-    /// 历史时间序列数据（按时间顺序），长度 = input_window_secs / 60
-    pub history: Vec<f32>,
-    /// UTC 时间戳（秒）
-    pub timestamp: i64,
+    /// 输入窗口步数（默认 24，由 input_window_secs / step_seconds 计算）
+    pub window_size: usize,
+    /// 筛选后的特征维度（默认 7，由 MIC top_k 确定）
+    pub num_features: usize,
 }
 
-/// LSTM 模型输出
-#[derive(Debug, Clone)]
+/// 模型预测输出
 pub struct LstmOutput {
-    /// 预测值向量（未来 N 个时间步），长度 = output_horizon_secs / 60
-    pub predictions: Vec<f32>,
-    /// 置信度 (0.0 ~ 1.0)，基于输出方差的简化估计
-    pub confidence: f64,
+    pub pv_forecast: Vec<f32>,              // 光伏 P50 点预测（15 维）
+    pub load_forecast: Vec<f32>,             // 负荷 P50 点预测（15 维）
+    pub load_forecast_quantiles: Vec<f32>,   // 负荷 P90 分位数（15 维）
+    pub shock_load_probability: f32,         // 冲击负荷概率
+    pub base_load: f32,                      // 基础负荷（第 1 步 P50）
 }
 ```
+
+> **注意：** `confidence` 字段已删除（原算法基于预测序列方差，数学上无意义）。策略引擎的 confidence 来自 `ModelOutput` 元数据字段，与 LSTM 无关。
 
 ### 2.4 模型结构体
 
@@ -306,12 +309,12 @@ impl LstmModel {
 
 ```
 训练阶段 (x86 服务器, PyTorch):
-  1. 定义 LSTM/TCN 模型 (torch.nn.LSTM / TCN)
-  2. 训练至收敛 (MAPE <= 10%)
-  3. torch.onnx.export() 导出 ONNX 模型
+  1. 定义 LSTM 模型 + AdditiveAttention（第 14 章）
+  2. 训练至收敛
+  3. torch.onnx.export() 导出 ONNX 模型（含 metadata_props 10 键）
   4. rknn-toolkit2 加载 ONNX 模型
-  5. 校准数据集 (calibration dataset) INT8 量化
-  6. rknn.build() 生成 .rknn 模型文件 (<= 5MB)
+  5. 校准数据集 INT8 量化
+  6. rknn.build() 生成 .rknn 模型文件（lstm_attn ≤ 8MB / bilstm_attn ≤ 12MB / error_correction ≤ 3MB）
 
 部署阶段 (RK3588):
   1. 加载 .rknn 文件到 RKNN Runtime
@@ -321,18 +324,19 @@ impl LstmModel {
 
 ### 2.6 预测向量长度处理
 
-**v2.16 修订**：预测输出向量长度由 `LstmConfig.output_horizon_secs / step_seconds` 计算（替代原 `/60` 硬编码）。当实际输出长度与配置不符时：
+预测输出向量长度由 `LstmConfig.output_horizon_secs / step_seconds` 计算（15 步，固定）。当实际输出长度与配置不符时：
 - 超出部分：截断（取前 N 个值）
-- 不足部分：**返回 `OutputShapeMismatch` 错误**（v2.16 修复原静默补零行为）
+- 不足部分：**返回 `OutputShapeMismatch` 错误**（不静默补零）
 
 ```rust
-// v2.16: 使用 step_seconds 统一计算（默认 900s = 15 分钟）
 let output_size = self.config.output_horizon_secs as usize / self.config.step_seconds as usize;
-let predictions: Vec<f32> = output.into_iter()
-    .take(output_size)
-    .chain(std::iter::repeat(0.0))
-    .take(output_size)
-    .collect();
+// = 22500 / 900 = 15
+if output.len() < output_size {
+    return Err(AiEngineError::OutputShapeMismatch {
+        expected: output_size,
+        actual: output.len(),
+    });
+}
 ```
 
 ---
@@ -770,7 +774,7 @@ RLModel 使用 MADDPG（多智能体深度确定性策略梯度）或 PPO（近�
 - 无功补偿（Q_batt）：根据电压实时闭环调节，响应时间 ms 级
 - 三相不平衡：不涉及电池充放电，由实时控制核心模块独立处理
 - 调节方式：查表法或 PID，不经过 AI
-- 执行器按下垂公式 `P_output = P_ref + k_droop × ΔV` 执行毫秒级暂态调节
+- 执行器按下垂公式 `P_output = P_ref - k_droop × ΔV` 执行毫秒级暂态调节
 
 **上层（RL决策）**— v2.15 现行，2 维动作空间
 - `p_ref`（有功基准点，[-50.0, 50.0] kW）：AI 负责稳态全局优化，通过核间 TCP 下发
@@ -1331,8 +1335,8 @@ R_smooth = -|Δk_droop| - λ * max(0, k_droop - K_MAX)
 ```
 
 - `Δk_droop = k_droop_t - k_droop_{t-1}`：防止 AI 频繁调整 k_droop
-- `K_MAX`：k_droop 上限（默认 50.0 kW/V）
-- `λ`：超限惩罚系数（默认 1.0）
+- `K_MAX`：k_droop 惩罚触发阈值（默认 30.0 kW/V）
+- `λ`：超限惩罚系数（默认 10.0）
 
 **子项定义：**
 
@@ -1497,8 +1501,8 @@ fn calc_pq_coordination(&self, state: &FusedSystemState, p_ref: f64) -> f64 {
 
 /// 下垂系数平滑惩罚（v2.8 新增）
 fn calc_smooth_penalty(&self, k_droop: f64, prev_k_droop: f64) -> f64 {
-    const K_MAX: f64 = 50.0; // kW/V
-    const LAMBDA: f64 = 1.0;
+    const K_MAX: f64 = 30.0; // kW/V
+    const LAMBDA: f64 = 10.0;
     let delta = (k_droop - prev_k_droop).abs();
     let excess = (k_droop - K_MAX).max(0.0);
     delta + LAMBDA * excess
@@ -1549,8 +1553,8 @@ pub struct RewardCalculator {
 ```
 R_arbitrage = w1 * R_price_spread - w2 * P_battery_degradation
 
-R_price_spread         = p_ref * delta_t * (price_current - price_average) * conversion_factor
-P_battery_degradation  = beta * abs(p_ref) * delta_t / E_battery_total * 100
+R_price_spread         = (price_current - price_avg) * p_ref * conversion_factor
+P_battery_degradation  = β · (|p_ref| / E_battery_total)²   # C-rate² 应力模型（v2.15）
 ```
 
 **权重表：**
@@ -1565,11 +1569,12 @@ fn reward_commercial_arbitrage(
     &self, state: &FusedSystemState, action: &ActionOutput
 ) -> f64 {
     let w = &self.weights.commercial_arbitrage;
-    // 电价差：当前电价相对于峰谷均价差
     let avg_price = (state.peak_price + state.valley_price) / 2.0;
     let spread = (state.current_electricity_price - avg_price) * action.p_ref * 0.001;
-    let r_spread = spread * 100.0; // 缩放
-    let p_deg = 100.0 * action.p_ref.abs() / 500.0 * 0.01; // 每 kW 损耗
+    let r_spread = spread * 100.0;
+    // C-rate² 应力模型（v2.15，对齐 MODE-01）
+    let c_rate = action.p_ref.abs() / BATTERY_CAPACITY_KWH;
+    let p_deg = c_rate * c_rate * 100.0;
     w[0] * r_spread - w[1] * p_deg
 }
 ```
@@ -6313,6 +6318,15 @@ AI 引擎可通过 p_batt/q_batt 协同控制主动调节。v2.3 仅恢复电压
 | 8 | 版本号更新 | 文档头部 | v2.14 → v2.15 |
 
 **修订依据：** PRD v2.15 (`[REVIEWED: PASS]`) 将动作空间从 5 维精简为 2 维：(1) p_ref/k_droop 通过核间通信下发实时控制模块；(2) load_shedding 下沉至 strategy-engine 需量控制策略独立执行；(3) pv_limit 下沉至 strategy-engine 防逆流策略独立执行；(4) confidence 保留在 ModelOutput 中供 action_validator 内部校验。精简后 AI 引擎专注于核心 P-Q 协同控制，策略引擎承担本地设备控制职责。
+
+### v3.1 精简修订记录 (2026-06-21)
+
+| 序号 | 修订项 | 修订位置 | 说明 |
+|------|--------|----------|------|
+| 1 | **精简第 2 章 LSTM 模型设计** | §2.1~2.6 | 移除 TCN 备选方案引用、移除 `LstmOutput.confidence` 过时字段、移除 `LstmInput` 中 `history: Vec<f32>` 过时定义、移除硬编码 `/60` 步长计算为 `step_seconds` 统一计算、移除 v2.16 版本标记、精度要求更新为 v3.0 目标 |
+| 2 | 新增第 2 章交叉引用 | §2 | 新增引导注释："完整的预测管线设计（VMD 分解、Attention、误差修正、降级层级）见第 14 章" |
+| 3 | 更新版本头部 | 文档头部 | v3.0 → v3.1，标注精简与交叉引用变更；PRD 引用 v2.15 → v3.1 |
+| 4 | 更新附录A | 附录A | 新增 v3.1 本修订记录 |
 
 ### v3.0 合并修订记录 (2026-06-21)
 

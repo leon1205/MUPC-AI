@@ -5,7 +5,7 @@ VMD (Variational Mode Decomposition) 信号分解器 (v3.0 R2).
      部署时 VMD 由 MUPC 推理端 CPU 执行, 训练管线仅训练/导出 VMD 兼容模型.
 
 K 值: 光伏 4~6, 负荷 5~8 (由 MSSA 搜索确定).
-参考试验: alpha=2000.0, tau=0.0, tol=1e-7, max_iter=500.
+参考试验: alpha=2000.0, tau=0.0, tol=1e-6, max_iter=500.
 
 注意: VMD 是 R2 可选特性, 由 LSTMTrainer config["vmd_enabled"] 控制启用.
       当前为骨架实现, 训练时 VMD 通过外部库 (vmdpy) 或纯 NumPy 分解.
@@ -25,14 +25,14 @@ class VmdDecomposer:
     """
 
     def __init__(self, K: int = 5, alpha: float = 2000.0, tau: float = 0.0,
-                 tol: float = 1e-7, max_iter: int = 500,
+                 tol: float = 1e-6, max_iter: int = 500,
                  dc: bool = False, init_mode: int = 1):
         """
         Args:
             K: 模态数 (默认 5)
             alpha: 带宽约束参数 (默认 2000)
             tau: 噪声容忍度 (默认 0 = 无噪声)
-            tol: 收敛容差 (默认 1e-7)
+            tol: 收敛容差 (默认 1e-6)
             max_iter: 最大迭代次数 (默认 500)
             dc: 是否保留直流分量 (默认 False)
             init_mode: 初始化模式 (0=全零, 1=均匀分布, 2=随机)
@@ -108,7 +108,7 @@ VMD_DEFAULT_CONFIG = {
     "K": 5,
     "alpha": 2000.0,
     "tau": 0.0,
-    "tol": 1e-7,
+    "tol": 1e-6,
     "max_iter": 500,
     "dc": False,
     "init_mode": 1,

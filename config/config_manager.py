@@ -90,7 +90,7 @@ class DualControlConfig:
     k_droop_min: float = -100.0   # v2.17 对齐下游
     k_droop_max: float = 100.0    # v2.17 对齐下游
     p_ref_ramp_limit_kw: float = 50.0
-    k_droop_ramp_limit: float = 30.0  # v2.17 对齐下游 ACT-02
+    k_droop_ramp_limit: float = 10.0  # 对齐下游 PRD §6.5 ACT-02
     pv_limit_min: float = 0.0
 
 

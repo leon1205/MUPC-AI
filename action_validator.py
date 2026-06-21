@@ -3,16 +3,18 @@
 
 约束规则 (v2.17 完全对齐下游 Rust action_validator.rs):
   ACT-01: |Δp_ref| <= 50 kW/步
-  ACT-02: |Δk_droop| <= 30 kW/V/步
+  ACT-02: |Δk_droop| <= 10 kW/V/步
   ACT-03: √(p_ref² + k_droop²) <= 200 kVA (视在功率圆, 对齐下游 S-circle)
   ACT-04: k_droop ∈ [-100, 100] kW/V (最终值域 clamp)
   ACT-05: |p_ref| <= |dispatch_p| (调度权限约束)
 
 v2.17 变更:
   - k_droop 范围 [0,30] → [-100,100] (对齐下游 Dual 模式默认值)
-  - ACT-02 阈值 10 → 30 (对齐下游 q_batt_ramp_limit_kvar)
   - ACT-03 从简单 p_ref clamp 改为 S-circle (对齐下游标准模式)
   - 新增 MAX_APPARENT_POWER_KVA = 200.0
+
+v3.1 对齐:
+  - ACT-02 阈值恢复为 10 kW/V/步 (对齐下游 PRD §6.5)
 """
 
 import numpy as np
@@ -29,13 +31,13 @@ class ActionValidator:
     K_DROOP_MIN: float = -100.0           # kW/V (v2.17: 对齐下游 Dual 模式)
     K_DROOP_MAX: float = 100.0            # kW/V (v2.17: 对齐下游 Dual 模式)
     DELTA_P_MAX: float = 50.0             # kW/步, ACT-01
-    DELTA_K_DROOP_MAX: float = 30.0       # kW/V/步, ACT-02 (v2.17: 10→30)
+    DELTA_K_DROOP_MAX: float = 10.0       # kW/V/步, ACT-02 对齐下游 PRD §6.5
     MAX_APPARENT_POWER_KVA: float = 200.0  # kVA, ACT-03 S-circle
 
     def __init__(self, p_batt_max: float = 50.0,
                  k_droop_min: float = -100.0, k_droop_max: float = 100.0,
                  delta_p_max: float = 50.0,
-                 delta_k_droop_max: float = 30.0,
+                 delta_k_droop_max: float = 10.0,
                  max_apparent_power_kva: float = 200.0):
         """初始化动作约束参数。
 
@@ -44,7 +46,7 @@ class ActionValidator:
             k_droop_min: 下垂系数下限 (kW/V), v2.17 默认 -100
             k_droop_max: 下垂系数上限 (kW/V), v2.17 默认 100
             delta_p_max: 电池变化率保护 (kW/步), ACT-01
-            delta_k_droop_max: 下垂系数变化率保护 (kW/V/步), ACT-02
+            delta_k_droop_max: 下垂系数变化率保护 (kW/V/步), ACT-02 对齐下游 PRD §6.5
             max_apparent_power_kva: 视在功率上限 (kVA), ACT-03 S-circle
         """
         self.P_BATT_MAX = p_batt_max
@@ -105,7 +107,7 @@ class ActionValidator:
                 min(self.DELTA_P_MAX, p_ref - self.prev_p_ref))
             violations["ACT-01"] = True
 
-        # ACT-02: Δk_droop <= 30 kW/V/步 (v2.17: 10→30)
+        # ACT-02: Δk_droop <= 10 kW/V/步
         if abs(k_droop - self.prev_k_droop) > self.DELTA_K_DROOP_MAX:
             k_droop = self.prev_k_droop + max(
                 -self.DELTA_K_DROOP_MAX,
