@@ -435,7 +435,7 @@ class LSTMForecast:
 
 LSTM_TRAIN_CONFIG = {
     "input_seq_len": 8,          # legacy: 120 分钟 / 15 分钟
-    "input_window": 12,           # v3.0: 输入窗口步数 (12/24/36)
+    "input_window": 24,           # v3.0: 输入窗口步数 (12/24/36)
     "forecast_steps": 15,        # 预测 15 步
     "hidden_dim": 64,
     "num_layers": 2,
@@ -444,9 +444,9 @@ LSTM_TRAIN_CONFIG = {
     "learning_rate": 1e-3,
     "epochs": 200,
     "patience": 20,
-    "output_mode": "legacy",         # 默认 legacy (v3.0 p10p50p90 由 --config 切换)
-    "with_attention": False,         # 默认无 Attention (由 --config 启用)
-    "loss": "Huber",                 # v3.1: "Huber" / "quantile" 真分位数回归
+    "output_mode": "p10p50p90",     # v3.0: 分位数三通道预测 (legacy 向后兼容由 --config 切换)
+    "with_attention": True,          # v3.0: AdditiveAttention
+    "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
     "quantile_taus": [0.1, 0.5, 0.9],  # v3.1: 分位数目标 (仅 loss="quantile" 时使用)
 }
 
@@ -599,6 +599,8 @@ class LSTMTrainer:
         with _torch.no_grad():
             t_x = _torch.tensor(X[:2000], dtype=_torch.float32).to(self.device)
             pred = self.model(t_x)
+            if isinstance(pred, tuple):
+                pred = pred[0]
             if self.model.output_mode == "p10p50p90":
                 pred_np = pred.cpu().numpy()  # (B, 2, 15, 3)
                 y_sub = y_true[:2000] if y_true.ndim == 4 else y_true[:2000].reshape(-1, 2, 15, 3)
@@ -673,6 +675,8 @@ class LSTMTrainer:
                 batch_y = batch_y.to(self.device)
                 optimizer.zero_grad()
                 pred = self.model(batch_x)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
                 loss = loss_fn(pred, batch_y)
                 loss.backward()
                 _torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -692,6 +696,8 @@ class LSTMTrainer:
                     t_x = _torch.tensor(X_val, dtype=_torch.float32).to(self.device)
                     t_y = _torch.tensor(y_val, dtype=_torch.float32).to(self.device)
                     val_pred = self.model(t_x)
+                    if isinstance(val_pred, tuple):
+                        val_pred = val_pred[0]
                     val_loss = loss_fn(val_pred, t_y).item()
                 history["val_loss"].append(val_loss)
                 scheduler.step(val_loss)
@@ -759,16 +765,29 @@ class LSTMTrainer:
         self.model.lstm.eval()
         with _torch.no_grad():
             t_x = _torch.tensor(X[idx], dtype=_torch.float32).to(self.device)
-            pred = self.model(t_x).cpu().numpy()
-        offset = 0 if is_pv else self.config["forecast_steps"]
-        y_true = y[idx][:, offset:offset + self.config["forecast_steps"]]
-        y_pred = pred[:, offset:offset + self.config["forecast_steps"]]
+            raw = self.model(t_x)
+            # v3.0: forward 可能返回 (out, attn_weights) tuple
+            if isinstance(raw, tuple):
+                pred = raw[0].cpu().numpy()
+            else:
+                pred = raw.cpu().numpy()
+
+        output_mode = self.config.get("output_mode", "legacy")
+        if output_mode == "p10p50p90":
+            # pred: (B, 2, 15, 3), y: (N, 2, 15, 3)
+            # 取 P50 通道 (index=1) 作为预测值，对应 y[..., 1] = 真实值
+            ch = 0 if is_pv else 1  # PV=ch0, Load=ch1
+            y_pred = pred[:, ch, :, 1]  # (n, 15)
+            y_true = y[idx, ch, :, 1]
+        else:
+            # legacy: (B, 47) 或 (B, 30)
+            offset = 0 if is_pv else self.config["forecast_steps"]
+            y_true = y[idx][:, offset:offset + self.config["forecast_steps"]]
+            y_pred = pred[:, offset:offset + self.config["forecast_steps"]]
 
         if is_pv:
-            # PV: 仅统计实际出力 > 10kW (5%容量) 的点 — 夜间不计
             mask = y_true > 10.0
         else:
-            # 负荷: 仅统计 > 10kW 的点
             mask = y_true > 10.0
 
         if mask.sum() == 0:

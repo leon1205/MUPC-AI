@@ -286,11 +286,17 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
     _ensure_export_deps()
 
     from lstm_model import LSTMForecast
-    lstm_model = LSTMForecast(
-        with_attention=with_attention,
-        output_mode="p10p50p90" if with_attention else "legacy",
-    )
     state_dict = torch.load(checkpoint_path, map_location="cpu")
+    # v3.0: auto-detect output_mode from checkpoint
+    has_attn = "attention" in state_dict and state_dict["attention"] is not None
+    has_p10p50p90 = "head_pv_p10" in state_dict
+    detected_mode = "p10p50p90" if has_p10p50p90 else "legacy"
+    detected_attn = has_attn
+    print(f"  检测到模型模式: {detected_mode}, attention={detected_attn}")
+    lstm_model = LSTMForecast(
+        with_attention=detected_attn,
+        output_mode=detected_mode,
+    )
     lstm_model.load_state_dict(state_dict)
     lstm_model.eval()
 
@@ -380,13 +386,15 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
         output_names=output_names,
         opset_version=13,
         dynamic_axes={"history": {0: "batch"}, "forecast": {0: "batch"}},
-        metadata_props=export_metadata,
     )
 
     onnx_model = onnx.load(onnx_path)
+    # v3.0: 注入 metadata_props
+    for k, v in export_metadata.items():
+        onnx_model.metadata_props.append(onnx.StringStringEntryProto(key=k, value=v))
+    onnx.save(onnx_model, onnx_path)
     onnx.checker.check_model(onnx_model)
 
-    # 验证 metadata
     meta = {p.key: p.value for p in onnx_model.metadata_props}
     print(f"LSTM ONNX 导出: {onnx_path}")
     print(f"  metadata keys: {sorted(meta.keys())}")

@@ -194,7 +194,14 @@ def main():
     train_data, val_data = loader.split(data)
 
     # ── v3.0: MSSA 配置覆盖 ────────────────────────────────
-    lstm_cfg = {"epochs": 50, "batch_size": 64}
+    lstm_cfg = {
+        "epochs": 200, "batch_size": 64,
+        "output_mode": "p10p50p90",     # v3.0: 分位数三通道预测
+        "with_attention": True,          # v3.0: AdditiveAttention
+        "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
+        "input_window": 24,              # v3.0: 输入窗口步数
+        "patience": 30,                  # 早停
+    }
     if args.config:
         mssa_cfg = parse_mssa_config(args.config)
         # v3.0: MSSA 键名 → 训练配置键名映射 (全部 10 个超参)
@@ -247,7 +254,9 @@ def main():
             torch.save(predictor.state_dict(), lstm_path)
             print(f"LSTM checkpoint 已保存: {lstm_path}")
         except Exception as e:
+            import traceback
             sys.stderr.write(f"[FATAL] LSTM training failed: {e}\n")
+            traceback.print_exc(file=sys.stderr)
             sys.exit(1)
     else:
         from lstm_model import OraclePredictor
@@ -293,9 +302,6 @@ def main():
 
     print(f"\n{'=' * 56}")
     print(f"  训练完成。checkpoint: {args.checkpoint_path}")
-    # v3.1: 调度时段统计
-    if dispatch_stats._total_steps > 0:
-        print(f"  {dispatch_stats.summary()}")
     print(f"{'=' * 56}")
 
     # v3.0: stdout MAPE 输出 (供 MSSA 解析)
@@ -405,7 +411,7 @@ def _train_sb3(env, eval_env, args):
 
     model = algo_cls(
         "MlpPolicy", vec_env,
-        learning_rate=3e-4,
+        learning_rate=3e-4,       # v2.18 调优: 原始默认, unified数据量充足
         n_steps=2048,
         batch_size=64,
         n_epochs=10,
@@ -429,6 +435,8 @@ def _train_sb3(env, eval_env, args):
         checkpoint_path = os.path.join(args.checkpoint_path, "final_model")
         model.save(checkpoint_path)
         print(f"最终模型已保存: {checkpoint_path}.zip")
+        if dispatch_stats._total_steps > 0:
+            print(f"  {dispatch_stats.summary()}")
     except KeyboardInterrupt:
         checkpoint_path = os.path.join(args.checkpoint_path, "interrupted_model")
         model.save(checkpoint_path)
