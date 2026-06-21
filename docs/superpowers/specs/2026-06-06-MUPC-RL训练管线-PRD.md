@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v3.0 | 2026-06-21 | 架构师 | **[REVIEWED: PASS]** |
 | v2.18 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
 | v2.17 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
 | v2.16 | 2026-06-15 | 需求分析师 | **[REVIEWED: PASS]** |
@@ -16,9 +17,11 @@
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v2.15 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v3.0 (`[REVIEWED: PASS]`)
 
 ---
+
+> **v3.0 变更说明 (预测增强分层混合架构):** LSTM 时序预测模型系统性升级, 对齐下游 v3.0 预测增强分层混合架构。核心变更: (1) 新增 AdditiveAttention (Bahdanau) 注意力机制嵌入 ONNX 计算图 (全 ONNX 标准算子: Gemm+Tanh+Softmax+Mul+ReduceSum); (2) LSTM 输出维度从 (B, 47) 单头点预测升级为 (B, 2, 15, 3) 六头分位数预测 (PV/Load × 15步 × P10/P50/P90); (3) ONNX 导出新增 metadata_props 10 键 (mupc_model_type/with_attention/with_vmd/mic_topk/output_horizon/input_window/hidden_size/num_layers/direction/version); (4) train.py 新增 --config JSON 参数 (MSSA 超参搜索接口) + stdout 结构化 MAPE 输出 (PV_MAPE= LOAD_MAPE=); (5) 新增 MIC 特征筛选 JSON 数据交换接口; (6) 新增 compute_data_fingerprint() 训练数据指纹; (7) LSTMForecast 双模式 (legacy 47维 向后兼容 / p10p50p90 90维 新分位数)。**向后兼容**: 所有新功能通过 feature flag 控制 (with_attention, output_mode, --config), 不传新参数等价于 v2.18 行为。**关联文档**: `docs/superpowers/notes/上游训练管线-MUPC-AI2-改造要求.md` [REVIEWED: PASS], `docs/superpowers/specs/2026-06-21-MUPC-RL训练管线-v3.0-设计文档.md` [DESIGN_APPROVED]。
 
 > **v2.17 变更说明（观测空间 78 维扩展 + SB3 升级为主路径）：** v2.15 动作空间已精简为 2 维同质 tanh（`[p_ref, k_droop]`），SB3 `MlpPolicy` 完全支持。`train.py` 不再硬编码 `_train_numpy_ppo()`，新增 `--algo-backend {auto|sb3|numpy}` 参数（默认 `auto`）：SB3 + Gymnasium + Torch 三件套齐全时优先 SB3 PPO/SAC，任一缺失时自动降级到 `_ppo_core.py`（纯 NumPy PPO）。`_resolve_backend()` 辅助函数集中后端选择逻辑。`_ppo_core.py` 默认 `act_dim` 由 5 改为 2 与 v2.15 一致。训练后端选择日志显式打印（"训练后端: stable-baselines3 (主路径)" 或 "NumPy PPO (后备路径)"）。训练管线后端策略与部署端 ONNX 模型完全对齐。**v2.17 新增 (2026-06-17):** 观测空间从 63/64 维扩展至 78/79 维，对齐下游 v2.14 FusedSystemState (D1~D10 全部纳入, to_input_vector() 78 维)。D3 新增 peak_price/valley_price (仅 EnvState, 不入向量)，D6 新增 dispatch_q_set (仅 EnvState, 不入向量)，D10 新增 17 维概率负荷预测。mupc_env/ 模块化拆分。ActionValidator ACT-07→ACT-05 编号统一。
 
@@ -332,31 +335,39 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 
 #### 功能描述
 
-`lstm_model.py` 训练 LSTM 模型用于光伏/负荷的 15 分钟超前预测。预测输出作为 RL 环境状态空间 D2 的输入。
+`lstm_model.py` 训练 LSTM 模型用于光伏/负荷的 15 分钟超前预测。v3.0 新增 AdditiveAttention 注意力机制 + 分位数三通道输出。
 
-**模型规格**：
+**模型规格 (v3.0)**：
 
 | 项目 | 规格 |
 |------|------|
-| 输入窗口 | 过去 120 分钟 (8 步 × 15分钟, v2.14 4→8) |
-| 输出窗口 | 未来 15 分钟 (1 步 × 15分钟)（默认，可配置至 30 分钟） |
-| 输入特征 | [pv_power, load_power, solar_irradiance, temperature, hour_sin, hour_cos, yesterday_pv] (7 维, v2.14 新增周期性特征) |
-| 输出 | [pv_forecast_1..15, load_forecast_1..15, quantiles_1..15, shock_prob, base_load] (47 维 = 15+15+15+1+1, v2.18: 30→47) |
-| 模型架构 | 2 层 LSTM (hidden=64) + 5 个 Linear 头 (pv/load/d10_quantiles/d10_shock/d10_base) |
-| 精度要求 | 光伏 MAPE ≤ 10%，负荷 MAPE ≤ 15% |
-| 训练数据 | SMART-DS 光伏 + 负荷数据，按时间 8:2 切分 |
+| 输入窗口 | 8 步 (legacy) / 12/24/36 步 (v3.0, MSSA 确定) |
+| 输出窗口 | 15 步 × 15 分钟 = 225 分钟 |
+| 输入特征 | K 维 (MIC 筛选, legacy=7) |
+| 核心架构 | 2 层 LSTM + AdditiveAttention (v3.0) |
+| 输出模式 | legacy: (B, 47) 单头; p10p50p90: (B, 2, 15, 3) 六头分位数 |
+| 精度要求 | 光伏 MAPE ≤ 10%, 负荷 MAPE ≤ 15% |
 
-**输出序列化**：LSTM 输出 15 个时间步的预测值。当部署端配置为 30 分钟时，超出部分补零填充。
+**v3.0 增强项**：
+
+| 增强 | 描述 |
+|------|------|
+| AdditiveAttention | Bahdanau 注意力, ONNX 全标准算子, 自动关注辐照突变/负荷峰谷 |
+| 分位数输出 | (B, 2, 15, 3): PV/Load × 15步 × (P10, P50, P90) |
+| ONNX metadata_props | 10 键 (model_type/with_attention/mic_topk/input_window 等) |
+| MSSA 接口 | --config JSON + stdout PV_MAPE= LOAD_MAPE= |
+| 向后兼容 | legacy 模式无变更, feature flag 控制 |
 
 #### 验收标准
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F3-01 | LSTM 模型训练完成，loss 收敛 | 检查训练 loss 曲线 |
-| F3-02 | 光伏预测 MAPE ≤ 10%（测试集） | 回测计算 |
-| F3-03 | 负荷预测 MAPE ≤ 15%（测试集） | 回测计算 |
-| F3-04 | 预测输出形状 (1, 47) = 15 pv + 15 load + 15 quantiles + 1 shock_prob + 1 base_load (v2.18) | 单元测试 |
-| F3-05 | ONNX 导出 + checker 验证通过 | `python export_onnx.py --lstm` |
+| F3-02 | 光伏 MAPE ≤ 10%（测试集） | 回测计算 |
+| F3-03 | 负荷 MAPE ≤ 15%（测试集） | 回测计算 |
+| F3-04 | legacy 输出 (1, 47), p10p50p90 输出 (1, 2, 15, 3) | 单元测试 |
+| F3-05 | ONNX 导出含 Attention 计算图 + metadata_props 10 键 | `python export_onnx.py --lstm --with-attention` |
+| F3-06 | (v3.0) --config JSON 训练 + stdout MAPE 格式正确 | `python train.py --config test.json` |
 
 ---
 
