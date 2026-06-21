@@ -433,7 +433,8 @@ class LSTMTrainer:
         temp = data["temperature"]
         hours = data.get("hours", np.arange(len(pv), dtype=np.float32) * 15 / 60 % 24)
 
-        seq_len = self.config["input_seq_len"]
+        # v3.0: MSSA 搜索的 input_window 优先, legacy input_seq_len 作为 fallback
+        seq_len = self.config.get("input_window") or self.config["input_seq_len"]
         forecast = self.config["forecast_steps"]
         n = len(pv)
         max_samples = n - seq_len - forecast

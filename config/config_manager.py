@@ -56,7 +56,7 @@ class TimeConfig:
 
 @dataclass
 class ContractConfig:
-    contract_demand_kw: float = 300.0
+    contract_demand_kw: float = 200.0  # v3.0 对齐下游 data_fusion.rs
     grid_emission_factor: float = 0.581
 
 

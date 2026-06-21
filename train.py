@@ -135,11 +135,18 @@ def parse_mssa_config(config_path: str) -> dict:
             sys.exit(1)
     return cfg
 
-def load_mic_features(json_path: str) -> list[str]:
-    """读取 MIC 分析结果, 返回 selected 特征名列表."""
+def load_mic_features(json_path: str) -> tuple[list[str], int]:
+    """读取 MIC 分析结果, 返回 (selected 特征名列表, top_k).
+
+    若实际选中数 != top_k, 输出 WARN.
+    """
     with open(json_path) as f:
         mic = json.load(f)
-    return [feat["name"] for feat in mic["features"] if feat["selected"]]
+    selected = [feat["name"] for feat in mic["features"] if feat["selected"]]
+    top_k = mic["top_k"]
+    if len(selected) != top_k:
+        sys.stderr.write(f"[WARN] MIC selected {len(selected)} features != top_k {top_k}\n")
+    return selected, top_k
 
 def load_mssa_result(json_path: str) -> dict:
     """读取 MSSA 搜索结果, 返回最优超参字典."""
@@ -190,15 +197,26 @@ def main():
     lstm_cfg = {"epochs": 50, "batch_size": 64}
     if args.config:
         mssa_cfg = parse_mssa_config(args.config)
-        # v3.0: MSSA 键名 → 训练配置键名映射
-        KEY_MAP = {"hidden_size": "hidden_dim", "lr": "learning_rate"}
+        # v3.0: MSSA 键名 → 训练配置键名映射 (全部 10 个超参)
+        KEY_MAP = {
+            "hidden_size": "hidden_dim",
+            "lr": "learning_rate",
+            "attn_score": "attn_score",
+            "vmd_k": "vmd_k",
+            "vmd_alpha": "vmd_alpha",
+            "optimizer": "optimizer",
+        }
+        KNOWN_KEYS = {"hidden_dim", "num_layers", "learning_rate", "batch_size",
+                       "dropout", "input_window", "output_mode", "with_attention",
+                       "attn_score", "vmd_k", "vmd_alpha", "optimizer"}
         mapped = {}
         for k, v in mssa_cfg.items():
+            if k not in KEY_MAP and k not in KNOWN_KEYS:
+                sys.stderr.write(f"[WARN] MSSA key '{k}' not recognized, skipping\n")
+                continue
             target_k = KEY_MAP.get(k, k)
             mapped[target_k] = v
-        lstm_cfg.update({k: v for k, v in mapped.items()
-                         if k in ["hidden_dim", "num_layers", "learning_rate", "batch_size",
-                                  "input_window", "output_mode", "with_attention"]})
+        lstm_cfg.update({k: v for k, v in mapped.items() if k in KNOWN_KEYS})
 
     # ── LSTM / Oracle ────────────────────────────────────
     predictor = None
