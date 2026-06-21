@@ -1,11 +1,13 @@
-# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v2.16）
+# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v3.0）
 
-> **版本：** v2.16 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-18
+> **版本：** v3.0 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-21
 
 ### 变更记录
 
 | 版本 | 日期 | 作者 | 变更说明 | 评审状态 |
 |------|------|------|----------|----------|
+| v3.0 | 2026-06-21 | 需求分析师 | 预测增强分层混合架构：VMD 信号分解 + Attention 注意力机制 + BiLSTM 增强 + 误差修正 BiLSTM + MSSA 超参优化，五层混合架构提升光伏/负荷预测精度 | [REVIEWED: PASS] |
+| v2.17 | 2026-06-18 | 需求分析师 | 安全 RL 包装器：物理模型事前预测拒绝、线路阻抗配置化、RobustnessManager 协同、Web API 状态端点、Web UI 监控面板 | [REVIEWED: PASS] |
 | v2.16 | 2026-06-18 | 需求分析师 | LSTM 模型优化：步长统一为 15 分钟、15 步分位数预测、D10 数据流通、删除 confidence 字段、消除冗余推理 | [REVIEWED: PASS] |
 | v2.15 | 2026-06-17 | 需求分析师 | 动作空间精简：5维→2维（移除load_shedding/pv_limit/confidence），下沉至策略引擎 | [REVIEWED: PASS] |
 | v2.14 | 2026-06-15 | - | SafetyOverride 奖励函数重构、FusedSystemState 78维统一 | [REVIEWED: PASS] |
@@ -393,6 +395,727 @@ if output.len() < output_size {
 | #1 真分位数回归 | 📋 训练管线侧工作 | 需 MUPC-AI2 用 Quantile Loss 重训 LSTM，Rust 侧仅标记实验性 |
 | #5 协变量阈值参数化 | ❌ 推迟 | 单台区部署，硬编码可接受 |
 | #6 冲击概率正态假设 | ❌ 推迟 | 需历史冲击负荷统计，当前数据基础不足 |
+
+---
+
+### 3.7 v2.17 安全 RL 包装器（Safety RL Wrapper）
+
+> **来源**：`docs/TODO/安全RL包装器.md`
+
+#### 3.7.1 背景与动机
+
+| 现存问题 | 说明 |
+|----------|------|
+| ActionValidator 仅做静态数值校验（值域、变化率、调度约束）| 无法预测动作施加后电网的短时动态响应 |
+| RobustnessManager（v2.9）属被动防御 | 仅在异常已发生（电压<0.9p.u.）时才介入，存在滞后窗口 |
+| 合法的 `p_ref` 在特定工况下可能引发低电压 | 例如 -30kW 在低电压工况下可致电压从 0.98 骤降至 0.92 |
+
+**设计目标**：在 RL 决策后、ActionValidator 前插入**物理模型前置过滤器**，基于戴维南等效电路预测电压变化，提前拒绝高风险动作。
+
+#### 3.7.2 核心变更
+
+##### 变更 1：SafetyRLWrapper 模块（核心）
+
+**位置**：`crates/ai-engine/src/safety_wrapper.rs`（新增）
+
+**核心结构**：
+
+```rust
+/// 安全包装器
+pub struct SafetyRLWrapper {
+    line_impedance: RwLock<LineImpedance>,
+    last_safe_action: RwLock<ActionOutput>,
+    predictor: Box<dyn SafetyPredictor + Send + Sync>,
+    bounds: SafetyBounds,
+}
+
+/// 物理模型预测器 trait（支持替换为不同精度模型）
+#[async_trait]
+pub trait SafetyPredictor: Send + Sync {
+    async fn predict(&self, state: &FusedSystemState, action: &ActionOutput)
+        -> Result<PredictionResult, AiEngineError>;
+}
+
+/// 预测结果
+pub struct PredictionResult {
+    pub v_predicted: f64,
+    pub dv_dt: f64,
+    pub soc_after: f64,
+    pub is_safe: bool,
+    pub reason: Option<String>,
+}
+
+/// 安全边界
+pub struct SafetyBounds {
+    pub v_min: f64,         // 0.93
+    pub v_max: f64,         // 1.07
+    pub dv_dt_max: f64,     // 0.03
+    pub soc_margin: f64,    // 0.02
+}
+```
+
+**物理模型（戴维南等效 + 灵敏度分析）**：
+
+```
+ΔV ≈ (R·ΔP + X·ΔQ) / V₀
+P_output_new = p_ref_new + k_droop_new × (V_avg - 1.0)
+```
+
+**安全检查入口**：
+
+```rust
+impl SafetyRLWrapper {
+    pub async fn check_and_fallback(
+        &self,
+        state: &FusedSystemState,
+        proposed_action: &ActionOutput,
+    ) -> (ActionOutput, CheckResult) {
+        // 1. 物理模型预测（失败则回退到 last_safe_action）
+        // 2. 安全边界检查（任一不满足则拒绝）
+        // 3. 通过则更新 last_safe_action
+    }
+}
+
+pub enum CheckResult {
+    Passed,
+    Rejected { reason: String },
+    FallbackDueToPredictionError,
+}
+```
+
+##### 变更 2：ModelManager 集成（SAFETY-01）
+
+**集成位置**：`model_manager.full_decision_cycle` 第 6 步（RL 决策）后、ActionValidator 前
+
+```
+RLModel.decide()
+   ↓
+SafetyRLWrapper.check_and_fallback()  ← 新增
+   ↓
+ActionValidator.validate_dual()
+   ↓
+strategy-engine
+```
+
+**与 RobustnessManager 协同**（Q-W3=A）：
+- SafetyRLWrapper **事前**预测拒绝（决策前）
+- RobustnessManager **事中**应急响应（异常已发生时）
+- 两者串联：先 SafetyRLWrapper，再 RobustnessManager，最后 ActionValidator
+
+##### 变更 3：线路阻抗配置化（Q-W2=B）
+
+**新增配置字段**（`mupc/config/ai.toml`）：
+
+```toml
+[safety_wrapper]
+# 线路阻抗参数（从台区档案读取）
+line_impedance_r_ohm = 0.1      # 线路电阻 R（Ω）
+line_impedance_x_ohm = 0.05     # 线路电抗 X（Ω）
+v_base = 220.0                  # 基准电压（V）
+
+# 安全边界
+v_min = 0.93                    # 电压下限（p.u.）
+v_max = 1.07                    # 电压上限（p.u.）
+dv_dt_max = 0.03                # 电压变化率上限（p.u./s）
+soc_margin = 0.02               # SOC 安全裕度（比临界多 2%）
+
+# 性能参数
+max_check_latency_ms = 5        # 单次检查最大延迟
+```
+
+**验收**：单台区档案正确加载，跨台区部署通过修改 ai.toml 适配。
+
+##### 变更 4：检查结果推送（Q-W4=C 触发 Web UI 告警，事件驱动架构）
+
+**事件流架构**（避免 HTTP 轮询开销）：
+
+```
+AI 引擎 SafetyRLWrapper
+   ↓ publish (tokio::sync::broadcast::Sender)
+全局 broadcast::Receiver
+   ↓ forward
+Web API SsePushService
+   ↓ SSE push
+Web UI EventSource（自动接收）
+```
+
+**关键设计决策**（v2.17 修订）：
+- AI 引擎使用 `tokio::sync::broadcast::Sender`（轻量级，无外部依赖）
+- Web API 持有 `broadcast::Receiver`，将事件转为 SSE 推送给 Web UI
+- 依赖注入在 `main.rs` 中组装（AppState）
+- **AI 引擎零 HTTP 依赖，Web UI 零轮询开销**
+
+**事件类型**（`SseEventType::SafetyWrapperUpdate`）：
+
+```rust
+// 扩展 crates/web-api/src/sse/mod.rs 的 SseEventType 枚举
+pub enum SseEventType {
+    // ... 既有类型 ...
+    SafetyWrapperUpdate {
+        check_result: CheckResult,  // Passed / Rejected / Fallback
+        reason: String,
+        v_predicted: f64,
+        latency_us: u64,
+    },
+}
+```
+
+**消息格式**（SSE payload）：
+
+```json
+{
+  "event_id": "uuid",
+  "event_type": "SafetyWrapperUpdate",
+  "timestamp": 1718697000,
+  "payload": {
+    "check_result": "Rejected",
+    "reason": "v_predicted=0.92 < v_min=0.93",
+    "proposed_p_ref": 30.0,
+    "proposed_k_droop": 15.0,
+    "fallback_p_ref": -10.0,
+    "fallback_k_droop": 8.0,
+    "v_predicted": 0.92,
+    "latency_us": 1200
+  }
+}
+```
+
+**违规日志持久化**（独立通道，仅用于审计）：
+- 单独调用 `storage::record_safety_violation()` 持久化
+- Web UI 不依赖此表（仅运维查询用）
+
+**说明**：本设计复用项目现有 `tokio::sync::broadcast` 机制（`web-api/src/sse/mod.rs` 已使用），新增 `SafetyWrapperUpdate` 事件类型即可，无需新增 `message_bus` 模块或第三方依赖。
+
+##### 变更 5：Web API 状态端点
+
+**新增端点**（`crates/web-api/src/routes/ai/safety_wrapper.rs`）：
+
+| 方法 | 路径 | 说明 | 权限 |
+|------|------|------|------|
+| GET | `/api/v1/safety_wrapper/status` | 当前状态（边界条件、line_impedance、累计指标）| Operator+ |
+| GET | `/api/v1/safety_wrapper/recent_violations` | 最近 100 条违规记录 | Operator+ |
+| GET | `/api/v1/safety_wrapper/stats` | 统计（拒绝率、平均延迟等）| Operator+ |
+
+##### 变更 6：Web UI 监控面板
+
+**位置**：`crates/web-api/src/static/ai-monitor.html`（新增）
+
+**面板组件**：
+
+| 组件 | 数据来源 | 刷新频率 |
+|------|----------|----------|
+| 当前安全状态卡片 | `GET /status` | 5s |
+| 拒绝率趋势图（24h）| `GET /stats` | 30s |
+| 最近违规列表（最近 10 条）| `GET /recent_violations` | 10s |
+| 安全边界配置展示 | `GET /status` | 30s |
+| 实时电压预测曲线 | `GET /status` + 历史数据 | 5s |
+
+#### 3.7.3 接口定义
+
+```rust
+/// 单条违规记录（持久化到 storage）
+pub struct SafetyViolation {
+    pub timestamp: i64,
+    pub reason: String,
+    pub proposed_p_ref: f64,
+    pub proposed_k_droop: f64,
+    pub fallback_p_ref: f64,
+    pub fallback_k_droop: f64,
+    pub v_predicted: f64,
+    pub latency_us: u64,
+}
+
+/// 累计指标
+pub struct SafetyStats {
+    pub total_checks: u64,
+    pub total_rejected: u64,
+    pub total_fallback: u64,
+    pub rejection_rate: f64,    // 拒绝率（最近 1h）
+    pub avg_latency_us: u64,    // 平均检查延迟
+    pub max_latency_us: u64,    // 最大检查延迟
+}
+```
+
+#### 3.7.4 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| SAFETY-01 | SafetyRLWrapper 在 RL 决策后、ActionValidator 前拦截 | 集成测试 |
+| SAFETY-02 | 单次检查延迟 < 5ms | 性能测试（P99 < 5ms）|
+| SAFETY-03 | v_predicted 计算正确（戴维南等效 + 灵敏度公式）| 单元测试 |
+| SAFETY-04 | 安全边界检查覆盖 5 类（电压下限/上限/变化率/SOC/功率方向）| 单元测试 |
+| SAFETY-05 | 检查失败时回退到 last_safe_action | 单元测试 |
+| SAFETY-06 | 检查通过时更新 last_safe_action | 单元测试 |
+| SAFETY-07 | 物理模型预测失败时回退到 FallbackDueToPredictionError | 单元测试（模拟 panic）|
+| SAFETY-08 | 线路阻抗从配置文件读取，跨台区可配 | 配置测试 |
+| SAFETY-09 | 与 RobustnessManager 协同（事前 vs 事中边界明确）| 集成测试 |
+| SAFETY-10 | 与 ActionValidator 协同（顺序：SafetyWrapper → RobustnessManager → ActionValidator）| 集成测试 |
+| SAFETY-11 | 违规日志通过 tracing 记录 + storage 持久化（无消息总线依赖）| 集成测试 |
+| SAFETY-12 | Web API `GET /api/v1/safety_wrapper/status` 返回当前状态 | API 测试 |
+| SAFETY-13 | Web API `GET /api/v1/safety_wrapper/recent_violations` 返回最近 100 条 | API 测试 |
+| SAFETY-14 | Web API `GET /api/v1/safety_wrapper/stats` 返回统计指标 | API 测试 |
+| SAFETY-15 | Web UI 监控面板可访问且实时刷新 | UI 集成测试 |
+| SAFETY-16 | 拒绝率超过阈值（默认 20%）时触发 Web UI 告警 | 集成测试 |
+| SAFETY-17 | 端到端延迟增加 < 5ms（< 120ms 总预算的 5%）| 性能测试 |
+
+#### 3.7.5 兼容性说明
+
+| 项 | 影响 | 处理 |
+|----|------|------|
+| 新增 SafetyRLWrapper 模块 | 不破坏现有数据流 | 与 ModelManager 集成点明确 |
+| RobustnessManager 已有 | 边界明确即可 | 两者串联，顺序明确 |
+| ActionValidator 已有 | 仅静态校验 | 在 SafetyRLWrapper 后执行 |
+| Web API 新增 3 个端点 | 不影响现有路由 | 路径命名空间 `ai/safety_wrapper/*` |
+| Web UI 新增面板 | 不影响现有 UI | 独立页面 `ai-monitor.html` |
+| 配置文件新增 `[safety_wrapper]` 段 | 默认值兜底 | 缺失时使用代码内默认值 |
+
+#### 3.7.6 非目标（v2.17 不做）
+
+| 项 | 状态 | 理由 |
+|----|------|------|
+| 自适应边界（基于历史数据自动调整 v_min/v_max）| 📋 推迟 | 需积累运行数据 |
+| 多台区协同安全检查 | 📋 推迟 | 单台区部署，无需跨台区协调 |
+| 复杂小信号模型（替换线性灵敏度）| 📋 推迟 | 5ms 性能预算下不适用 |
+| 拒绝率历史趋势机器学习预测 | 📋 推迟 | 增加复杂度，收益有限 |
+
+#### 3.7.7 改动文件清单
+
+| 模块 | 文件 | 类型 |
+|------|------|------|
+| AI 引擎 | `crates/ai-engine/src/safety_wrapper.rs` | 新增 |
+| AI 引擎 | `crates/ai-engine/src/lib.rs` | 导出新模块 |
+| AI 引擎 | `crates/ai-engine/src/model_manager.rs` | 修改（集成点） |
+| AI 引擎 | `crates/ai-engine/src/config.rs` | 修改（SafetyBounds 配置结构） |
+| 配置 | `mupc/config/ai.toml` | 修改（[safety_wrapper] 段） |
+| Web API | `crates/web-api/src/routes/ai/safety_wrapper.rs` | 新增 |
+| Web API | `crates/web-api/src/lib.rs` | 注册路由 |
+| Web UI | `crates/web-api/src/static/ai-monitor.html` | 新增（监控面板）|
+| 文档 | 本 PRD（§3.7）| 修改 |
+| 文档 | 设计文档 §6.x | 后续追加 |
+
+---
+
+### 3.8 v3.0 预测增强分层混合架构
+
+> **来源**：`docs/superpowers/specs/2026-06-21-预测增强分层混合架构-PRD.md` v1.1
+> **原始评审状态**：[REVIEWED: PASS]（v1.1 已通过，2026-06-21 评审修复 6 项）
+> **论文吸收来源**：`docs/TODO/论文吸收-预测增强.md`（4 篇学术论文分层吸收方案）
+> **合并日期**：2026-06-21
+
+#### 3.8.1 产品概述
+
+##### 3.8.1.1 产品定位
+
+预测增强分层混合架构是 MUPC AI 优化引擎（ai-engine crate）LSTM 时序预测管线的增强方案。该方案吸收 4 篇学术论文中经过验证的预测方法，以分层叠加方式提升光伏出力与台区负荷的预测精度，为强化学习决策模型提供更高质量的前瞻性输入。
+
+该增强是现有 LSTM 预测管线（本 PRD 第 3 章）的上游升级，对下游 RL 决策模型、策略引擎、数据融合引擎透明。
+
+##### 3.8.1.2 核心价值
+
+| 价值 | 说明 | 量化目标 |
+|------|------|----------|
+| 预测精度提升 | 通过信号分解与注意力机制降低预测误差 | 光伏 MAPE 从 <= 10% 降至 <= 8.5%，负荷 MAPE 从 <= 15% 降至 <= 13%（第一轮目标，权威目标见 §10.2） |
+| 预测稳定性增强 | VMD 分离多尺度模态，降低噪声干扰 | 预测误差标准差降低 >= 15% |
+| 关键时段感知 | Attention 机制自动关注辐照度突变、负荷峰谷等关键时段 | 峰谷时段预测误差降低 >= 10% |
+| 训练自动化 | MSSA 超参自动搜索，减少人工调参 | 超参搜索自动化，自动搜索产出最优超参，MAPE 不劣于人工调参 |
+| 误差自修正 | 残差 BiLSTM 二次修正系统性偏差 | 系统性偏差消除 >= 60%（Bias 指标） |
+
+##### 3.8.1.3 分层架构总览
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                 预测增强分层混合架构（五层）                        │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  原始特征 ──→ [第1层] MIC 特征筛选 ──→ [第2层] VMD 信号分解       │
+│                                               │                   │
+│  分解子模态 ──→ [第3层] LSTM + Attention ──→ 预测值1              │
+│                                               │                   │
+│  预测残差 ──→ [第4层] BiLSTM 误差修正 ──→ 修正后的预测值2          │
+│                                               │                   │
+│  训练阶段 ──→ [第5层] MSSA 超参自动搜索 ──→ 最优超参配置           │
+│                                                                   │
+│  [第0层] 输出层：保持 MUPC 现有 15 步分位数预测（P10/P50/P90）不变   │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+各层独立可叠加：第 1 层（离线特征筛选）和第 2 层（CPU 预处理）对推理延迟零影响；第 3-4 层在 NPU 上执行；第 5 层仅影响训练阶段。
+
+#### 3.8.2 用户角色与透明性约束
+
+| 角色 | 描述 | 与本增强的交互 |
+|------|------|----------------|
+| **AI 运维人员** | 负责 AI 模型训练、部署、监控 | 执行离线 MIC 分析、配置 VMD 模态数 K、触发 MSSA 超参搜索、对比新旧模型预测精度 |
+| **策略引擎（系统角色）** | 消费 LSTM 预测数据用于安全校验与兜底策略 | 通过 FusedSystemState D2/D10 读取增强后的预测值，接口不变 |
+| **数据融合引擎（系统角色）** | 采集并融合多维数据供 LSTM 推理 | 输入特征经 MIC 筛选后可能增/减维，需同步 mupc-ai-engine 中的 LstmInput 构造与 FusedSystemState 序列化逻辑（data_fusion.rs、lstm_model.rs），mupc-common 不涉及 |
+| **强化学习决策模型（系统角色）** | 基于预测值做出控制决策 | 通过 FusedSystemState D2 消费增强后的预测值，接口不变 |
+
+##### 3.8.2.1 向下游系统角色的透明性约束
+
+| 约束 | 说明 |
+|------|------|
+| FusedSystemState D2/D10 字段不变 | pv_forecast_15min、load_forecast_15min、load_forecast_quantiles 等字段定义、维度、取值范围不变 |
+| LstmOutput 结构不变 | 增强后仍返回相同结构，下游无需修改 |
+| 推理接口签名不变 | `predict()` 和 `predict_quantiles()` 的函数签名保持兼容 |
+| NPU 推理延迟上限不变 | 增强后推理延迟仍须满足 < 1s 约束 |
+
+#### 3.8.3 F1: 特征工程增强（MIC 最大信息系数筛选）
+
+##### 3.8.3.1 用户故事
+
+> 作为 **AI 运维人员**，
+> 我希望系统能自动量化各气象/时序特征与预测目标（光伏出力、负荷功率）之间的非线性相关性，
+> 以便筛选出对预测最有价值的 Top-K 特征，剔除冗余或噪声特征，提升模型训练效率和泛化能力。
+
+##### 3.8.3.2 功能描述
+
+在离线训练阶段，使用 MIC（Maximal Information Coefficient，最大信息系数）对候选输入特征进行相关性排序，筛选 Top-K 个特征作为 LSTM 模型的输入。MIC 能够捕获线性和非线性关系，适用性优于皮尔逊相关系数。
+
+**候选特征池（当前 7 维 + 扩展候选）：**
+
+| 特征 | 当前状态 | 说明 |
+|------|----------|------|
+| pv_power | 已使用 | 光伏出力历史序列 |
+| load_power | 已使用 | 负荷功率历史序列 |
+| ghi | 已使用 | 太阳辐照度 |
+| temp | 已使用 | 环境温度 |
+| hour_sin | 已使用 | 小时正弦编码 |
+| hour_cos | 已使用 | 小时余弦编码 |
+| yesterday_pv | 已使用 | 昨日同一时刻光伏值 |
+| humidity | 候选扩展 | 湿度（来自 LSTM 优化建议 #1） |
+| wind_speed | 候选扩展 | 风速（来自 LSTM 优化建议 #1） |
+| day_of_week_sin/cos | 候选扩展 | 星期正弦/余弦编码 |
+| is_holiday | 候选扩展 | 节假日标志 |
+| month_sin/cos | 候选扩展 | 月份正弦/余弦编码 |
+| pv_3day_avg | 候选扩展 | 过去 3 天同一时刻光伏均值 |
+| load_3day_avg | 候选扩展 | 过去 3 天同一时刻负荷均值 |
+
+##### 3.8.3.3 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| MIC-01 | MIC 分析工具接受历史数据 CSV（>= 90 天），输出每个特征与目标的 MIC 值（0~1） | 离线脚本测试 |
+| MIC-02 | 特征按 MIC 值降序排列，筛选 Top-K（K 可配置，默认 K=7）作为模型输入特征 | 离线脚本测试 |
+| MIC-03 | MIC 筛选后模型在测试集上 MAPE 不劣于使用全部特征的基线（MAPE 增加 <= 1%） | 离线回测对比 |
+| MIC-04 | MIC 分析结果以 JSON 格式持久化，包含特征名、MIC 值、排名、筛选状态 | 文件格式验证 |
+| MIC-05 | MIC 筛选结果可被训练管线直接读取，无需人工转录 | 端到端集成测试 |
+| MIC-06 | 若扩展候选特征数据源不可用（如 humidity/wind_speed 缺失），MIC 分析自动跳过该特征 | 离线脚本测试 |
+
+##### 3.8.3.4 不做的事
+
+- MIC 分析不在线执行，不进入 RK3588 部署代码路径
+- MIC 不替代 KPCA（核主成分分析）——两者目标正交：MIC 做特征选择，KPCA 做特征降维，KPCA 作为备选方案保留在论文吸收方案中但不在本轮实施
+
+##### 3.8.3.5 MIC 输入 CSV 数据格式
+
+MIC 离线分析脚本接受以下格式的 CSV 文件作为输入：
+
+**列结构：**
+
+| 列序 | 列名 | 类型 | 说明 |
+|------|------|------|------|
+| 1 | `timestamp` | `datetime`（ISO 8601） | 数据时间戳，格式 `YYYY-MM-DDTHH:MM:SS`（无时区偏移，本地时间） |
+| 2 | `pv_power` | `float64` | 光伏有功出力 (kW) |
+| 3 | `load_power` | `float64` | 台区负荷功率 (kW) |
+| 4 | `ghi` | `float64` | 水平面总辐照度 (W/m2) |
+| 5 | `temp` | `float64` | 环境温度 (deg C) |
+| 6 | `hour_sin` | `float64` | 小时正弦编码 sin(2 * pi * hour / 24) |
+| 7 | `hour_cos` | `float64` | 小时余弦编码 cos(2 * pi * hour / 24) |
+| 8 | `yesterday_pv` | `float64` | 昨日同一时刻光伏出力 (kW) |
+| 9 | `humidity` | `float64`（可选） | 相对湿度 (%) |
+| 10 | `wind_speed` | `float64`（可选） | 风速 (m/s) |
+| 11 | `day_of_week_sin` | `float64`（可选） | 星期正弦编码 sin(2 * pi * dow / 7) |
+| 12 | `day_of_week_cos` | `float64`（可选） | 星期余弦编码 cos(2 * pi * dow / 7) |
+| 13 | `is_holiday` | `int`（可选） | 节假日标志 (0/1) |
+| 14 | `month_sin` | `float64`（可选） | 月份正弦编码 sin(2 * pi * month / 12) |
+| 15 | `month_cos` | `float64`（可选） | 月份余弦编码 cos(2 * pi * month / 12) |
+| 16 | `pv_3day_avg` | `float64`（可选） | 过去 3 天同一时刻光伏出力均值 (kW) |
+| 17 | `load_3day_avg` | `float64`（可选） | 过去 3 天同一时刻负荷功率均值 (kW) |
+
+**格式约定：**
+
+- **编码：** UTF-8，含 BOM 或无 BOM 均可识别
+- **分隔符：** 逗号 `,`
+- **表头：** 第一行为列名，列序如上表所示；列名大小写不敏感
+- **时间戳：** ISO 8601 格式（`YYYY-MM-DDTHH:MM:SS`），本地时间，无时区偏移。时间步长须一致（默认 15 分钟），脚本自动从相邻行推导步长并校验
+- **缺失值：** 用空字段或字符串 `NaN` 表示。MIC 分析自动跳过含缺失值的样本对
+- **最小行数：** >= 90 天 * 96 点/天 = 8640 行（15 分钟步长）。不足时 MIC 分析拒绝执行并提示
+- **数据范围校验：** 脚本对以下字段做范围校验，超出范围的值按缺失值处理：
+  - `pv_power`、`load_power`：>= 0
+  - `ghi`：[0, 1500] W/m2
+  - `temp`：[-30, 60] deg C
+  - `humidity`：[0, 100]
+  - `wind_speed`：[0, 60] m/s
+
+#### 3.8.4 F2: 信号分解预处理（VMD 变分模态分解）
+
+##### 3.8.4.1 用户故事
+
+> 作为 **AI 运维人员**，
+> 我希望在 LSTM 推理前对原始光伏/负荷时间序列进行 VMD 分解，
+> 将复杂的非平稳信号分解为若干相对平稳的子模态（IMF），
+> 以便 LSTM 对每个子模态分别建模预测，最后重构合成，从而降低预测误差。
+
+##### 3.8.4.2 功能描述
+
+VMD（Variational Mode Decomposition）将原始时间序列 x(t) 分解为 K 个具有有限带宽的子模态 u_k(t)，每个子模态围绕一个中心频率 omega_k 聚集。
+
+**处理流程：**
+
+```
+原始序列 x(t) → VMD 分解 → [IMF_1, IMF_2, ..., IMF_K] → 各 IMF 分别输入 LSTM → 各 IMF 预测值求和重构 → 最终预测
+```
+
+**VMD 关键参数：**
+
+| 参数 | 符号 | 说明 | 可配置范围 |
+|------|------|------|------------|
+| 模态数 | K | 分解的子模态数量 | [2, 10]，默认值由不同预测对象确定 |
+| 惩罚因子 | alpha | 带宽约束强度 | [100, 5000]，默认 2000 |
+| 收敛容差 | tol | 迭代收敛判据 | [1e-7, 1e-5]，默认 1e-6 |
+| 最大迭代次数 | max_iter | 防止无限循环 | [100, 2000]，默认 500 |
+
+**预测对象与 K 值映射：**
+
+| 预测对象 | 推荐 K | 理由 |
+|----------|--------|------|
+| 光伏出力 | 4~6 | 光伏主要受辐照度日周期主导，模态结构相对简单 |
+| 台区负荷 | 5~8 | 负荷含基荷、周期性、随机波动等多尺度成分 |
+
+##### 3.8.4.3 推理阶段集成方式
+
+**训练阶段：** 对每条训练样本的输入窗口，执行 VMD 分解后送入 LSTM。K 值在训练超参中确定。
+
+**推理阶段（部署到 RK3588）：** 对当前输入窗口执行 VMD 分解（CPU 计算），各子模态分别送入 NPU 执行 LSTM 推理，然后求和重构。
+
+**关键约束：** VMD 分解在 CPU 上执行，不属于 NPU 推理管线的一部分，其计算开销独立计入端到端延迟预算。
+
+##### 3.8.4.4 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| VMD-01 | VMD 分解对输入长度为 input_window_size（默认 24 步）的光伏/负荷序列，输出 K 个子模态，每个子模态长度与输入相同 | 单元测试 |
+| VMD-02 | 所有子模态求和重构后与原信号的均方根误差（RMSE）<= 1e-4（重构保真度） | 单元测试 |
+| VMD-03 | K 值可通过配置文件指定，不同预测对象（光伏/负荷）使用独立的 K 值 | 配置测试 |
+| VMD-04 | VMD 分解单次执行时间 <= 50ms（CPU 上，输入窗口 24 步） | 性能测试 |
+| VMD-05 | VMD 分解后的预测管线 MAPE 比不使用 VMD 的基线降低 >= 5%（相对改善） | 离线回测对比 |
+| VMD-06 | VMD 分解失败时（如迭代不收敛），自动回退到不使用 VMD 的原始序列直接推理 | 单元测试（模拟 max_iter 耗尽） |
+| VMD-07 | alpha、tol、max_iter 参数可通过配置文件指定，缺失时使用默认值 | 配置测试 |
+
+##### 3.8.4.5 不做的事
+
+- VMD 不在线自适应调整 K 值（K 值由训练阶段确定后固定）
+- CEEMDAN（自适应噪声完备集合经验模态分解）作为备选方案记录在案，但本轮不实施。如后续光伏预测经 VMD 提升不及预期，可切换为 CEEMDAN
+
+#### 3.8.5 F3: 神经网络增强（Attention 注意力机制 + 可选 BiLSTM）
+
+##### 3.8.5.1 用户故事
+
+> 作为 **AI 运维人员**，
+> 我希望在 LSTM 输出层之上增加 Attention 注意力机制，
+> 使模型能够自动学习对预测结果影响最大的历史时间步（如辐照度突变点、负荷峰谷拐点），
+> 而不是对所有时间步均等对待，从而在参数量增加较小的前提下提升关键时段的预测精度。
+
+> 作为 **AI 运维人员**，
+> 我希望可选地启用 BiLSTM（双向 LSTM）替换单向 LSTM，
+> 使模型能同时捕获过去和未来的时序依赖关系，但仅在 Attention 验证有效且 NPU 推理延迟裕度允许时启用。
+
+##### 3.8.5.2 功能描述
+
+**F3-A：Attention 注意力机制（第一轮实施，必选）**
+
+在 LSTM 输出序列 H = [h_1, h_2, ..., h_T] 之上施加注意力层：
+
+1. 对每个时间步的 LSTM 隐状态 h_t 计算注意力权重 alpha_t
+2. alpha_t 通过可学习的打分函数 score(h_t, context) 和 softmax 归一化获得
+3. 上下文向量 c = sum(alpha_t * h_t)
+4. c 送入全连接层生成预测值
+
+Attention 层增加的参数量约 5-10%，对 NPU 推理延迟影响可控。
+
+**F3-B：BiLSTM 双向替换（第二轮实施，可选）**
+
+将单向 LSTM 替换为 BiLSTM：
+- 前向 LSTM：处理从 t-T 到 t 的序列
+- 后向 LSTM：处理从 t 到 t-T 的序列
+- 输出：前向和后向隐状态拼接，送入 Attention 层
+
+BiLSTM 参数量约翻倍，需验证在 RK3588 NPU 上推理延迟仍满足 < 1s。
+
+##### 3.8.5.3 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| ATT-01 | Attention 层输出维度与 LSTM 隐状态维度一致 | 单元测试 |
+| ATT-02 | 注意力权重 alpha_t 对所有 t 求和 = 1.0（softmax 归一化） | 单元测试 |
+| ATT-03 | 注意力权重向量长度 = 输入序列长度（input_window_size，默认 24） | 单元测试 |
+| ATT-04 | 增加 Attention 层后 NPU 推理延迟增加 <= 15%（相对基线） | 性能测试 |
+| ATT-05 | 增加 Attention 层后模型 INT8 量化文件大小增加 <= 15% | 模型文件验证 |
+| ATT-06 | Attention 增强模型在测试集上 MAPE 比纯 LSTM 基线降低 >= 5%（相对改善） | 离线回测对比 |
+| ATT-07 | 峰谷时段（如 6:00-8:00 早高峰、18:00-20:00 晚高峰）预测误差比纯 LSTM 基线降低 >= 10% | 离线分时段回测 |
+| ATT-08 | Attention 可视化数据（权重向量）可通过日志导出，供 AI 运维人员分析模型关注时段 | 日志格式验证 |
+| BILSTM-01 | BiLSTM 模式可通过配置文件开关启用/禁用 | 配置测试 |
+| BILSTM-02 | BiLSTM 启用时参数量 <= 2.2 倍单向 LSTM（允许全连接层等共享部分） | 模型文件验证 |
+| BILSTM-03 | BiLSTM 启用时 NPU 推理延迟仍满足 < 1s 约束 | 性能测试 |
+| BILSTM-04 | BiLSTM 默认禁用，仅在配置文件中显式开启后才生效 | 配置测试 |
+
+##### 3.8.5.4 不做的事
+
+- 不在 Attention 层使用多头自注意力（Multi-Head Self-Attention）——论文方案基于单头加性 Attention，多头会显著增加参数量和推理延迟，与 RK3588 边缘部署约束冲突
+- 不替换为 Transformer 架构——LSTM 在 24 步短序列场景下已足够，Transformer 在长序列上优势更明显，且计算开销更高
+
+#### 3.8.6 F4: 误差修正管线（BiLSTM 残差修正）
+
+##### 3.8.6.1 用户故事
+
+> 作为 **AI 运维人员**，
+> 我希望在 VMD + (Bi)LSTM + Attention 主预测管线之后，增加一个独立的 BiLSTM 误差修正环节，
+> 专门学习主预测残差的时序模式，对主预测结果进行二次修正，以消除系统性预测偏差。
+
+##### 3.8.6.2 功能描述
+
+**两阶段预测架构：**
+
+```
+阶段1（主预测）:
+  原始序列 → VMD 分解 → LSTM/Attention → 初步预测值 y_pred_1
+
+阶段2（误差修正）:
+  训练阶段：残差 e = y_true - y_pred_1 → 训练 BiLSTM 学习残差时序模式
+  推理阶段：BiLSTM 输入最近 T 步的已知残差 → 预测未来残差 e_pred → y_pred_2 = y_pred_1 + e_pred
+```
+
+误差修正 BiLSTM 是一个独立的轻量模型，专门对残差序列建模：
+- 输入：最近 T 步的历史残差序列（训练阶段用训练集残差，推理阶段用在线观测残差）
+- 输出：未来 15 步的预测残差
+
+**触发条件：** 误差修正管线在训练阶段确认主预测模型存在系统性偏差（Bias 绝对值 > 3% MAPE 基线）时启用。若主预测模型无系统性偏差，误差修正层可跳过。
+
+##### 3.8.6.3 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| ERR-01 | 残差 BiLSTM 输入维度与主预测输出维度一致（15 步） | 单元测试 |
+| ERR-02 | 残差 BiLSTM 参数量 <= 主预测 LSTM 参数量的 50% | 模型文件验证 |
+| ERR-03 | 误差修正后预测 MAPE 比修正前降低 >= 3%（绝对改善，如 10% -> 7%） | 离线回测对比 |
+| ERR-04 | 误差修正后的 Bias（平均误差）绝对值 <= 修正前的 40%（系统性偏差消除 >= 60%） | 离线回测统计 |
+| ERR-05 | 误差修正管线可通过配置文件开关启用/禁用 | 配置测试 |
+| ERR-06 | 残差 BiLSTM 推理延迟 <= 200ms（NPU 上） | 性能测试 |
+| ERR-07 | 误差修正 + 主预测总推理延迟（含两次 NPU 推理）仍满足 < 1s 约束 | 性能测试 |
+| ERR-08 | 在线推理时，残差输入使用最近 T 步的观测残差（实际值 - 预测值），缺失时（如模型刚启动）使用零向量 | 集成测试 |
+
+##### 3.8.6.4 不做的事
+
+- 不在误差修正层使用 VMD 二次分解——残差已是相对平稳的序列，再次分解收益有限
+- 误差修正 BiLSTM 不参与 Attention 增强——保持轻量
+
+#### 3.8.7 F5: 超参自动优化（MSSA 多策略麻雀搜索算法）
+
+##### 3.8.7.1 用户故事
+
+> 作为 **AI 运维人员**，
+> 我希望系统能自动搜索 LSTM/Attention/BiLSTM/VMD 的最优超参数组合，
+> 以替代当前依赖人工经验和多次手动试验的调参方式，减少从训练到部署的迭代周期。
+
+##### 3.8.7.2 功能描述
+
+MSSA（Multi-Strategy Sparrow Search Algorithm，多策略麻雀搜索算法）在训练阶段自动搜索最优超参数组合。相比传统网格搜索和随机搜索，MSSA 利用"发现者-加入者-侦察者"三群体协同机制 + 佳点集初始化 + 反向学习 + Corsi 变异扰动策略，全局搜索能力更强。
+
+**搜索空间（超参数候选范围）：**
+
+| 超参数 | 符号 | 搜索范围 | 步长/类型 |
+|--------|------|----------|-----------|
+| LSTM 隐状态维度 | hidden_size | {32, 64, 96, 128} | 离散 |
+| LSTM 层数 | num_layers | {1, 2, 3} | 离散 |
+| Attention 打分函数类型 | attn_score | {additive, dot, general} | 枚举 |
+| VMD 模态数 K | vmd_k | [2, 10] | 整数 |
+| VMD 惩罚因子 | vmd_alpha | [100, 5000] | 连续 |
+| 学习率 | lr | [1e-4, 1e-2] | log 连续 |
+| Batch Size | batch_size | {16, 32, 64, 128} | 离散 |
+| Dropout 率 | dropout | [0.0, 0.5] | 连续 |
+| 优化器类型 | optimizer | {Adam, AdamW, RMSprop} | 枚举 |
+| 输入窗口步数 | input_window | {12, 24, 36} | 离散 |
+
+**目标函数（最小化）：** 验证集上的加权 MAPE = 0.5 * MAPE_pv + 0.5 * MAPE_load
+
+**终止条件（任一满足即停止）：**
+1. 达到最大迭代次数（默认 50）
+2. 连续 10 次迭代目标函数改善 < 1e-4
+3. 总搜索时间超过 2 小时
+
+##### 3.8.7.3 验收标准
+
+| ID | 标准 | 验证方法 |
+|----|------|----------|
+| MSSA-01 | MSSA 搜索在 <= 50 次迭代内收敛（满足任一终止条件） | 离线运行验证 |
+| MSSA-02 | MSSA 搜索出的最优超参组合在测试集上 MAPE <= 人工调参最优 MAPE | 离线对比验证 |
+| MSSA-03 | MSSA 搜索出的最优超参组合在测试集上 MAPE <= 网格搜索最优 MAPE | 离线对比验证 |
+| MSSA-04 | MSSA 搜索结果以 JSON 格式持久化，包含最优超参、目标函数值、收敛曲线、每个超参的搜索轨迹 | 文件格式验证 |
+| MSSA-05 | MSSA 搜索结果可直接被训练管线读取，无需人工转录 | 端到端集成测试 |
+| MSSA-06 | MSSA 支持设置超参搜索范围的配置文件，未指定的超参使用默认搜索范围 | 配置测试 |
+| MSSA-07 | MSSA 支持设置最大搜索时间上限（默认 2 小时），超时后输出当前最优解 | 离线运行验证 |
+
+##### 3.8.7.4 不做的事
+
+- MSSA 不在线执行，不进入 RK3588 部署代码路径
+- MSSA 不搜索神经网络架构（如是否使用残差连接、激活函数类型）——架构固定为 LSTM+Attention
+- IPSO（改进粒子群优化）作为备选方案保留，如 MSSA 搜索时间超预期可降级为 IPSO
+
+#### 3.8.8 实施路径与阶段划分
+
+##### 3.8.8.1 第一轮：VMD + Attention（投入产出比最高）
+
+**范围：** F1（MIC 离线分析） + F2（VMD 分解） + F3-A（Attention）
+
+**交付物：**
+- 离线 MIC 分析脚本
+- VMD CPU 预处理模块（C++ 或 Rust 实现，静态/动态链接）
+- 含 Attention 层的 LSTM 训练/推理模型（ONNX -> .rknn）
+- 预测管线：VMD 分解 -> 各 IMF LSTM+Attention 推理 -> 重构
+
+**预期收益：** 预测误差（MAPE）降低 10-20%
+
+**风险：** 低。VMD 在 CPU 执行不占 NPU 算力，Attention 参数量增加可控。
+
+##### 3.8.8.2 第二轮：BiLSTM + 误差修正
+
+**范围：** F3-B（BiLSTM，可选） + F4（残差 BiLSTM 误差修正）
+
+**前置条件：** 第一轮完成并通过离线精度验证；Attention 验证在目标数据集上有效（MAPE 改善 >= 5%）。
+
+**预期收益：** 累计预测误差降低 20-40%（相对原始 LSTM 基线）
+
+**风险：** 中-高。BiLSTM 参数量翻倍，NPU 推理延迟可能超过 < 1s 上限。
+
+**风险缓解措施（准入条件）：** 在第一轮结束前，使用原型 ONNX 模型（含 BiLSTM + Attention）在 RK3588 上做一次延迟摸底。若 P99 推理延迟 >= 900ms（为全管线留 100ms 裕度），BiLSTM 将降级为 Go/No-Go 决策中的 No-Go，第二轮仅保留误差修正管线（单向 LSTM）而跳过 BiLSTM 双向替换。
+
+##### 3.8.8.3 第三轮：MSSA 超参自动优化
+
+**范围：** F5（MSSA 超参搜索）
+
+**前置条件：** 前两轮模型架构冻结，超参搜索空间明确。
+
+**预期收益：** 减少人工调参工作量，自动找到与手动调参持平或更优的超参组合。
+
+**风险：** 低。MSSA 仅在离线训练阶段运行，不影响推理管线。
+
+#### 3.8.9 §3.8 非目标（本轮不做）
+
+| 项 | 状态 | 理由 |
+|----|------|------|
+| CEEMDAN 信号分解 | 备选保留 | VMD 优先，若光伏预测 VMD 提升不足则切换 |
+| KPCA 特征降维 | 备选保留 | 与 MIC 目标重叠，MIC 优先 |
+| IPSO 超参搜索 | 备选保留 | MSSA 优先，若搜索时间超标则降级为 IPSO |
+| 预测误差在线自适应校正（卡尔曼滤波） | 推迟 | 属在线监控范畴（LSTM 优化建议 #6），与本次增强正交 |
+| 训练阶段数据增强与领域随机化 | 推迟 | 属训练管线侧工作（LSTM 优化建议 #4），与本次推理管线增强正交 |
+| 训练阶段 QAT（量化感知训练） | 推迟 | 属训练管线侧工作（LSTM 优化建议 #5），与本次推理管线增强正交 |
+| 多头自注意力（Multi-Head Self-Attention） | 不做 | 参数和延迟超标，不适用于 RK3588 |
+| 在线 VMD K 值自适应调整 | 不做 | K 值由训练阶段确定后固定 |
+
+---
+
+## 4. 多源数据融合
 
 ---
 
@@ -1248,6 +1971,17 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 分位数预测延迟（v2.11）| <= 1s | 性能测试 |
 | 冲击负荷概率计算延迟（v2.11）| <= 10ms | 性能测试 |
 
+**v3.0 预测增强管线新增：**
+
+| 指标 | 要求 | 测量方法 |
+|------|------|----------|
+| LSTM 预测总延迟（含 VMD + Attention） | < 1s（P99） | 性能测试（1000 次连续推理） |
+| VMD 分解延迟（CPU） | <= 50ms（输入窗口 24 步） | 性能测试（1000 次分解） |
+| Attention 层导致的额外延迟 | <= 基线的 15% | 对比性能测试 |
+| BiLSTM 启用时推理总延迟 | < 1s | 性能测试 |
+| 误差修正 BiLSTM 推理延迟 | <= 200ms | 性能测试 |
+| 误差修正 + 主预测总延迟 | < 1s | 性能测试 |
+
 ### 10.2 模型精度
 
 | 指标 | 要求 | 测量方法 |
@@ -1255,6 +1989,23 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 光伏预测 MAPE | <= 10% | 回测验证 |
 | 负荷预测 MAPE | <= 15% | 回测验证 |
 | RL 决策综合回报 | 相比固定策略提升 >= 20% | 对比实验 |
+
+**v3.0 预测增强精度目标（分轮迭代）：**
+
+| 指标 | 基线（v2.16） | 第一轮目标 | 第二轮目标 |
+|------|---------------|------------|------------|
+| 光伏预测 MAPE（第 1 步） | <= 10% | <= 8.5% | <= 7.5% |
+| 负荷预测 MAPE（第 1 步） | <= 15% | <= 13% | <= 12% |
+| 光伏预测 MAPE（第 15 步） | 无约束（远期放宽） | <= 22% | <= 18% |
+| 负荷预测 MAPE（第 15 步） | 无约束（远期放宽） | <= 28% | <= 24% |
+| 预测误差标准差（RMSE） | 无约束 | 降低 >= 15%（相对基线） | 降低 >= 25%（相对基线） |
+| 峰谷时段预测 MAPE | 无约束 | <= 日平均 MAPE * 1.3 | <= 日平均 MAPE * 1.15 |
+| 系统性偏差 Bias | 无约束 | 无约束（不引入新偏差） | \|Bias\| <= 3% MAPE |
+
+**精度测量环境：**
+- 测试集：与训练集无时间重叠的 >= 30 天连续数据
+- 指标计算：MAPE 按天计算后取月均值
+- 对比基线：v2.16 纯 LSTM（无 VMD、无 Attention、无误差修正）在同一测试集上的表现
 
 ### 10.3 模型大小与资源占用
 
@@ -1264,6 +2015,17 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 推理运行时内存占用 | <= 200MB |
 | 训练数据本地存储 | <= 1GB（30 天） |
 | 日志存储 | 按系统滚动策略（单文件 10MB，保留 10 个） |
+
+**v3.0 预测增强新增：**
+
+| 指标 | 要求 |
+|------|------|
+| 增强后 INT8 量化模型大小（LSTM + Attention） | <= 8MB（当前基线 <= 5MB） |
+| BiLSTM + Attention INT8 量化模型大小 | <= 12MB |
+| 误差修正 BiLSTM INT8 量化模型大小 | <= 3MB |
+| VMD 预处理内存开销 | <= 10MB |
+| 推理运行时总内存 | <= 300MB（当前基线 <= 200MB） |
+| 训练数据存储 | 不变（<= 1GB，30 天） |
 
 ### 10.4 可靠性
 
@@ -1390,6 +2152,70 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
     ↓
 数据恢复 5 连续周期后 → 自动切回 AI 模式
 ```
+
+**v3.0 预测增强降级层级（6 级）：**
+
+```
+第 1 级: VMD → LSTM/BiLSTM + Attention → 误差修正 BiLSTM   [全功能]
+第 2 级: VMD → LSTM + Attention → 无误差修正                  [误差修正降级]
+第 3 级: 无VMD → LSTM + Attention → 无误差修正                [VMD降级]
+第 4 级: 无VMD → LSTM（无Attention）→ 无误差修正              [Attention降级]
+第 5 级: v2.16 基线 LSTM 推理                                  [全降级]
+```
+
+降级触发为**单模块粒度**：某个模块失败时仅降级该模块及其下游依赖，不影响其他正常模块。系统启动时自检所有可用模块，确定初始运行层级。运行中模块恢复后自动升回更高层级（需连续 5 次成功）。
+
+### 11.4 预测增强异常处理（v3.0）
+
+#### 11.4.1 信号分解异常
+
+| 异常场景 | 检测条件 | 处理措施 | 恢复策略 |
+|----------|----------|----------|----------|
+| VMD 迭代不收敛 | 达到 max_iter 仍未满足 tol | 丢弃 VMD 结果，使用原始（未分解）序列直接送入 LSTM | 该次推理结束后自动重置，下次推理重试 VMD |
+| VMD 分解结果异常 | 任一 IMF 含 NaN/Inf 值 | 丢弃 VMD 结果，使用原始序列 | 记录 ERROR 日志，连续 3 次触发告警 |
+| VMD 重构误差超标 | 重建信号与原始信号 RMSE > 0.01 | 丢弃 VMD 结果，使用原始序列 | 记录 WARN 日志 |
+| VMD 模态数 K 与实际信号不匹配 | K 过小导致欠分解（模态混叠），或 K 过大导致过分解（伪模态） | 依赖训练阶段 MSSA 自动确定最优 K；若部署后发现模态混叠，通过配置文件调整 K 后重启 | 运维手动调整 |
+
+#### 11.4.2 神经网络推理异常
+
+| 异常场景 | 检测条件 | 处理措施 | 恢复策略 |
+|----------|----------|----------|----------|
+| NPU 推理超时 | 单次推理 > 1s | 记录 ERROR，降级至 CPU 推理 | 连续 3 次 NPU 推理成功且延迟 < 1s 后恢复 |
+| Attention 层输出异常 | 注意力权重全部相等（∀t: alpha_t ≈ 1/T） | 不中断推理（退化到等权重模式），记录 WARN | 该次推理结束后自动重置 |
+| BiLSTM 推理延迟超标 | BiLSTM 推理 > 500ms | 自动禁用 BiLSTM，回退到单向 LSTM + Attention | 下次重启后可重试，连续 3 次超标后持久化禁用 |
+| 误差修正模型推理失败 | 残差 BiLSTM 返回错误 | 跳过误差修正，使用主预测值直接输出 | 该次推理结束后自动重试，连续 3 次失败后持久化降级 |
+| 主预测模型输出 NaN/Inf | 任一预测值 is_nan() 或 is_infinite() | 丢弃本次预测，使用上一周期预测值（hold-last-value） | 记录 ERROR，连续 3 次触发 AI 降级至本地策略 |
+
+#### 11.4.3 模型文件异常
+
+| 异常场景 | 检测条件 | 处理措施 | 恢复策略 |
+|----------|----------|----------|----------|
+| 增强模型文件缺失 | 文件路径不存在 | 回退至 v2.16 基线模型文件，增强功能全部降级 | 记录 WARN，等待 OTA 下发增强模型 |
+| 增强模型文件损坏 | SHA256 校验失败 | 拒绝加载，回退至基线模型 | 记录 ERROR，触发 OTA 备份恢复流程 |
+| 增强模型与 RKNN Runtime 版本不兼容 | rknn_init 返回 -4（SDK 版本不匹配） | 拒绝加载，回退至基线模型 | 记录 ERROR，等待 RKNN Runtime 升级 |
+| 输入维度不匹配 | rknn_init 返回 -5（输入数量不匹配） | 拒绝加载，回退至基线模型 | 记录 ERROR，检查训练管线输出与部署配置一致性 |
+| 误差修正模型缺失但主预测启用误差修正 | 误差修正配置文件开启但模型文件不存在 | 跳过误差修正，主预测正常执行 | 记录 WARN，等待 OTA 下发误差修正模型 |
+
+#### 11.4.4 配置与状态异常
+
+| 异常场景 | 检测条件 | 处理措施 | 恢复策略 |
+|----------|----------|----------|----------|
+| VMD K 值超出了合理范围 | K < 2 或 K > 10 | 使用默认 K 值（光伏 K=5，负荷 K=6） | 记录 WARN，以默认值启动 |
+| Attention 配置启用但模型不含 Attention 层 | 模型元数据中无 Attention 层标记 | 自动回退到无 Attention 模式 | 记录 WARN |
+| 配置文件格式错误 | YAML/TOML 解析失败 | 使用 v2.16 默认配置（全部增强功能禁用） | 记录 ERROR，启动后通知运维 |
+| MSSA 搜索超时 | 搜索时间 > 2 小时 | 输出当前最优解并终止 | 记录 WARN，增加最大迭代次数或缩小搜索空间后可重试 |
+| MSSA 搜索结果退化 | 最优 MAPE > 人工基线 MAPE * 1.1 | 标记结果为"不可用"，使用人工基线超参 | 记录 WARN，检查搜索空间配置是否合理 |
+
+#### 11.4.5 多增强模块组合异常
+
+| 异常场景 | 处理措施 |
+|----------|----------|
+| VMD + Attention 均正常 | 全功能运行 |
+| VMD 失败，Attention 正常 | 跳过 VMD，原始序列 + Attention |
+| VMD 正常，Attention 失败 | VMD 分解 + 无 Attention（权重退化为等权） |
+| VMD + Attention 均失败 | 回退至 v2.16 基线纯 LSTM 推理 |
+| 误差修正失败 | 主预测值直接输出，不修正 |
+| BiLSTM 启用但 Attention 禁用 | BiLSTM 输出直接到全连接层（跳过 Attention），记录 INFO |
 
 ---
 
@@ -1620,10 +2446,227 @@ mupc/crates/ai-engine/
 | 5 | 在线微调是否需要经过审批流程（安全考虑）？还是自动触发？ | 中 | 影响 OnlineUpdater 触发策略 |
 | 6 | 气象数据连续缺失时长"10 个周期"是以融合周期（10 秒）还是气象更新周期（150 分钟）计？ | 中 | 影响 FUSION 告警阈值配置 |
 
+### 14.3 预测增强改动范围（v3.0）
+
+#### 14.3.1 涉及 Crate
+
+| Crate | 改动类型 | 说明 |
+|-------|----------|------|
+| `mupc-ai-engine` | 修改 | 新增 VMD 预处理模块、Attention 层配置、误差修正管线集成 |
+| `mupc-ai-engine` | 修改 | `LstmConfig` 新增增强模块开关字段 |
+| `mupc-ai-engine` | 修改 | `lstm_model.rs` 推理流程扩展（VMD 分解 -> 推理 -> 误差修正），LstmInput 构造适配 MIC 筛选后的特征维度 |
+| `mupc-ai-engine` | 修改 | `data_fusion.rs` 中 FusedSystemState 序列化逻辑适配 MIC 筛选后特征增/减维 |
+| `mupc-ai-engine` | 修改 | 错误类型新增增强模块相关变体 |
+| `mupc-common` | - | 不涉及（特征向量序列化逻辑在 mupc-ai-engine 而非 mupc-common，预测增强对下游 crate 透明） |
+| `mupc-strategy-engine` | - | 不涉及（FusedSystemState 接口不变） |
+
+#### 14.3.2 配置文件变更
+
+`mupc/config/mupc_env_config.yaml`（或新增预测增强独立配置文件）：
+
+```yaml
+prediction_enhancement:
+  vmd:
+    enabled: true
+    k_pv: 5                   # 光伏模态数
+    k_load: 6                 # 负荷模态数
+    alpha: 2000               # 惩罚因子
+    tol: 1.0e-6               # 收敛容差
+    max_iter: 500             # 最大迭代次数
+  attention:
+    enabled: true
+    score_type: "additive"    # additive / dot / general
+  bilstm:
+    enabled: false            # 默认禁用，Attention 验证后按需启用
+  error_correction:
+    enabled: false            # 默认禁用，主预测模型偏差 > 3% 时启用
+  feature_selection:
+    mic_top_k: 7              # MIC 筛选 Top-K 特征数
+```
+
+#### 14.3.3 跨项目接口契约（与 MUPC-AI2 训练管线对接）
+
+本节定义 MUPC 推理端与 MUPC-AI2 训练管线之间的数据交换接口，确保 MIC 分析、MSSA 搜索、ONNX 模型转换三个跨项目环节的输出可直接被对端消费，无需人工转录。
+
+##### 14.3.3.1 MIC 分析输出 JSON Schema
+
+MIC 离线分析脚本输出 JSON 文件，由训练管线读取以确定模型输入特征集。
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MicAnalysisOutput",
+  "type": "object",
+  "required": ["analysis_metadata", "features", "top_k"],
+  "properties": {
+    "analysis_metadata": {
+      "type": "object",
+      "required": ["source_csv", "total_rows", "analysis_time", "target", "step_seconds"],
+      "properties": {
+        "source_csv": {"type": "string", "description": "输入 CSV 文件路径"},
+        "total_rows": {"type": "integer", "minimum": 8640},
+        "analysis_time": {"type": "string", "format": "date-time", "description": "ISO 8601"},
+        "target": {"type": "string", "enum": ["pv_power", "load_power"]},
+        "step_seconds": {"type": "integer", "default": 900, "description": "时间步长（秒）"}
+      }
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "mic_value", "rank", "selected"],
+        "properties": {
+          "name": {"type": "string"},
+          "mic_value": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+          "rank": {"type": "integer", "minimum": 1},
+          "selected": {"type": "boolean"}
+        }
+      }
+    },
+    "top_k": {"type": "integer", "minimum": 2},
+    "excluded_features": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "因数据缺失被跳过的特征名列表"
+    }
+  }
+}
+```
+
+**使用约定：**
+- 训练管线按 `features[].selected == true` 筛选特征，按 `rank` 升序排列特征维度
+- 若 `selected` 特征数 != `top_k`（如部分扩展候选特征不可用），训练管线以实际选中数量为准
+- `mic_value` 数组按 `rank` 升序排列（rank=1 为最强相关性）
+
+##### 14.3.3.2 MSSA 搜索结果 JSON Schema
+
+MSSA 超参搜索输出 JSON 文件，由训练管线读取以设置最优超参组合。
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MssaSearchOutput",
+  "type": "object",
+  "required": ["search_metadata", "best_hyperparameters", "best_objective"],
+  "properties": {
+    "search_metadata": {
+      "type": "object",
+      "required": ["algorithm", "start_time", "end_time", "total_iterations", "convergence_reason"],
+      "properties": {
+        "algorithm": {"type": "string", "const": "MSSA"},
+        "start_time": {"type": "string", "format": "date-time"},
+        "end_time": {"type": "string", "format": "date-time"},
+        "total_iterations": {"type": "integer", "minimum": 1, "maximum": 50},
+        "convergence_reason": {"type": "string", "enum": ["max_iter", "no_improvement", "timeout"]},
+        "elapsed_seconds": {"type": "number"}
+      }
+    },
+    "best_hyperparameters": {
+      "type": "object",
+      "required": ["hidden_size", "num_layers", "attn_score", "vmd_k", "vmd_alpha", "lr", "batch_size", "dropout", "optimizer", "input_window"],
+      "properties": {
+        "hidden_size": {"type": "integer", "enum": [32, 64, 96, 128]},
+        "num_layers": {"type": "integer", "enum": [1, 2, 3]},
+        "attn_score": {"type": "string", "enum": ["additive", "dot", "general"]},
+        "vmd_k": {"type": "integer", "minimum": 2, "maximum": 10},
+        "vmd_alpha": {"type": "number", "minimum": 100, "maximum": 5000},
+        "lr": {"type": "number", "minimum": 1.0e-4, "maximum": 1.0e-2},
+        "batch_size": {"type": "integer", "enum": [16, 32, 64, 128]},
+        "dropout": {"type": "number", "minimum": 0.0, "maximum": 0.5},
+        "optimizer": {"type": "string", "enum": ["Adam", "AdamW", "RMSprop"]},
+        "input_window": {"type": "integer", "enum": [12, 24, 36]}
+      }
+    },
+    "best_objective": {
+      "type": "object",
+      "required": ["weighted_mape", "mape_pv", "mape_load"],
+      "properties": {
+        "weighted_mape": {"type": "number", "description": "0.5 * MAPE_pv + 0.5 * MAPE_load"},
+        "mape_pv": {"type": "number"},
+        "mape_load": {"type": "number"}
+      }
+    },
+    "convergence_curve": {
+      "type": "array",
+      "items": {"type": "number"},
+      "description": "每次迭代的目标函数值（weighted_mape），长度 = total_iterations"
+    },
+    "per_parameter_trajectory": {
+      "type": "object",
+      "description": "每个搜索超参的迭代轨迹，key=超参名，value=长度 total_iterations 的数组",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"type": "number"}
+      }
+    },
+    "quality_flag": {
+      "type": "string",
+      "enum": ["usable", "unusable"],
+      "description": "usable = 最优 MAPE <= 人工基线 MAPE * 1.1；unusable = 搜索结果退化，应使用人工基线超参"
+    }
+  }
+}
+```
+
+##### 14.3.3.3 增强后 ONNX 模型输入/输出维度约定
+
+**通用约定（MUPC-AI2 训练管线与 MUPC RT 推理端共同遵守）：**
+
+| 约定项 | 值 | 说明 |
+|--------|-----|------|
+| 输入 dtype | `float32` | 训练与推理统一 float32，量化部署时由 RKNN Toolkit 自行转换 |
+| 输入 shape | `[batch_size, input_window, num_selected_features]` | `input_window` 由 MSSA 确定（12/24/36）；`num_selected_features` 由 MIC 确定（<= top_k） |
+| 输出 dtype | `float32` | 统一 float32 |
+| 输出 shape（无 VMD） | `[batch_size, output_horizon, 3]` | `output_horizon` = 15（15 步分位数预测）；channel 0=P10, 1=P50, 2=P90 |
+| 输出 shape（含 VMD） | `[batch_size, K, output_horizon, 3]` | K 为 VMD 模态数（光伏 4~6，负荷 5~8）；推理端在 `K`-dim 上求和重构得最终预测 |
+| VMD 子模态重构 | 推理端负责在输出 `K`-dim 上 `sum(K)` 得到标准 output shape | 训练管线输出 K 通道，推理端聚合；此约束确保 ONNX 模型与 .rknn 模型语义一致 |
+
+**维度约定溯源：**
+
+```
+MSSA 搜索 [input_window] ──→ ONNX input dim_1
+MIC 筛选 [num_selected_features] ──→ ONNX input dim_2
+VMD K 值（训练确定） ──→ ONNX output dim_1（含 VMD 时）
+output_horizon（固定 15） ──→ ONNX output dim_1（无 VMD）/ dim_2（含 VMD）
+分位数 P10/P50/P90（固定 3） ──→ ONNX output dim_2（无 VMD）/ dim_3（含 VMD）
+```
+
+**模型元数据要求：** ONNX 模型须在 `metadata_props` 中包含以下键值对，供推理端启动校验：
+
+| 元数据键 | 类型 | 说明 |
+|----------|------|------|
+| `mupc_model_type` | `"lstm"` / `"bilstm"` | 模型架构类型 |
+| `mupc_with_attention` | `"true"` / `"false"` | 是否含 Attention 层 |
+| `mupc_with_vmd` | `"true"` / `"false"` | 是否期望推理端执行 VMD 预处理 |
+| `mupc_mic_topk` | 整数 | MIC 筛选的特征数 |
+| `mupc_output_horizon` | 整数 | 固定 15 |
+| `mupc_input_window` | 整数 | 12 / 24 / 36 |
+| `mupc_version` | 字符串 | 模型版本号，与 OTA 模型管理联动 |
+
+### 14.4 预测增强术语表（v3.0 新增）
+
+| 术语 | 全称/说明 |
+|------|-----------|
+| VMD | Variational Mode Decomposition，变分模态分解 |
+| MIC | Maximal Information Coefficient，最大信息系数 |
+| BiLSTM | Bidirectional LSTM，双向长短时记忆网络 |
+| Attention | 注意力机制，自动加权关注关键时间步 |
+| MSSA | Multi-Strategy Sparrow Search Algorithm，多策略麻雀搜索算法 |
+| IMF | Intrinsic Mode Function，本征模态函数（VMD 分解的子模态） |
+| MAPE | Mean Absolute Percentage Error，平均绝对百分比误差 |
+| RMSE | Root Mean Square Error，均方根误差 |
+| CEEMDAN | Complete Ensemble Empirical Mode Decomposition with Adaptive Noise，自适应噪声完备集合经验模态分解 |
+| IPSO | Improved Particle Swarm Optimization，改进粒子群优化 |
+| KPCA | Kernel Principal Component Analysis，核主成分分析 |
+| P10/P50/P90 | 第 10/50/90 百分位数预测值 |
+
 ---
 
-**文档状态：** 统一版 v2.15（整合了 v1.0~v2.15 所有历史版本）
+**文档状态：** 统一版 v3.0（整合了 v1.0~v3.0 所有历史版本，含预测增强分层混合架构 §3.8）
 
 **来源文档：**
-- `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md`（v1.0~v2.15 历史版本合并）
+- `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md`（v1.0~v2.17 历史版本合并）
+- `docs/superpowers/specs/2026-06-21-预测增强分层混合架构-PRD.md`（v1.1 [REVIEWED: PASS]，预测增强分层混合架构，已合并至 §3.8/§10/§11/§14）
 - `docs/superpowers/plans/modules/05-MUPC-AI引擎-设计文档.md`（设计文档）
+- `docs/TODO/论文吸收-预测增强.md`（论文吸收方案输入源）
+- `docs/TODO/LSTM优化.md`、`docs/TODO/LSTM优化2.md`（已完成的 LSTM 优化 v2.16，供参考）
