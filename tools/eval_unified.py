@@ -10,7 +10,7 @@ print("=" * 60)
 # 加载验证数据
 from train_unified import _load_all
 _, val_data = _load_all()
-from lstm_model import OraclePredictor
+from models.lstm import OraclePredictor
 predictor = OraclePredictor(val_data)
 print(f"\nTest set: {val_data['n_steps']} steps")
 

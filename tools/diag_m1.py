@@ -3,7 +3,7 @@ import os, numpy as np
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from data_loader import SmartDSLoader
 from mupc_env import MupcEnv
-from lstm_model import OraclePredictor
+from models.lstm import OraclePredictor
 from stable_baselines3 import PPO
 
 loader = SmartDSLoader()

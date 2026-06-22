@@ -20,7 +20,7 @@ from mupc_env.constants import P_BATT_MAX_KW
 if TYPE_CHECKING:
     import pandapower as pp
     from grid2op import Environment
-    from grid2op_env.numpy_chronics import NumpyChronics
+    from mupc_env.grid2op.numpy_chronics import NumpyChronics
 
 # ── 物理常量（运行时从配置读取，避免导入时序问题）─────────────────
 

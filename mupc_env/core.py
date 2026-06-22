@@ -28,7 +28,7 @@ except ImportError:
     from _gym_stub import Box
     _GYM_AVAILABLE = False
 
-from action_validator import ActionValidator
+from mupc_env.action_validator import ActionValidator
 
 from . import constants
 from . import observation
@@ -77,7 +77,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         if lstm_predictor is not None:
             self._predictor = lstm_predictor
         else:
-            from lstm_model import OraclePredictor
+            from models.lstm import OraclePredictor
             self._predictor = OraclePredictor(data)
 
         # 电压仿真器 (Grid2Op 优先，失败降级到 VoltageSimulator)
@@ -181,9 +181,9 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             return
 
         try:
-            from grid2op_env import Grid2OpPowerFlow, NumpyChronics
-            from grid2op_env.network import create_mupc_network
-            from grid2op_env.backend import is_grid2op_available
+            from mupc_env.grid2op import Grid2OpPowerFlow, NumpyChronics
+            from mupc_env.grid2op.network import create_mupc_network
+            from mupc_env.grid2op.backend import is_grid2op_available
         except ImportError as e:
             print(f"[WARN] grid2op_env 不可用, 降级到 VoltageSimulator: {e}")
             return

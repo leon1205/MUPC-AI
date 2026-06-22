@@ -64,15 +64,20 @@ python data/download_smart_ds.py
 ```
 SMART-DS CSV/Parquet
         ↓
-data_loader.py       → 加载光伏/负荷/气象，合成 TOU电价/需量/调度
+data_loader.py          → 加载光伏/负荷/气象，合成 TOU电价/需量/调度
         ↓
-lstm_model.py        → LSTM 预测模型（或 Oracle 后备）
+models/                 → ML 模型 (v3.1)
+  ├── lstm.py           → LSTM + TCN + Attention + BiLSTM 预测
+  ├── error_correction.py → BiLSTM 误差修正
+  └── vmd.py            → VMD 变分模态分解
         ↓
-mupc_env.py          → Gymnasium 环境：78/79维观测 + 2维动作 + 5场景奖励 (v2.14)
+mupc_env/               → Gymnasium 环境：78/79维观测 + 2维动作 + 5场景奖励
+  ├── action_validator.py → 动作约束 ACT-01~05
+  └── grid2op/          → Grid2Op + Pandapower 电压仿真
         ↓
-train.py             → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
+train.py                → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
         ↓
-export_onnx.py       → ONNX 导出
+export_onnx.py          → ONNX 导出
         ↓
 MUPC AI Engine (Rust, RK3588 NPU)
 ```
@@ -128,13 +133,18 @@ Q_batt 由实时电压调节器闭环控制，不经过 RL 动作空间。
 
 ```
 train.py
-├── data_loader.py          (SmartDSLoader + ChinaDataLoader + UnifiedDataLoader)
-├── lstm_model.py           (PyTorch LSTM / Oracle 后备)
-├── mupc_env.py             (Gymnasium 环境)
-│   └── action_validator.py  (4+1 条动作约束)
-├── stable_baselines3       (PPO/SAC，主路径)
-│   └── _ppo_core.py       (NumPy PPO 后备)
-└── export_onnx.py         (ONNX 导出)
+├── data_loader.py              (SmartDSLoader + ChinaDataLoader + UnifiedDataLoader)
+├── models/                     (ML 模型)
+│   ├── lstm.py                 (LSTM + TCN + Attention + BiLSTM)
+│   ├── error_correction.py     (BiLSTM 误差修正)
+│   └── vmd.py                  (VMD 分解)
+├── mupc_env/                   (Gymnasium 环境)
+│   ├── core.py                 (MupcEnv 主类)
+│   ├── action_validator.py     (ACT-01~05 动作约束)
+│   └── grid2op/                (Grid2Op + Pandapower 电压仿真)
+├── stable_baselines3           (PPO/SAC，主路径)
+│   └── _ppo_core.py           (NumPy PPO 后备)
+└── export_onnx.py             (ONNX 导出)
 ```
 
 **降级规则**：

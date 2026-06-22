@@ -505,7 +505,7 @@ if __name__ == "__main__":
 
     # 3. ActionValidator 4+1 条约束规则 (v2.17: ACT-01/02/03/04 + ACT-05)
     print("[3] ActionValidator 约束规则...")
-    from action_validator import ActionValidator
+    from mupc_env.action_validator import ActionValidator
     v = ActionValidator()
     # 2 维动作: [p_ref, k_droop]
     act_init = np.array([0.0, 0.0], dtype=np.float32)

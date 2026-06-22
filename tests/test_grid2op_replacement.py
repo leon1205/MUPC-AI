@@ -470,7 +470,7 @@ def test_grid2op_fallback():
     print("\n[降级测试] Grid2Op 不可用时自动降级到 VoltageSimulator")
     try:
         from mupc_env import MupcEnv
-        from grid2op_env.backend import is_grid2op_available
+        from mupc_env.grid2op.backend import is_grid2op_available
 
         data = _get_data()
 

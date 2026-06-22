@@ -231,7 +231,7 @@ def main():
     predictor = None
     lstm_metrics = {}  # v3.0: 训练指标供 stdout 输出
     if not args.no_lstm and args.lstm_checkpoint:
-        from lstm_model import LSTMForecast
+        from models.lstm import LSTMForecast
         import torch as _torch_lstm
         print(f"\n── LSTM 模型加载 ──")
         model = LSTMForecast()
@@ -242,7 +242,7 @@ def main():
     elif not args.no_lstm and has_torch:
         print("\n── LSTM 模型训练 ──")
         try:
-            from lstm_model import LSTMTrainer
+            from models.lstm import LSTMTrainer
             trainer = LSTMTrainer(lstm_cfg)
             result = trainer.train(train_data, val_data)
             predictor = result["model"]
@@ -261,7 +261,7 @@ def main():
             traceback.print_exc(file=sys.stderr)
             sys.exit(1)
     else:
-        from lstm_model import OraclePredictor
+        from models.lstm import OraclePredictor
         print("\n── 使用 Oracle 预测 ──")
         predictor = OraclePredictor(train_data)
 

@@ -287,7 +287,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
 
     _ensure_export_deps()
 
-    from lstm_model import LSTMForecast
+    from models.lstm import LSTMForecast
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     # v3.0: auto-detect output_mode from checkpoint
     has_attn = "attention" in state_dict and state_dict["attention"] is not None
