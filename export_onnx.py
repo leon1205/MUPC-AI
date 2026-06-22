@@ -307,6 +307,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
     class LSTMWrapper(nn.Module):
         def __init__(self, m):
             super().__init__()
+            self.tcn = m.tcn  # v3.1: TCN 前置特征提取层
             self.lstm = m.lstm
             if m.attention is not None:
                 self.attn_W = m.attention.W
@@ -332,6 +333,8 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
                     self.head_d10_base = m.head_d10_base
 
         def forward(self, x):
+            if self.tcn is not None:
+                x = self.tcn.forward(x)  # v3.1: TCN 前置特征提取
             h_seq, (h_n, _) = self.lstm(x)
             if self.has_attn:
                 score = self.attn_v(torch.tanh(self.attn_W(h_seq)))
