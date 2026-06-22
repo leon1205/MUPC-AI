@@ -232,7 +232,7 @@ VMD（Variational Mode Decomposition）把一个时间序列 x(t) 分解为 K �
 | tol | 1e-6 | 1e-6 | 收敛精度 |
 | max_iter | 500 | 500 | 最大迭代次数 |
 
-**实现方式**：训练阶段用 Python（`vmd_decomposer.py`，骨架支持 `vmdpy` 库调用）；部署阶段用纯 Rust（`rustfft + nalgebra`）在 RK3588 CPU 上执行，不依赖外部 C/C++ 库。K 值由 MSSA 搜索确定后写入配置。
+**实现方式**：训练阶段用 Python（`models/vmd.py`，骨架支持 `vmdpy` 库调用）；部署阶段用纯 Rust（`rustfft + nalgebra`）在 RK3588 CPU 上执行，不依赖外部 C/C++ 库。K 值由 MSSA 搜索确定后写入配置。
 
 > **VMD 是可选特性**（R2 交付）。未启用时信号直接进入 LSTM。部署时 VMD 分解失败自动回退到原始序列。
 
@@ -1070,16 +1070,23 @@ A: 单模式输出 78 维 obs，多模式追加 mode_id 在索引 78 变成 79 �
 
 | 文件 | 职责 |
 |------|------|
-| `lstm_model.py` | LSTM 预测模型 (LSTM+Attention+BiLSTM+VMD 集成) |
-| `error_correction.py` | BiLSTM 误差修正模型 |
-| `vmd_decomposer.py` | VMD 信号分解器 |
+| `models/lstm.py` | LSTM 预测模型 (LSTM+Attention+BiLSTM+VMD 集成) |
+| `models/error_correction.py` | BiLSTM 误差修正模型 |
+| `models/vmd.py` | VMD 信号分解器 |
 | `mupc_env/core.py` | MupcEnv 主环境协调 |
 | `mupc_env/observation.py` | 78/79 维观测构建 |
 | `mupc_env/rewards.py` | 奖励函数 (9+3 项) |
 | `mupc_env/constants.py` | 物理常数 + 权重默认值 |
-| `action_validator.py` | 动作约束 ACT-01~05 |
-| `grid2op_env/network.py` | 农网拓扑定义 |
-| `grid2op_env/power_flow.py` | Grid2Op + Pandapower 集成 |
+| `mupc_env/action_validator.py` | 动作约束 ACT-01~05 |
+| `mupc_env/grid2op/network.py` | 农网拓扑定义 |
+| `mupc_env/grid2op/power_flow.py` | Grid2Op + Pandapower 集成 |
+| `mupc_env/grid2op/numpy_chronics.py` | 时序数据注入器 |
+| `mupc_env/grid2op/backend.py` | Backend 选择 (LightSim/PandaPower) |
+| `train.py` | 训练入口 (PPO + MSSA 接口) |
+| `export_onnx.py` | ONNX 导出 (含 metadata_props) |
+| `data_loader.py` | SMART-DS/中国合成 数据加载 |
+| `config/config_manager.py` | YAML 配置加载 |
+| `config/mupc_env_config.yaml` | 环境参数配置文件 |
 | `train.py` | 训练入口 (PPO + MSSA 接口) |
 | `export_onnx.py` | ONNX 导出 (含 metadata_props) |
 | `config/config_manager.py` | YAML 配置加载 |

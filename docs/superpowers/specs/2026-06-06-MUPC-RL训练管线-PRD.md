@@ -532,9 +532,9 @@ Grid2Op + Pandapower 电压仿真引擎作为 `VoltageSimulator` 的替代方案
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| `NumpyChronics` | `grid2op_env/numpy_chronics.py` | 将 SmartDSLoader 的 data dict 转换为 Grid2Op 三相格式 |
-| `Grid2OpPowerFlow` | `grid2op_env/power_flow.py` | Grid2Op 引擎封装，提供同步 SOC 和获取三相电压的接口 |
-| `create_mupc_network` | `grid2op_env/network.py` | Pandapower 网络拓扑（农网台区 3 总线模型） |
+| `NumpyChronics` | `mupc_env/grid2op/numpy_chronics.py` | 将 SmartDSLoader 的 data dict 转换为 Grid2Op 三相格式 |
+| `Grid2OpPowerFlow` | `mupc_env/grid2op/power_flow.py` | Grid2Op 引擎封装，提供同步 SOC 和获取三相电压的接口 |
+| `create_mupc_network` | `mupc_env/grid2op/network.py` | Pandapower 网络拓扑（农网台区 3 总线模型） |
 
 **技术规格**：
 
@@ -695,7 +695,7 @@ MUPC-AI2/
 ├── export_onnx.py # F6: ONNX 导出
 ├── _ppo_core.py              # 纯 NumPy PPO 后备
 ├── _gym_stub.py # Gymnasium 最小替代
-├── grid2op_env/             # F8: Grid2Op 电压仿真引擎
+├── mupc_env/grid2op/             # F8: Grid2Op 电压仿真引擎
 │   ├── __init__.py
 │   ├── numpy_chronics.py     # NumpyChronics: data dict → Grid2Op 格式
 │   ├── power_flow.py # Grid2OpPowerFlow: Grid2Op 引擎封装
@@ -765,7 +765,7 @@ MUPC-AI2/
 | 3 | 新增 R-01~R-08 风险评估 | 6.1 | Grid2Op相关的8 个风险及应对策略 |
 | 4 | 新增 `--use-grid2op` / `--no-grid2op` 参数 | 3.4 | 电压仿真引擎切换开关 |
 | 5 | 新增 F8 验收标准 | 3.8 | Grid2Op 初始化、SOC 同步、不收敛处理等 |
-| 6 | 更新文件结构 | 7 | 新增 grid2op_env/ 目录 |
+| 6 | 更新文件结构 | 7 | 新增 mupc_env/grid2op/ 目录 |
 | 7 | 更新版本引用 | 文档头部 | v2.2 → v2.3 |
 
 **修订依据：** Grid2Op + Pandapower 电压仿真替换 PRD（2026-06-09）已通过 code review，集成到训练管线 PRD
