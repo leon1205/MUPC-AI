@@ -109,6 +109,116 @@ class AdditiveAttention:
         return ctx, weights
 
 
+# ── v3.1: TCN 时域卷积特征提取层 (R2 可选) ────────────────
+
+class TCNBlock:
+    """单层 TCN 残差块 (因果卷积).
+
+    Conv1D(kernel_size, dilation) → BatchNorm → ReLU → Dropout → +残差
+    因果卷积: 左侧 padding = (kernel_size-1) * dilation, 右侧无 padding.
+    所有算子均为 ONNX 标准 (Conv1D/BN/ReLU/Add), RKNN Toolit 2 原生支持.
+    """
+    def __init__(self, in_channels: int, out_channels: int,
+                 kernel_size: int, dilation: int, dropout: float = 0.1):
+        _ensure_torch()
+        self.conv = _nn.Conv1d(in_channels, out_channels, kernel_size,
+                               dilation=dilation,
+                               padding=(kernel_size - 1) * dilation)
+        self.bn = _nn.BatchNorm1d(out_channels)
+        self.relu = _nn.ReLU()
+        self.dropout = _nn.Dropout(dropout)
+        self.residual = (_nn.Conv1d(in_channels, out_channels, 1)
+                         if in_channels != out_channels else _nn.Identity())
+        self._out_channels = out_channels
+
+    def to(self, device: str):
+        self.conv.to(device); self.bn.to(device)
+        if not isinstance(self.residual, _nn.Identity):
+            self.residual.to(device)
+
+    def parameters(self):
+        params = list(self.conv.parameters()) + list(self.bn.parameters())
+        if not isinstance(self.residual, _nn.Identity):
+            params += list(self.residual.parameters())
+        return params
+
+    def state_dict(self):
+        d = {"conv": self.conv.state_dict(), "bn": self.bn.state_dict()}
+        if not isinstance(self.residual, _nn.Identity):
+            d["residual"] = self.residual.state_dict()
+        return d
+
+    def load_state_dict(self, d: dict):
+        self.conv.load_state_dict(d["conv"]); self.bn.load_state_dict(d["bn"])
+        if "residual" in d and not isinstance(self.residual, _nn.Identity):
+            self.residual.load_state_dict(d["residual"])
+
+    def eval(self): self.conv.eval(); self.bn.eval()
+    def train(self, mode: bool = True): self.conv.train(mode); self.bn.train(mode)
+
+    def forward(self, x):
+        # x: (B, T, C) → Conv1D expects (B, C, T)
+        out = x.permute(0, 2, 1)
+        out = self.relu(self.bn(self.conv(out)))
+        out = out.permute(0, 2, 1)         # (B, C, T) → (B, T, C)
+        out = out[:, :x.size(1), :]        # 截断因果 padding
+        out = self.dropout(out)
+        residual = self.residual(x.permute(0, 2, 1)).permute(0, 2, 1)
+        if residual.shape[1] != out.shape[1]:
+            residual = residual[:, :out.shape[1], :]
+        return out + residual
+
+
+class TCNFeatureExtractor:
+    """4 层 TCN 特征提取器, 膨胀率 [1, 2, 4, 8], 覆盖 15 步感受野.
+
+    Input:  (B, T, K)  原始特征
+    Output: (B, T, H)  提取后特征 (H = hidden_dim)
+    """
+    def __init__(self, input_dim: int, hidden_dim: int = 64,
+                 num_levels: int = 4, kernel_size: int = 3,
+                 dropout: float = 0.1):
+        _ensure_torch()
+        self.blocks = []
+        for i in range(num_levels):
+            dilation = 2 ** i
+            in_ch = input_dim if i == 0 else hidden_dim
+            self.blocks.append(TCNBlock(in_ch, hidden_dim, kernel_size, dilation, dropout))
+        self.hidden_dim = hidden_dim
+        self.num_levels = num_levels
+
+    def to(self, device: str):
+        for b in self.blocks:
+            b.to(device)
+
+    def parameters(self):
+        params = []
+        for b in self.blocks:
+            params += b.parameters()
+        return params
+
+    def state_dict(self):
+        return {f"tcn_block_{i}": b.state_dict() for i, b in enumerate(self.blocks)}
+
+    def load_state_dict(self, d: dict):
+        for i in range(self.num_levels):
+            key = f"tcn_block_{i}"
+            if key in d:
+                self.blocks[i].load_state_dict(d[key])
+
+    def eval(self):
+        for b in self.blocks: b.eval()
+
+    def train(self, mode: bool = True):
+        for b in self.blocks: b.train(mode)
+
+    def forward(self, x):
+        """x: (B, T, K) → (B, T, hidden_dim)."""
+        for block in self.blocks:
+            x = block.forward(x)
+        return x
+
+
 # ── 模型定义 ──────────────────────────────────────────────────
 
 class LSTMForecast:
@@ -124,7 +234,8 @@ class LSTMForecast:
                  dropout: float = 0.1, with_d10: bool = True,
                  with_attention: bool = True,
                  output_mode: str = "p10p50p90",
-                 bidirectional: bool = False):
+                 bidirectional: bool = False,
+                 with_tcn: bool = True):     # v3.1: TCN 特征提取 (R2 默认开启)
         """
         Args:
             input_dim: 输入特征维度
@@ -136,9 +247,11 @@ class LSTMForecast:
             with_attention: 是否含 Attention 层 (v3.0)
             output_mode: "legacy" 或 "p10p50p90" (v3.0)
             bidirectional: 是否启用 BiLSTM (v3.0 R2)
+            with_tcn: 是否前置 TCN 特征提取层 (v3.1 R2)
         """
         _ensure_torch()
         self.bidirectional = bidirectional
+        self.with_tcn = with_tcn
         # 双向时折半 hidden_dim 以控制参数量 ≤ 单向的 2.2x
         lstm_hidden = hidden_dim // 2 if bidirectional else hidden_dim
         self.input_dim = input_dim
@@ -149,6 +262,13 @@ class LSTMForecast:
         self.with_attention = with_attention
         self.output_mode = output_mode
 
+        # v3.1: TCN 特征提取层 (R2 可选)
+        self.tcn = TCNFeatureExtractor(input_dim, hidden_dim, num_levels=4,
+                                       kernel_size=3, dropout=dropout) if with_tcn else None
+        # LSTM 输入维度：有 TCN 时为 hidden_dim (TCN 已将特征投影到 hidden_dim)，
+        # 否则为 input_dim
+        lstm_input_dim = hidden_dim if with_tcn else input_dim
+
         if output_mode == "p10p50p90":
             self.output_dim = forecast_steps * 2 * 3
         else:
@@ -158,7 +278,7 @@ class LSTMForecast:
         self._d10_trained_count: int = 0
 
         self.lstm = _nn.LSTM(
-            input_dim, lstm_hidden, num_layers,
+            lstm_input_dim, lstm_hidden, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
             bidirectional=bidirectional,
         )
@@ -189,6 +309,8 @@ class LSTMForecast:
 
     def to(self, device: str) -> "LSTMForecast":
         self.lstm.to(device)
+        if self.tcn is not None:
+            self.tcn.to(device)
         if self.output_mode == "p10p50p90":
             for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
                       self.head_load_p10, self.head_load_p50, self.head_load_p90]:
@@ -207,6 +329,8 @@ class LSTMForecast:
 
     def parameters(self):
         params = list(self.lstm.parameters())
+        if self.tcn is not None:
+            params += self.tcn.parameters()
         if self.output_mode == "p10p50p90":
             for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
                       self.head_load_p10, self.head_load_p50, self.head_load_p90]:
@@ -223,6 +347,8 @@ class LSTMForecast:
 
     def state_dict(self) -> dict:
         d = {"lstm": self.lstm.state_dict()}
+        if self.tcn is not None:
+            d["tcn"] = self.tcn.state_dict()
         if self.output_mode == "p10p50p90":
             d.update({
                 "head_pv_p10": self.head_pv_p10.state_dict(),
@@ -245,6 +371,8 @@ class LSTMForecast:
 
     def load_state_dict(self, d: dict) -> None:
         self.lstm.load_state_dict(d["lstm"])
+        if "tcn" in d and self.tcn is not None:
+            self.tcn.load_state_dict(d["tcn"])
         if self.output_mode == "p10p50p90":
             self.head_pv_p10.load_state_dict(d["head_pv_p10"])
             self.head_pv_p50.load_state_dict(d["head_pv_p50"])
@@ -264,6 +392,8 @@ class LSTMForecast:
 
     def eval(self) -> "LSTMForecast":
         self.lstm.eval()
+        if self.tcn is not None:
+            self.tcn.eval()
         if self.output_mode == "p10p50p90":
             for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
                       self.head_load_p10, self.head_load_p50, self.head_load_p90]:
@@ -280,6 +410,8 @@ class LSTMForecast:
 
     def train(self, mode: bool = True) -> "LSTMForecast":
         self.lstm.train(mode)
+        if self.tcn is not None:
+            self.tcn.train(mode)
         if self.output_mode == "p10p50p90":
             for h in [self.head_pv_p10, self.head_pv_p50, self.head_pv_p90,
                       self.head_load_p10, self.head_load_p50, self.head_load_p90]:
@@ -306,6 +438,10 @@ class LSTMForecast:
                      + attn_weights (B, T) 当 with_attention=True
             使用 ReLU 保证 PV/load/分位数/基荷输出非负。
         """
+        # v3.1: TCN 前置特征提取 (R2)
+        if self.tcn is not None:
+            x = self.tcn.forward(x)                     # (B, T, K) → (B, T, H)
+
         h_seq, (h_n, _) = self.lstm(x)                # h_seq: (B, T, H), h_n: (L, B, H)
 
         if self.attention is not None:
@@ -448,6 +584,7 @@ LSTM_TRAIN_CONFIG = {
     "with_attention": True,          # v3.0: AdditiveAttention
     "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
     "quantile_taus": [0.1, 0.5, 0.9],  # v3.1: 分位数目标 (仅 loss="quantile" 时使用)
+    "with_tcn": True,                # v3.1: TCN 前置特征提取 (R2 默认开启)
 }
 
 
@@ -637,6 +774,7 @@ class LSTMTrainer:
             with_d10=cfg.get("with_d10", True),
             with_attention=cfg.get("with_attention", True),
             output_mode=cfg.get("output_mode", "p10p50p90"),
+            with_tcn=cfg.get("with_tcn", True),   # v3.1: TCN 特征提取 (R2 默认开启)
         )
         self.model.input_window = cfg.get("input_window", 12)
         self.model.to(self.device)

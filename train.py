@@ -201,6 +201,7 @@ def main():
         "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
         "input_window": 24,              # v3.0: 输入窗口步数
         "patience": 30,                  # 早停
+        "with_tcn": True,                # v3.1: TCN 特征提取 (R2, 默认开启)
     }
     if args.config:
         mssa_cfg = parse_mssa_config(args.config)
@@ -215,7 +216,8 @@ def main():
         }
         KNOWN_KEYS = {"hidden_dim", "num_layers", "learning_rate", "batch_size",
                        "dropout", "input_window", "output_mode", "with_attention",
-                       "attn_score", "vmd_k", "vmd_alpha", "optimizer"}
+                       "attn_score", "vmd_k", "vmd_alpha", "optimizer",
+                       "with_tcn"}    # v3.1: TCN 特征提取 (R2)
         mapped = {}
         for k, v in mssa_cfg.items():
             if k not in KEY_MAP and k not in KNOWN_KEYS:

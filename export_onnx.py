@@ -269,7 +269,8 @@ def _verify_onnx_inference(pytorch_model, onnx_path: str, obs_dim: int) -> None:
 
 def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
                 input_window: int = 4, with_attention: bool = False,
-                bidirection: bool = False, metadata: dict | None = None) -> str:
+                bidirection: bool = False, with_tcn: bool = False,
+                metadata: dict | None = None) -> str:
     """导出 LSTM 模型为 ONNX (v3.0: 支持 Attention + metadata_props).
 
     Args:
@@ -277,6 +278,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
         input_window: 输入窗口步数 (legacy=4, v3.0=12/24/36)
         with_attention: 是否嵌入 Attention 计算图
         bidirection: 是否导出 BiLSTM (R2)
+        with_tcn: 是否前置 TCN 特征提取层 (v3.1 R2)
         metadata: metadata_props 字典 (v3.0 必须), None 则用默认值
     """
     import torch
@@ -296,6 +298,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
     lstm_model = LSTMForecast(
         with_attention=detected_attn,
         output_mode=detected_mode,
+        with_tcn=with_tcn,
     )
     lstm_model.load_state_dict(state_dict)
     lstm_model.eval()
@@ -376,6 +379,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
         "mupc_input_window": str(input_window),
         "mupc_hidden_size": str(lstm_model.hidden_dim),
         "mupc_num_layers": str(lstm_model.num_layers),
+        "mupc_with_tcn": str(with_tcn).lower(),        # v3.1: TCN 特征提取
         "mupc_direction": "bidirectional" if bidirection else "forward",
         "mupc_version": "v3.0.1",
     }
@@ -463,6 +467,8 @@ def main():
                         help="嵌入 Attention 计算图 (v3.0)")
     parser.add_argument("--bidirectional", action="store_true",
                         help="导出 BiLSTM (v3.0 R2)")
+    parser.add_argument("--with-tcn", action="store_true",
+                        help="前置 TCN 特征提取层 (v3.1 R2)")
     parser.add_argument("--metadata", type=str, default=None,
                         help="metadata JSON 文件路径 (v3.0)")
     parser.add_argument("--to-rknn", action="store_true",
@@ -483,6 +489,7 @@ def main():
                                     input_window=getattr(args, 'input_window', 4),
                                     with_attention=getattr(args, 'with_attention', False),
                                     bidirection=getattr(args, 'bidirectional', False),
+                                    with_tcn=getattr(args, 'with_tcn', False),
                                     metadata=metadata)
             if args.to_rknn:
                 export_to_rknn(onnx_path, args.output_dir)
