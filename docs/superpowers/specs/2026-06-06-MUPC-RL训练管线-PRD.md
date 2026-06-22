@@ -2,6 +2,7 @@
 
 | 版本 | 日期 | 作者 | 状态 |
 |------|------|------|------|
+| v3.1 | 2026-06-22 | 架构师 | **[REVIEWED: PASS]** |
 | v3.0 | 2026-06-21 | 架构师 | **[REVIEWED: PASS]** |
 | v2.18 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
 | v2.17 | 2026-06-17 | 架构师 | **[REVIEWED: PASS]** |
@@ -17,15 +18,17 @@
 | v2.7 | 2026-06-11 | 架构师 | **[REVIEWED: PASS]** |
 | v2.6 | 2026-06-11 | 需求分析师 | **[REVIEWED: PASS]** |
 
-**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v3.0 (`[REVIEWED: PASS]`)
+**对应部署端 PRD:** `docs/MUPC/05-MUPC-AI引擎-PRD.md` v3.1 (`[REVIEWED: PASS]`)
 
 ---
 
+> **v3.1 变更说明 (预测增强分层混合架构完整化):** v3.0 预测增强架构全面落地。核心变更: (1) TCN 时域卷积特征提取层 (4 层因果膨胀卷积, dilation=[1,2,4,8], kernel=3, 64 filters, ~39K 参数, 默认开启, 插入在 VMD 与 LSTM 之间); (2) QuantileLoss 真分位数回归替代 Huber Loss 成为默认损失函数 (tau=[0.10, 0.50, 0.90], 支持 P90 覆盖率验证 90%±2%); (3) Data Quality 标签 (quality=0正常/1传感器异常/2通信中断/3调度接管, quality>=1 样本不参与 LSTM 训练); (4) ACT-05 方向约束增强 (dispatch_p>0 → p_ref>=0, 调度要求放电时禁止充电); (5) Models 包结构落地 (models/lstm.py, models/error_correction.py, models/vmd.py); (6) mupc_env/ 模块化拆分 (action_validator, observation, rewards, constants, voltage_sim 独立模块); (7) ACT-02 Δk_droop 上限修正 30→10 kW/V/步 (对齐下游 PRD §6.5); (8) CONTRACT_DEMAND 修正 300→200 kW (对齐下游)。**关联文档**: `docs/superpowers/specs/2026-06-06-MUPC-RL训练管线-设计文档.md` v3.1 [DESIGN_APPROVED]。
+>
 > **v3.0 变更说明 (预测增强分层混合架构):** LSTM 时序预测模型系统性升级, 对齐下游 v3.0 预测增强分层混合架构。核心变更: (1) 新增 AdditiveAttention (Bahdanau) 注意力机制嵌入 ONNX 计算图 (全 ONNX 标准算子: Gemm+Tanh+Softmax+Mul+ReduceSum); (2) LSTM 输出维度从 (B, 47) 单头点预测升级为 (B, 2, 15, 3) 六头分位数预测 (PV/Load × 15步 × P10/P50/P90); (3) ONNX 导出新增 metadata_props 10 键 (mupc_model_type/with_attention/with_vmd/mic_topk/output_horizon/input_window/hidden_size/num_layers/direction/version); (4) train.py 新增 --config JSON 参数 (MSSA 超参搜索接口) + stdout 结构化 MAPE 输出 (PV_MAPE= LOAD_MAPE=); (5) 新增 MIC 特征筛选 JSON 数据交换接口; (6) 新增 compute_data_fingerprint() 训练数据指纹; (7) LSTMForecast 双模式 (legacy 47维 向后兼容 / p10p50p90 90维 新分位数)。**向后兼容**: 所有新功能通过 feature flag 控制 (with_attention, output_mode, --config), 不传新参数等价于 v2.18 行为。**关联文档**: `docs/superpowers/notes/上游训练管线-MUPC-AI2-改造要求.md` [REVIEWED: PASS], `docs/superpowers/specs/2026-06-21-MUPC-RL训练管线-v3.0-设计文档.md` [DESIGN_APPROVED]。
 
 > **v2.17 变更说明（观测空间 78 维扩展 + SB3 升级为主路径）：** v2.15 动作空间已精简为 2 维同质 tanh（`[p_ref, k_droop]`），SB3 `MlpPolicy` 完全支持。`train.py` 不再硬编码 `_train_numpy_ppo()`，新增 `--algo-backend {auto|sb3|numpy}` 参数（默认 `auto`）：SB3 + Gymnasium + Torch 三件套齐全时优先 SB3 PPO/SAC，任一缺失时自动降级到 `_ppo_core.py`（纯 NumPy PPO）。`_resolve_backend()` 辅助函数集中后端选择逻辑。`_ppo_core.py` 默认 `act_dim` 由 5 改为 2 与 v2.15 一致。训练后端选择日志显式打印（"训练后端: stable-baselines3 (主路径)" 或 "NumPy PPO (后备路径)"）。训练管线后端策略与部署端 ONNX 模型完全对齐。**v2.17 新增 (2026-06-17):** 观测空间从 63/64 维扩展至 78/79 维，对齐下游 v2.14 FusedSystemState (D1~D10 全部纳入, to_input_vector() 78 维)。D3 新增 peak_price/valley_price (仅 EnvState, 不入向量)，D6 新增 dispatch_q_set (仅 EnvState, 不入向量)，D10 新增 17 维概率负荷预测。mupc_env/ 模块化拆分。ActionValidator ACT-07→ACT-05 编号统一。
 
-> **v2.15 变更说明（对齐部署端 v2.15，5D→2D 动作空间精简）：** 对齐部署端 AI 引擎 PRD v2.15 动作空间精简。RL 输出从 5 维（`[p_ref, k_droop, load_shedding, pv_limit, confidence]`）精简为 2 维（`[p_ref, k_droop]`，全 tanh 同质激活）：`load_shedding`/`pv_limit` 下沉至 strategy-engine 本地策略（不在 RL 动作空间），`confidence` 改为 ModelOutput 元数据（不在 RL 动作空间）。动作空间维度统一（无下垂模式默认 2 维、有下垂模式也 2 维）。ActionValidator 约束规则由 5 条（ACT-01/03/04/05/07）精简为 4 条（ACT-01/02/03/04 + ACT-05）。`MupcPolicy` 自定义 SB3 策略退役（v2.13 的异构激活已不存在），直接使用 SB3 `MlpPolicy`。观测空间维度 63/64 维 (v2.17 扩展至 78/79)。Q_batt 仍由实时电压调节器闭环给出，不经过 RL 动作空间。下沉维度默认值：`load_shed=0.0`、`pv_limit=1.0`、`confidence=0.5`。
+> **v2.15 变更说明（对齐部署端 v2.15，5D→2D 动作空间精简）：** 对齐部署端 AI 引擎 PRD v2.15 动作空间精简。RL 输出从 5 维（`[p_ref, k_droop, load_shedding, pv_limit, confidence]`）精简为 2 维（`[p_ref, k_droop]`，全 tanh 同质激活）：`load_shedding`/`pv_limit` 下沉至 strategy-engine 本地策略（不在 RL 动作空间），`confidence` 改为 ModelOutput 元数据（不在 RL 动作空间）。动作空间维度统一（无下垂模式默认 2 维、有下垂模式也 2 维）。ActionValidator 约束规则由旧版 5 条（ACT-01/03/04/05/07）精简为 4+1 条（ACT-01/02/03/04 + ACT-05 条件触发）。`MupcPolicy` 自定义 SB3 策略退役（v2.13 的异构激活已不存在），直接使用 SB3 `MlpPolicy`。观测空间维度 63/64 维 (v2.17 扩展至 78/79)。Q_batt 仍由实时电压调节器闭环给出，不经过 RL 动作空间。下沉维度默认值：`load_shed=0.0`、`pv_limit=1.0`、`confidence=0.5`。
 
 > **v2.16 变更说明（对齐部署端 v2.14）：** SafetyOverride精细化实现。D9新增safety_override_consecutive（连续触发次数）和safety_override_ratio（滑动窗口覆盖比例），移除safety_override_reason_code（下游v2.14已移除），D9从5字段缩减为4字段对齐下游。time_period_encoding从1维binary改为2维one-hot对齐下游。SCENE-01奖励函数新增分层SafetyOverride惩罚。P-Q协同度与SafetyOverride互斥。修正_normalize_obs索引偏移bug（q_realtime_margin归属D7 identity，load预测归一化索引[25..40]）。训练管线对齐下游v2.14 PRD。**2026-06-17**: 观测空间从 63/64 扩展至 78/79 维 (v2.17)。
 
@@ -49,14 +52,12 @@
 >
 > **v2.5 变更说明：** 对齐部署端 PRD v2.5。状态空间从 56/57 维扩展为 58/59 维（新增 D5 气象 2 维 + 修正 D2 光伏/负荷预测偏移）。观测空间索引修正 [24..39] → [25..39]。
 >
-> **v2.4 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
+> **v2.4 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。**注意**：原 v2.1 版本与此版本内容相同（首次引入分层控制架构），合并录此不再重复。
 >
 > **v2.3 变更说明：**集成 Grid2Op + Pandapower电压仿真替换（2026-06-09）。将 VoltageSimulator 替换为 Grid2Op 物理仿真引擎，三相电压基于真实潮流计算。原有 PRD v2.2 规格（58/59维观测、2维动作、5场景奖励）全部保留，新增电压仿真引擎切换开关 `use_grid2op`。性能目标：每步仿真 ≤ 50ms（lightsim2grid 加速）。
 >
 > **v2.2 变更说明：** 对齐部署端 PRD v2.5。状态空间从 48/49 维扩展为 56/57 维（新增 D7: q_realtime_margin + season_encoding + time_period_encoding）。SCENE-01 奖励函数新增自适应损耗系数 α(s) ∈ {3.0, 0.2, 1.0}、条件触发电压惩罚（仅当 q_realtime_margin ≤ 10% 且越限 ≥2 步）和弃光电压前置条件（v_avg ≥ 1.05 → R_pv = 0）。观测空间维度更新。
 >
-> **v2.1 变更说明：** 对齐部署端 PRD v2.4。动作空间从 4 维缩减为 2 维（分层控制架构：Q 控制交由实时控制核心闭环，RL 仅输出 P_batt + Load_shedding）。SCENE-01 奖励函数新增电压死区（±5%，越限连续 2 步触发）和 R_ramp 功率变化率惩罚（归一化到 C-rate）。MODE-01 权重表新增 w4（电压质量）、w5（功率变化率）。ACT-02/ACT-04 约束规则移除（由实时控制处理）。
-
 ---
 
 ## 1. 产品概述
@@ -100,10 +101,10 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 数据获取 | 文件读取 | DataSourceAdapter trait (TCP/MQTT/HTTP/Event) |
 | LSTM 预测 | 训练环境生成（作为状态输入给 RL） | RKNN Runtime 实时推理 |
 | 推理框架 | 不涉及 | RKNN Runtime (NPU) |
-| 动作校验 | 环境内部 clamp | ActionValidator (5条规则) |
+| 动作校验 | 环境内部 clamp | ActionValidator (4+1条规则) |
 | 电压仿真 | Grid2Op + Pandapower 三相潮流（可切换简化模型） | 实时数据 |
 
-> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v2.6。差异仅在于数据获取方式和电压仿真的实现方式。
+> **关键原则：** 训练环境的观测空间、动作空间和奖励函数规格完全对齐部署端 PRD v3.1。差异仅在于数据获取方式和电压仿真的实现方式。
 
 ### 1.3 目标平台
 
@@ -151,7 +152,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | F2 | MUPC 全状态环境仿真 | P0 | 78/79 维观测 + 2 维动作 + 5 种场景奖励的 Gymnasium 环境 |
 | F3 | LSTM 时序预测模型训练 | P0 | 光伏/负荷预测，输出 15 分钟预测向量 |
 | F4 | 多模式 RL 训练 | P0 | SB3 PPO/SAC 主路径（NumPy PPO 后备），多模式单模型，78/79 维输入 (v2.17) |
-| F5 | 动作约束校验 | P0 | 5 条约束规则（ACT-01/02/03/04 + ACT-05），环境内 clamp (v2.17 编号统一) |
+| F5 | 动作约束校验 | P0 | 4+1 条约束规则（ACT-01/02/03/04 + ACT-05），环境内 clamp (v2.17 编号统一) |
 | F6 | 模型导出 | P0 | LSTM + RL 策略网络 → ONNX，含 onnxruntime 验证 |
 | F7 | 训练监控 | P1 | TensorBoard + CSV 日志，21 字段各自可追踪 |
 | F8 | Grid2Op 电压仿真 | P0 | 三相潮流计算（可切换简化 VoltageSimulator） |
@@ -169,7 +170,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | 字段 | 来源 | 说明 |
 |------|------|------|
 | pv_power | 光伏 CSV `kW Generated` 列 × 0.2 (缩放到 200kW) | D1 |
-| load_power | 负荷 per-unit CSV × `LOAD_PEAK_KW` (400kW) | D1 |
+| load_power | 负荷 per-unit CSV × `LOAD_PEAK_KW` (60kW) | D1 |
 | solar_irradiance | 光伏 CSV `PoA Irradiance` 列 | D5 |
 | temperature | 光伏 CSV `Temperature` 列 | D5 |
 
@@ -179,7 +180,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 |------|----------|------|
 | battery_soc | 环境仿真内部状态 | D1，reset 随机 [0.2, 0.8] |
 | grid_power | 计算: `P_load - P_pv + P_batt` | D1 |
-| transformer_load | 计算: `S_transformer / 500` | D1 |
+| transformer_load | 计算: `S_transformer / 200` | D1 |
 | battery_power | 上一周期动作 A1 的值 | D1 |
 | voltage_phase_a/b/c | **Grid2Op 潮流计算** 或 VoltageSimulator | D1，v2.3 Grid2Op 新增 |
 | pv_forecast_15min | **LSTM 模型预测输出**（或 Oracle 后备） | D2 |
@@ -188,7 +189,7 @@ MUPC 强化学习模型训练管线是一个运行在本地 x86 PC 上的 Python
 | next_period_price | 下一时段电价查表 | D3 |
 | price_tariff_id | 时段枚举 {0=谷,1=平,2=峰,3=尖峰} | D3 |
 | current_demand | 最近 15 分钟平均负荷功率 | D4 |
-| contract_demand | 配置文件常量（默认 300 kW） | D4 |
+| contract_demand | 配置文件常量（默认 200 kW） | D4 |
 | peak_demand_this_month | 滑动窗口跟踪本月峰值 | D4 |
 | dispatch_p_set | 大部分时间 None；虚拟电厂模式合成 | D6 |
 | dispatch_q_set | 大部分时间 None；虚拟电厂模式合成 | D6 |
@@ -305,12 +306,12 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 |------|-----|--------|
 | 变压器容量 | 200 kVA | `TRANSFORMER_KVA` |
 | 电池容量 | 100 kWh | `BATTERY_CAPACITY_KWH` |
-| 最大充放电功率 | 50 kW (p_batt 范围上限) | `P_BATT_MAX` |
+| 最大充放电功率 | 50 kW (p_ref 范围上限) | `P_BATT_MAX` |
 | 最大无功功率 | 300 kVar (q_batt 范围上限) | `Q_BATT_MAX` |
 | SOC 硬限制 | 10% ~ 90% | `SOC_MIN`, `SOC_MAX` |
 | 过载阈值 | 85% | `OVERLOAD_THRESHOLD` |
 | 时间步长 | 15 分钟 (0.25 h) | `DT` |
-| 合同需量 | 300 kW (可配置) | `CONTRACT_DEMAND` |
+| 合同需量 | 200 kW (可配置) | `CONTRACT_DEMAND` |
 | 碳排放因子 | 0.581 kg CO2/kWh (可配置) | `GRID_EMISSION_FACTOR` |
 
 #### 验收标准
@@ -335,7 +336,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 
 #### 功能描述
 
-`lstm_model.py` 训练 LSTM 模型用于光伏/负荷的 15 分钟超前预测。v3.0 新增 AdditiveAttention 注意力机制 + 分位数三通道输出。
+`models/lstm.py` 训练 LSTM 模型用于光伏/负荷的 15 分钟超前预测。v3.0 新增 AdditiveAttention 注意力机制 + 分位数三通道输出。v3.1 新增 TCN 时域卷积特征提取 + QuantileLoss 真分位数回归。
 
 **模型规格 (v3.0)**：
 
@@ -425,7 +426,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 **PPO 网络结构**：
 
 ```
-Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
+Input(78 or 79) → Linear(128) → ReLU → Linear(128) → ReLU
                        ├── actor:  Linear(2) → Tanh  (v2.15: [p_ref, k_droop], 全 tanh 同质激活)
                        └── critic: Linear(1)
 ```
@@ -455,17 +456,17 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 
 #### 功能描述
 
-遵循 MUPC AI 引擎 PRD 第 6.5 节的 5 条约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
+遵循 MUPC AI 引擎 PRD 第 6.5 节的约束规则，在环境 `step()` 中对 RL 输出的动作进行校验和 clamp。
 
-> **v2.15 变更：** 动作空间精简为 2 维 (`[p_ref, k_droop]`)，约束规则由 5 条精简为 4 条。ACT-04 由 pv_limit 改为 k_droop 范围约束，ACT-05 (load_shedding) 移除（load_shedding 已下沉至 strategy-engine）。Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。
+> **v2.15 变更：** 动作空间精简为 2 维 (`[p_ref, k_droop]`)，约束规则由旧版 5 条精简为 4+1 条（ACT-01/02/03/04 固定 + ACT-05 条件触发）。ACT-04 由 pv_limit 改为 k_droop 范围约束，ACT-05 由 load_shedding 改为 dispatch_p 方向约束（v3.1）。Q 控制（q_batt_set）由实时电压调节器闭环调节，不经过 RL。
 
 | 规则 ID | 约束条件 | 训练环境实现 |
 |---------|----------|-------------|
 | ACT-01 | \|Δp_ref\| ≤ 50 kW/步 | 计算变化率，超标则 clamp |
-| ACT-02 | \|Δk_droop\| ≤ 30 kW/V/步 (v2.17) | 计算变化率，超标则 clamp |
+| ACT-02 | \|Δk_droop\| ≤ 10 kW/V/步 (v3.1 对齐下游 PRD §6.5) | 计算变化率，超标则 clamp |
 | ACT-03 | √(p_ref² + k_droop²) ≤ 200 kVA (S-circle, v2.17) | 超出边界则缩放 |
 | ACT-04 | k_droop ∈ [-100, 100] kW/V (v2.17) | 超出边界则 clamp |
-| ACT-05 | dispatch_p 有效时 \|p_ref\| ≤ \|dispatch_p\| | 有调度时 clamp |
+| ACT-05 | dispatch_p > 0 时 p_ref ≥ 0 (方向约束, v3.1) | 调度要求放电时禁止充电 |
 
 > 部署端 ActionValidator 在 Rust 端同样实现这些规则。训练时在环境内执行校验，让 RL agent 在与部署相同的约束下学习。
 
@@ -485,7 +486,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 
 `export_onnx.py` 导出两种模型为 ONNX：
 
-1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, 4, 6) (batch, seq_len, features), 输出 (1, 47) (v2.18: pv15+load15+D10_17)
+1. **LSTM 预测模型**：`lstm_forecast.onnx`，输入 (1, W, K) (batch, input_window=24, MIC features=7), 输出 (1, 2, 15, 3) (v3.1: PV/Load × 15步 × P10/P50/P90)
 2. **RL 策略网络**：`rl_policy.onnx`，输入 (1, 78) 或 (1, 79) (v2.14 对齐下游)，输出 (1, 2) (v2.15: [p_ref, k_droop])
 
 导出流程：
@@ -500,7 +501,7 @@ Input(63 or 64) → Linear(128) → ReLU → Linear(128) → ReLU
 | ID | 标准 | 验证方法 |
 |----|------|----------|
 | F6-01 | RL 策略 ONNX 输入 (1, 78/79) 输出 (1, 2) | 检查 ONNX spec (v2.17) |
-| F6-02 | LSTM ONNX 输入 (1, 4, 6) 输出 (1, 47) (v2.18) | 检查 ONNX spec |
+| F6-02 | LSTM ONNX 输入 (1, W, K) 输出 (1, 2, 15, 3) (v3.1) | 检查 ONNX spec |
 | F6-03 | ONNX 推理与 PyTorch 推理误差 < 1e-5 | 单元测试 |
 | F6-04 | 导出文件名含时间戳 | 检查文件名 |
 | F6-05 | 无 SB3 checkpoints 时自动从 npz 导出 | 测试 npz 路径 |
@@ -643,8 +644,8 @@ python train.py --mode MODE-01 --total-timesteps 1000000 --no-grid2op
 
 | 场景 | 处理 |
 |------|------|
-| SOC 达 90% 仍收到充电指令 | p_batt clamp 为 0，info 标记 `soc_clipped` |
-| SOC 达 10% 仍收到放电指令 | p_batt clamp 为 0，info 标记 `soc_clipped` |
+| SOC 达 90% 仍收到充电指令 | p_ref clamp 为 0，info 标记 `soc_clipped` |
+| SOC 达 10% 仍收到放电指令 | p_ref clamp 为 0，info 标记 `soc_clipped` |
 | load_rate > 150% | 安全惩罚急剧增长，但仍允许 step |
 | 电压超出 [0.85, 1.15] | Grid2Op 模式：潮流不收敛标记；VoltageSimulator 模式：clamp 到边界值 |
 
@@ -687,23 +688,48 @@ python train.py --mode MODE-01 --total-timesteps 1000000 --no-grid2op
 
 ```
 MUPC-AI2/
-├── data_loader.py              # F1: 数据加载 + 状态合成
-├── mupc_env.py # F2: Gymnasium 环境 (78/79维, 2维动作, Grid2Op集成, v2.17)
-├── lstm_model.py             # F3: LSTM 训练
-├── train.py                  # F4: RL 训练主入口
-├── action_validator.py       # F5: 动作约束校验
-├── export_onnx.py # F6: ONNX 导出
-├── _ppo_core.py              # 纯 NumPy PPO 后备
-├── _gym_stub.py # Gymnasium 最小替代
-├── mupc_env/grid2op/             # F8: Grid2Op 电压仿真引擎
+├── data_loader.py              # F1: SMART-DS + 中国合成 + Data Quality标签
+├── mupc_env/                   # F2: Gymnasium 环境 (包结构, v3.1)
 │   ├── __init__.py
-│   ├── numpy_chronics.py     # NumpyChronics: data dict → Grid2Op 格式
-│   ├── power_flow.py # Grid2OpPowerFlow: Grid2Op 引擎封装
-│   ├── network.py           # create_mupc_network(): Pandapower 拓扑
-│   └── backend.py           # Backend 选择 (lightsim vs pandapower)
+│   ├── core.py                 # MupcEnv 主环境类
+│   ├── observation.py          # 78/79 维观测构建与归一化
+│   ├── rewards.py              # 5场景奖励函数
+│   ├── constants.py            # 物理常量 + 权重 + 归一化边界
+│   ├── action_validator.py     # F5: ACT-01~05 约束校验 (4+1条)
+│   ├── voltage_sim.py          # VoltageSimulator 降级模型
+│   └── grid2op/                # F8: Grid2Op+Pandapower 电压仿真
+│       ├── __init__.py
+│       ├── numpy_chronics.py   # NumpyChronics: data dict → Grid2Op 格式
+│       ├── power_flow.py       # Grid2OpPowerFlow: Grid2Op 引擎封装
+│       ├── network.py          # create_mupc_network(): Pandapower 拓扑
+│       └── backend.py          # Backend 选择 (lightsim vs pandapower)
+├── models/                     # v3.1: ML 模型包
+│   ├── __init__.py
+│   ├── lstm.py                 # F3: LSTM+Attention+TCN+BiLSTM+QuantileLoss
+│   ├── error_correction.py     # BiLSTM 误差修正 (v3.0 R2)
+│   └── vmd.py                  # VMD 变分模态分解 (v3.0 R2)
+├── config/                     # YAML 配置管理
+│   ├── __init__.py
+│   ├── config_manager.py
+│   └── mupc_env_config.yaml
+├── tools/                      # 训练辅助工具
+│   ├── __init__.py
+│   ├── eval_unified.py
+│   ├── diagnose_mode2.py
+│   └── diag_m1.py
+├── tests/                      # 单元/集成测试
+│   ├── __init__.py
+│   ├── test_modes.py
+│   ├── test_grid2op_replacement.py
+│   └── record_golden.py
+├── train.py                    # F4: RL 训练主入口 (SB3 PPO/SAC 主路径)
+├── _ppo_core.py                # 纯 NumPy PPO 后备
+├── _gym_stub.py                # Gymnasium 最小替代
+├── export_onnx.py              # F6: ONNX 导出 (含 metadata_props 11键)
+├── mupc_env.py                 # 兼容性重定向: from mupc_env.core import MupcEnv
 ├── data/
-│   ├── download_smart_ds.py # 数据集下载
-│   └── smart_ds/ # SMART-DS 数据
+│   ├── download_smart_ds.py
+│   └── smart_ds/               # SMART-DS 数据
 ├── checkpoints/
 ├── exported_models/
 └── tensorboard_logs/
@@ -731,7 +757,7 @@ MUPC-AI2/
 | 4 | ACT-04 约束规则恢复 | 3.5 | pv_limit ∈ [0,1] 约束规则重新加入 |
 | 5 | SCENE-01 新增 w6 电压斜率惩罚 | 3.5 | R_slope = w6·|ΔV|，迫使 AI 平滑调节 |
 | 6 | 更新部署端 PRD 版本引用 | 文档头部 | v2.5 → v2.6 |
-| 7 | 动作值域修正 | 3.2 | p_batt [-500,500]→[-50,50]，load_shedding [0,500]→[0,60] |
+| 7 | 动作值域修正 | 3.2 | p_ref [-500,500]→[-50,50]，load_shedding [0,500]→[0,60] |
 
 **修订依据：** 对齐 MUPC AI 引擎 PRD v2.6，物理参数与实际设备规格一致
 
@@ -802,7 +828,7 @@ MUPC-AI2/
 | 3 | 新增 F4-09/F4-10 验收标准 | 3.4 | 验证训练启动日志显示正确的后端选择 |
 | 4 | 依赖检测升级 | 4.3 | `has_sb3` 同时检查 SB3/Gymnasium/Torch |
 | 5 | 性能目标微调 | 4.1 | SB3 PPO 实测 ~390 fps (CPU), 训练吞吐目标由 500→300 steps/s |
-| 6 | F5 约束规则编号更新 | 3.5 | ACT-04 由 pv_limit 改为 k_droop 范围约束, ACT-05 (load_shedding) 移除 |
+| 6 | F5 约束规则编号统一 | 3.5 | ACT-04 由 pv_limit 改为 k_droop 范围约束, ACT-05 由 load_shedding 改为 dispatch_p 条件约束 |
 | 7 | 更新部署端 PRD 版本引用 | 文档头部 | v2.14 → v2.15 |
 
 ## v2.15 修订记录 (动作空间 5D→2D)
@@ -812,7 +838,7 @@ MUPC-AI2/
 | 1 | 动作空间 5 维→2 维 | 1.1/3.2/3.4/3.6/3.7/7 | 对齐部署端 AI 引擎 PRD v2.15, 动作空间精简为 `[p_ref, k_droop]` 全 tanh 同质激活 |
 | 2 | load_shedding/pv_limit 下沉 | 3.2/3.4/3.5 | 下沉至 strategy-engine 本地策略, 不在 RL 动作空间 |
 | 3 | confidence 改为元数据 | 3.2 | confidence 改为 ModelOutput 元数据, 不在 RL 动作空间 |
-| 4 | ActionValidator 约束规则精简 | 3.5 | 5 条 (ACT-01/03/04/05/07) → 4 条 (ACT-01/02/03/04 + ACT-05) |
+| 4 | ActionValidator 约束规则重构 | 3.5 | 旧版 5 条 (ACT-01/03/04/05/07) → 新版 4+1 条 (ACT-01/02/03/04 + ACT-05) |
 | 5 | SB3 MupcPolicy 自定义策略退役 | 3.4 | v2.13 异构激活已不存在, 直接使用 SB3 `MlpPolicy` |
 | 6 | PPO 网络结构 actor 输出 | 3.4 | 2 维全 tanh (v2.13 时代 tanh+sigmoid 拼接已退役) |
 | 7 | Q_batt 实时控制说明 | 3.2 | Q_batt 由实时电压调节器闭环给出, 不经过 RL 动作空间 |
