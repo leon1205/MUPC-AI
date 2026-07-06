@@ -535,7 +535,7 @@ class LSTMForecast:
         x = np.zeros((seq_len, self.input_dim), dtype=np.float32)
         for i, idx in enumerate(seq_indices):
             if self.input_features is not None:
-                # MIC 特征模式: 按特征名动态构建
+                # MIC/VMD 特征模式: 按特征名动态构建
                 _builders = {
                     "pv_power": lambda j: self._data["pv_power"][j],
                     "load_power": lambda j: self._data["load_power"][j],
@@ -546,6 +546,15 @@ class LSTMForecast:
                     "pv_power_lag96": lambda j: (self._data["pv_power"][j-96]
                         if j >= 96 else self._data["pv_power"][j]),
                 }
+                # v3.1 (I-1): VMD IMF 通道 — 动态注册 pv_imf_N / load_imf_N
+                _vmd_pv = self._data.get("vmd_pv_imfs")
+                _vmd_load = self._data.get("vmd_load_imfs")
+                if _vmd_pv is not None:
+                    for k in range(_vmd_pv.shape[0]):
+                        _builders[f"pv_imf_{k}"] = lambda j, _k=k: _vmd_pv[_k, j]
+                if _vmd_load is not None:
+                    for k in range(_vmd_load.shape[0]):
+                        _builders[f"load_imf_{k}"] = lambda j, _k=k: _vmd_load[_k, j]
                 for f_idx, name in enumerate(self.input_features):
                     builder = _builders.get(name)
                     if builder:
@@ -685,27 +694,49 @@ class LSTMTrainer:
         hours = data.get("hours", np.arange(len(pv), dtype=np.float32) * 15 / 60 % 24)
         quality = data.get("data_quality")  # v3.1: 质量标注
 
+        # v3.1: VMD IMF 通道扩展 (I-1) — 替换原始 pv/load 为 K 个 IMF 通道
+        pv_imfs = data.get("vmd_pv_imfs")    # (K, T) or None
+        load_imfs = data.get("vmd_load_imfs")  # (K, T) or None
+        _vmd_active = pv_imfs is not None and load_imfs is not None
+
         # v3.1: MIC 特征筛选 — 动态构建特征列表
         mic_features = self.config.get("mic_features")
-        _ALL_FEATURES = [
-            ("pv_power", lambda idx: pv[idx]),
-            ("load_power", lambda idx: load[idx]),
+        _BASE_FEATURES = [
+            ("pv_power",       lambda idx: pv[idx]),
+            ("load_power",     lambda idx: load[idx]),
             ("solar_irradiance", lambda idx: ghi[idx]),
-            ("temperature", lambda idx: temp[idx]),
-            ("hour_sin", lambda idx: math.sin(hours[idx] * 2 * math.pi / 24)),
-            ("hour_cos", lambda idx: math.cos(hours[idx] * 2 * math.pi / 24)),
+            ("temperature",    lambda idx: temp[idx]),
+            ("hour_sin",       lambda idx: math.sin(hours[idx] * 2 * math.pi / 24)),
+            ("hour_cos",       lambda idx: math.cos(hours[idx] * 2 * math.pi / 24)),
             ("pv_power_lag96", lambda idx: pv[idx - 96] if idx >= 96 else pv[idx]),
         ]
+        if _vmd_active:
+            # 替换 pv_power → K_pv IMFs, load_power → K_load IMFs
+            K_pv, K_load = pv_imfs.shape[0], load_imfs.shape[0]
+            _ALL_FEATURES = []
+            for k in range(K_pv):
+                _ALL_FEATURES.append(
+                    (f"pv_imf_{k}", lambda idx, _k=k: pv_imfs[_k, idx]))
+            for k in range(K_load):
+                _ALL_FEATURES.append(
+                    (f"load_imf_{k}", lambda idx, _k=k: load_imfs[_k, idx]))
+            # 保留 5 个非分解特征
+            for name, builder in _BASE_FEATURES[2:]:
+                _ALL_FEATURES.append((name, builder))
+            print(f"  VMD IMF 通道: PV={K_pv}, Load={K_load}, 总={len(_ALL_FEATURES)} 特征")
+        else:
+            _ALL_FEATURES = _BASE_FEATURES
         if mic_features is not None:
             selected = [(n, f) for n, f in _ALL_FEATURES if n in mic_features]
             if len(selected) == 0:
-                print(f"  [WARN] MIC 特征为空, 使用全部 7 个默认特征")
+                print(f"  [WARN] MIC 特征为空, 使用全部 {len(_ALL_FEATURES)} 个默认特征")
                 selected = _ALL_FEATURES
             else:
                 print(f"  MIC 特征: {len(selected)}/{len(_ALL_FEATURES)} ({[n for n,_ in selected]})")
         else:
             selected = _ALL_FEATURES
         input_dim = len(selected)
+        self._selected_features = [n for n, _ in selected]  # v3.1: 供 train() 设置 model.input_features
 
         # v3.0: MSSA 搜索的 input_window 优先, legacy input_seq_len 作为 fallback
         seq_len = self.config.get("input_window") or self.config["input_seq_len"]
@@ -863,7 +894,7 @@ class LSTMTrainer:
             print(f"  验证样本: {len(X_val)}")
 
         mic_features = self.config.get("mic_features")
-        model_input_dim = len(mic_features) if mic_features else 7
+        model_input_dim = X.shape[2]  # v3.1: 从 prepare_data 输出自动获取 (含 VMD IMF 扩展)
         self.model = LSTMForecast(
             input_dim=model_input_dim, hidden_dim=cfg["hidden_dim"],
             num_layers=cfg["num_layers"], forecast_steps=cfg["forecast_steps"],
@@ -874,8 +905,8 @@ class LSTMTrainer:
             with_tcn=cfg.get("with_tcn", True),   # v3.1: TCN 特征提取 (R2 默认开启)
         )
         self.model.input_window = cfg.get("input_window", 12)
-        if mic_features:
-            self.model.input_features = mic_features
+        # v3.1 (I-1): 设置 VMD/MIC 特征名, 供 predict() 动态特征构建
+        self.model.input_features = getattr(self, '_selected_features', mic_features)
         self.model.to(self.device)
 
         optimizer = _torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])
