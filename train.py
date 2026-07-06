@@ -78,6 +78,8 @@ def parse_args():
                    help="模型保存目录")
     p.add_argument("--no-lstm", action="store_true",
                    help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
+    p.add_argument("--train-lstm", action="store_true",
+                   help="仅训练 LSTM + 误差修正, 不跑 RL (供 MSSA/MIC 使用)")
     p.add_argument("--no-error-correction", action="store_true",
                    help="跳过 BiLSTM 误差修正训练 (v3.1, 默认启用, 约增1-2分钟)")
     p.add_argument("--use-grid2op", action="store_true", default=True,
@@ -229,6 +231,30 @@ def main():
             mapped[target_k] = v
         lstm_cfg.update({k: v for k, v in mapped.items() if k in KNOWN_KEYS})
 
+    # v3.1: MIC 特征筛选 → 传递给 LSTMTrainer
+    mic_features = None
+    if args.mic:
+        selected, top_k = load_mic_features(args.mic)
+        print(f"\n── MIC 特征筛选 ──")
+        print(f"  选中 {len(selected)}/{top_k} 特征: {selected}")
+        mic_features = selected
+        lstm_cfg["mic_features"] = selected
+        lstm_cfg["mic_top_k"] = top_k
+
+    # v3.1: MSSA 搜索结果 → 覆盖 lstm_cfg
+    if args.mssa_result:
+        mssa_best = load_mssa_result(args.mssa_result)
+        print(f"\n── MSSA 搜索结果加载 ──")
+        # 将 MSSA 最优超参映射到 lstm_cfg (仅覆盖未在 --config 中指定的键)
+        mssa_key_map = {"hidden_size": "hidden_dim", "lr": "learning_rate"}
+        for mssa_k, cfg_k in mssa_key_map.items():
+            if mssa_k in mssa_best and cfg_k not in lstm_cfg:
+                lstm_cfg[cfg_k] = mssa_best[mssa_k]
+        for k in ["num_layers", "batch_size", "input_window", "dropout"]:
+            if k in mssa_best and k not in lstm_cfg:
+                lstm_cfg[k] = mssa_best[k]
+        print(f"  已合并超参: { {k: lstm_cfg[k] for k in ['hidden_dim','num_layers','input_window'] if k in lstm_cfg} }")
+
     # ── LSTM / Oracle ────────────────────────────────────
     predictor = None
     lstm_metrics = {}  # v3.0: 训练指标供 stdout 输出
@@ -277,7 +303,7 @@ def main():
                         bias_load = ec_result.get("bias_load", 0.0)
                         skip_reason = "Bias不足" if ec_result.get("skip") else "未知"
                         print(f"  误差修正跳过: {skip_reason} (PV={bias_pv:.1%}, Load={bias_load:.1%})")
-                except Exception as e:
+                except (ValueError, RuntimeError, ImportError) as e:
                     print(f"[WARN] 误差修正训练失败 (不影响主流程): {e}")
         except Exception as e:
             import traceback
@@ -288,6 +314,17 @@ def main():
         from models.lstm import OraclePredictor
         print("\n── 使用 Oracle 预测 ──")
         predictor = OraclePredictor(train_data)
+
+    # v3.1: --train-lstm 仅训练 LSTM + 误差修正, 不跑 RL (MSSA/MIC 工作流)
+    if args.train_lstm:
+        print(f"\n{'=' * 56}")
+        print(f"  LSTM 训练完成 (--train-lstm, 跳过 RL)")
+        if lstm_metrics:
+            pv_mape = lstm_metrics.get("pv_mape_step1", lstm_metrics.get("pv_mape", -1.0))
+            load_mape = lstm_metrics.get("load_mape_step1", lstm_metrics.get("load_mape", -1.0))
+            print(f"PV_MAPE={pv_mape:.4f} LOAD_MAPE={load_mape:.4f}")
+        print(f"{'=' * 56}")
+        return
 
     # ── 环境创建 ────────────────────────────────────────
     print("\n── 环境创建 ──")

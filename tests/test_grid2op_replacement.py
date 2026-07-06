@@ -73,7 +73,7 @@ def _get_data():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def ut_01_init():
-    """UT-01: MupcEnv 初始化 — 不报错，observation_space.shape == (63,) 或 (64,)"""
+    """UT-01: MupcEnv 初始化 — 不报错，observation_space.shape == (78,) 或 (79,)"""
     print("\n[UT-01] MupcEnv 初始化测试")
     try:
         from mupc_env import MupcEnv
@@ -82,7 +82,7 @@ def ut_01_init():
         for mode in ["MODE-01", "all"]:
             try:
                 env = MupcEnv(data, mode=mode)
-                obs_dim = 63 if mode != "all" else 64
+                obs_dim = 78 if mode != "all" else 79
                 if env.observation_space.shape == (obs_dim,):
                     _record(f"UT-01 [{mode}]", True)
                 else:
@@ -95,13 +95,13 @@ def ut_01_init():
 
 
 def ut_02_reset_obs_dim():
-    """UT-02: reset() 返回正确的观测维度 — obs.shape[0] == 63 或 64"""
+    """UT-02: reset() 返回正确的观测维度 — obs.shape[0] == 78 或 79"""
     print("\n[UT-02] reset() 观测维度测试")
     try:
         from mupc_env import MupcEnv
         data = _get_data()
 
-        for mode, expected_dim in [("MODE-01", 63), ("all", 64)]:
+        for mode, expected_dim in [("MODE-01", 78), ("all", 79)]:
             env = MupcEnv(data, mode=mode)
             obs, info = env.reset()
             if obs.shape[0] == expected_dim:
@@ -399,7 +399,7 @@ def it_03_onnx_export():
             obs, _, _, _, _ = env.step(action)
             observations.append(obs)
 
-        obs_dim = 63
+        obs_dim = 78
         hidden_dim = 128
 
         # 训练一个简单的 PyTorch 模型

@@ -62,7 +62,8 @@ class QuantileLoss:
         losses = []
         for i, q in enumerate(self.quantiles):
             error = target[..., i] - pred[..., i]
-            losses.append(_torch.max(q * error, (q - 1) * error))
+            loss_i = _torch.max(q * error, (q - 1) * error)
+            losses.append(_torch.nan_to_num(loss_i, nan=0.0, posinf=1e6, neginf=-1e6))
         return _torch.mean(_torch.stack(losses))
 
 class AdditiveAttention:
@@ -585,9 +586,11 @@ LSTM_TRAIN_CONFIG = {
     "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
     "quantile_taus": [0.1, 0.5, 0.9],  # v3.1: 分位数目标 (仅 loss="quantile" 时使用)
     "with_tcn": True,                # v3.1: TCN 前置特征提取 (R2 默认开启)
-    "vmd_enabled": False,            # v3.1: VMD 信号分解预处理 (R2 可选)
+    "vmd_enabled": False,            # v3.1: VMD 信号分解预处理 (实验性, 需 vmdpy + IMF 通道扩展)
     "vmd_k": 5,                      # v3.1: VMD 模态数 (光伏默认5, 负荷默认6)
     "vmd_alpha": 2000,               # v3.1: VMD 带宽约束
+    # 注意: VMD 启用后需要 prepare_data() 实现 IMF 通道扩展 (input_dim × K)
+    # 当前为实验性骨架, prepare_data() 暂未使用 vmd_pv_imfs/vmd_load_imfs
 }
 
 

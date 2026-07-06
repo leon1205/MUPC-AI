@@ -190,7 +190,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             from mupc_env.grid2op.network import create_mupc_network
             from mupc_env.grid2op.backend import is_grid2op_available
         except ImportError as e:
-            print(f"[WARN] grid2op_env 不可用, 降级到 VoltageSimulator: {e}")
+            print(f"[WARN] mupc_env.grid2op 不可用, 降级到 VoltageSimulator: {e}")
             return
 
         if not is_grid2op_available():
@@ -652,14 +652,13 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "dispatched": dispatched,     # v3.1: 调度接管标记
             **reward_info,
         }
+        # v3.1: 一次 forecast, 同时用于 terminal_obs 和返回 obs
+        forecast = self._predictor.predict(self._step_idx)
         if terminated or truncated:
-            forecast = self._predictor.predict(self._step_idx)
             state = self._make_env_state(forecast=forecast)
             info["terminal_observation"] = observation.build_observation(state, forecast)
 
-        forecast = self._predictor.predict(self._step_idx)
         state = self._make_env_state(forecast=forecast)
-        forecast = self._predictor.predict(self._step_idx)
         obs = observation.build_observation(state, forecast)
         return obs, float(reward), terminated, truncated, info
 

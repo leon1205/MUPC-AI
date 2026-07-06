@@ -25,7 +25,8 @@ SEARCH_SPACE = [
     ("batch_size", "discrete", [16, 32, 64, 128], 0),
     # dim 7: dropout
     ("dropout", "continuous", [0.0, 0.5], 3),
-    # dim 8: attn_type (当前仅 additive, 保留扩展)
+    # dim 8: attn_type (当前仅 additive, 预留扩展 dot_product/scaled_dot)
+    # 扩展时更新枚举值列表, 编解码自动适配
     ("attn_score", "enum", ["additive"], 0),
     # dim 9: optimizer
     ("optimizer", "enum", ["Adam", "AdamW"], 0),
