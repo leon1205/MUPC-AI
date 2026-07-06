@@ -96,12 +96,14 @@ def _load_sb3_weights(checkpoint_path: str, obs_dim: int) -> dict:
     try:
         model = PPO.load(checkpoint_path)
         state_dict = model.policy.state_dict()
-    except Exception:
+    except Exception as e1:
         try:
             model = SAC.load(checkpoint_path)
             state_dict = model.policy.state_dict()
-        except Exception as e:
-            raise RuntimeError(f"无法加载 SB3 checkpoint: {checkpoint_path}") from e
+        except Exception as e2:
+            raise RuntimeError(
+                f"无法加载 SB3 checkpoint: {checkpoint_path} "
+                f"(PPO={e1}, SAC={e2})")
     return state_dict
 
 def _load_npz_weights(npz_path: str, obs_dim: int) -> dict:
@@ -173,8 +175,13 @@ def export_rl_policy(
         from stable_baselines3 import PPO, SAC
         try:
             sb3_model = PPO.load(checkpoint_path)
-        except Exception:
-            sb3_model = SAC.load(checkpoint_path)
+        except Exception as e1:
+            try:
+                sb3_model = SAC.load(checkpoint_path)
+            except Exception as e2:
+                raise RuntimeError(
+                    f"无法加载 SB3 checkpoint: {checkpoint_path} "
+                    f"(PPO={e1}, SAC={e2})")
         state_dict = sb3_model.policy.state_dict()
 
         # SB3 policy 使用 mlp_extractor 结构

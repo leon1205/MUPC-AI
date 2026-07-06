@@ -323,6 +323,9 @@ def main():
             pv_mape = lstm_metrics.get("pv_mape_step1", lstm_metrics.get("pv_mape", -1.0))
             load_mape = lstm_metrics.get("load_mape_step1", lstm_metrics.get("load_mape", -1.0))
             print(f"PV_MAPE={pv_mape:.4f} LOAD_MAPE={load_mape:.4f}")
+            import json as _json
+            _mssa_out = {"pv_mape": pv_mape, "load_mape": load_mape}
+            print(f"MSSA_RESULT={_json.dumps(_mssa_out)}")
         print(f"{'=' * 56}")
         return
 
@@ -513,7 +516,7 @@ def _train_sb3(env, eval_env, args):
         checkpoint_path = os.path.join(args.checkpoint_path, "interrupted_model")
         model.save(checkpoint_path)
         print(f"\n训练中断, 模型已保存: {checkpoint_path}.zip")
-        sys.exit(0)
+        sys.exit(130)
 
 
 # ── NumPy PPO 训练 ────────────────────────────────────────────
@@ -536,7 +539,7 @@ def _train_numpy_ppo(env, eval_env, args, obs_dim):
         weights_path = os.path.join(args.checkpoint_path, "ppo_weights_interrupted.npz")
         model.save_weights(weights_path)
         print(f"\n训练中断, 权重已保存: {weights_path}")
-        sys.exit(0)
+        sys.exit(130)
 
 
 # ═══════════════════════════════════════════════════════════════

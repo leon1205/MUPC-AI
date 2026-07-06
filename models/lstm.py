@@ -9,6 +9,7 @@ v3.0 增强: AdditiveAttention + 分位数三通道输出 (P10/P50/P90).
   p10p50p90 模式: 输入 (B, T, K) → 输出 (B, 2, 15, 3)  v3.0
 """
 
+import importlib
 import math
 import numpy as np
 from typing import Optional
@@ -1085,7 +1086,7 @@ if __name__ == "__main__":
         print(f"\nOracle 自测通过。")
 
         # 可选: LSTM 训练 (如有 PyTorch)
-        if _TORCH_AVAILABLE or __import__('importlib').util.find_spec('torch'):
+        if _TORCH_AVAILABLE or importlib.util.find_spec('torch'):
             print("\n开始 LSTM 训练自测...")
             trainer = LSTMTrainer({"epochs": 5, "batch_size": 32})
             result = trainer.train(train, val)

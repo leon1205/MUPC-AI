@@ -38,8 +38,8 @@ def _get_data():
         data = loader.load_all()
         train, _ = loader.split(data)
         return train
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] SMART-DS 加载失败, 使用合成数据: {e}")
 
     # 降级：构造合成数据
     n_steps = 300

@@ -106,7 +106,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
                 k_droop_max = config.dual_control.k_droop_max
                 delta_p_max = config.dual_control.p_ref_ramp_limit_kw
                 delta_k_max = config.dual_control.k_droop_ramp_limit
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
         self._validator = ActionValidator(
             p_batt_max=constants.P_BATT_MAX_KW,
@@ -433,7 +433,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         if self._use_grid2op_active and self._grid2op_pf is not None:
             try:
                 self._grid2op_pf.reset(initial_storage_soc=self._soc)
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
 
         forecast = self._predictor.predict(self._step_idx)

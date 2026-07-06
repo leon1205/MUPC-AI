@@ -1,6 +1,9 @@
 """Verify different modes give different training results."""
 import os, sys
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+import pathlib
+
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 from data_loader import SmartDSLoader
 from mupc_env import MupcEnv
 from models.lstm import OraclePredictor
@@ -8,6 +11,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 import torch.nn as nn
+
+if __name__ != "__main__":
+    raise SystemExit("This script is meant to be run directly, not imported")
 
 loader = SmartDSLoader()
 train, val = loader.split(loader.load_all())

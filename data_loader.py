@@ -449,6 +449,7 @@ class SmartDSLoader:
 
         # quality=1: 传感器异常检测
         # 连续恒值 > 2h (= 8 步 × 15min)
+        # 优化: 可改用 sliding_window_view 向量化 (n=35040 时 ~2x 加速, 非关键路径)
         const_min_steps = 8
         for arr, name in [(pv, "pv_power"), (load, "load_power")]:
             for i in range(n - const_min_steps + 1):

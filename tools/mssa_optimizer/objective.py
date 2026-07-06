@@ -79,7 +79,18 @@ class ObjectiveEvaluator:
 
         stdout = result.stdout + result.stderr
 
-        # 解析 PV_MAPE / LOAD_MAPE
+        # 解析 PV_MAPE / LOAD_MAPE (优先结构化 JSON, 降级 regex)
+        mssa_match = re.search(r"MSSA_RESULT=(\{.*\})", stdout)
+        if mssa_match:
+            try:
+                mssa_data = json.loads(mssa_match.group(1))
+                pv_mape = float(mssa_data["pv_mape"])
+                load_mape = float(mssa_data["load_mape"])
+                weighted = 0.5 * pv_mape + 0.5 * load_mape
+                return weighted
+            except (json.JSONDecodeError, KeyError):
+                pass  # 降级到 regex 解析
+
         pv_match = re.search(r"PV_MAPE=([\d.]+)", stdout)
         load_match = re.search(r"LOAD_MAPE=([\d.]+)", stdout)
 
