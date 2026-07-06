@@ -43,7 +43,7 @@ class MLPPolicy:
     load_shedding/pv_limit 下沉至 strategy-engine.
     """
 
-    def __init__(self, obs_dim: int = 78, hidden: list[int] | None = None,
+    def __init__(self, obs_dim: int = 78, hidden: list[int] | None = None,  # 对齐 mupc_env.core.MupcEnv.observation_space
                  act_dim: int = 2):
         if hidden is None:
             hidden = [128, 128]

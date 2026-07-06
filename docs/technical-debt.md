@@ -23,7 +23,7 @@
 |----|------|------|---------|--------|
 | I-1 | VMD 预处理为实验性骨架 — `_apply_vmd()` 已接入但 `prepare_data()` 未使用 IMF 通道扩展 | 启用 VMD 不改变训练数据，浪费计算 | 在 `prepare_data()` 实现 `input_dim × K` 通道扩展逻辑；或安装 vmdpy 替换骨架 | 高 |
 | I-2 | 测试文件 `test_modes.py` 缺少 `__name__ == "__main__"` 完整守护 | import 时意外执行训练 | 将业务逻辑包裹入 `main()` 函数 | 中 |
-| I-3 | `export_onnx.py` 的 `SB3→SAC` fallback 在文件损坏时静默重试，无日志（第 97-104 行） | 排查困难 | 添加 DEBUG 级别日志记录原始异常 | 低 |
+| I-3 | ✅ SB3→SAC fallback 无日志 | 排查困难 | RuntimeError 已保留 PPO/SAC 原始异常信息 | ~~低~~ |
 
 ---
 

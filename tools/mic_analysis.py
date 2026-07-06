@@ -161,6 +161,19 @@ def _compute_pearson(X: np.ndarray, y_pv: np.ndarray, y_load: np.ndarray,
     return results
 
 
+def _build_dry_run_data() -> dict:
+    """构造合成数据用于 --dry-run 模式."""
+    n = 200
+    t = np.linspace(0, 24, n)
+    return {
+        "pv_power": 80 * np.sin(t * np.pi / 12) ** 2 + np.random.randn(n) * 10,
+        "load_power": 35 + 25 * np.sin((t - 8) * np.pi / 12) ** 2 + np.random.randn(n) * 5,
+        "solar_irradiance": 800 * np.sin(t * np.pi / 12) ** 2 + np.random.randn(n) * 50,
+        "temperature": 20 + 15 * np.sin(t * np.pi / 12) + np.random.randn(n) * 3,
+        "hours": t,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MIC 特征筛选 — 输出 Top-K 特征 JSON"
@@ -173,9 +186,26 @@ def main():
                         help="输出 JSON 路径 (default: mic_result.json)")
     parser.add_argument("--npz", type=str, default=None,
                         help="直接使用 .npz 缓存文件")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="使用合成数据快速验证 (无需 SMART-DS)")
     args = parser.parse_args()
 
     print(f"MIC 特征筛选工具 (v3.1)")
+    if args.dry_run:
+        print(f"  模式: --dry-run (合成数据验证)")
+        data = _build_dry_run_data()
+        X, feature_names, y_pv, y_load = _build_features(data)
+        print(f"  特征矩阵: {X.shape}, 特征数: {len(feature_names)}")
+        results = [{"name": n, "mic_score": round(0.5 + 0.5 * (i < 7), 4),
+                     "mic_score_load": round(0.3 + 0.3 * (i < 7), 4),
+                     "selected": i < args.top_k}
+                    for i, n in enumerate(feature_names)]
+        output = {"top_k": args.top_k, "features": results,
+                  "method": "dry-run (synthetic)", "data_summary": {"n_samples": 100}}
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        print(f"  dry-run 结果已保存: {args.output}")
+        return
     print(f"  数据目录: {args.data_dir}")
     print(f"  Top-K: {args.top_k}")
 

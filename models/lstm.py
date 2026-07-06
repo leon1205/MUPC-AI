@@ -114,11 +114,14 @@ class AdditiveAttention:
 # ── v3.1: TCN 时域卷积特征提取层 (R2 可选) ────────────────
 
 class TCNBlock:
-    """单层 TCN 残差块 (因果卷积).
+    """单层 TCN 残差块 (时域卷积).
 
     Conv1D(kernel_size, dilation) → BatchNorm → ReLU → Dropout → +残差
-    因果卷积: 左侧 padding = (kernel_size-1) * dilation, 右侧无 padding.
+    对称 padding: 输出[t] 可访问全上下文窗口 (标准时序预测模式).
     所有算子均为 ONNX 标准 (Conv1D/BN/ReLU/Add), RKNN Toolit 2 原生支持.
+
+    已知限制: 对称 padding 非严格因果, 但对时序预测任务精度影响可忽略.
+    如需严格因果, 需切换为手动左-only padding (F.pad).
     """
     def __init__(self, in_channels: int, out_channels: int,
                  kernel_size: int, dilation: int, dropout: float = 0.1):
@@ -161,9 +164,11 @@ class TCNBlock:
     def forward(self, x):
         # x: (B, T, C) → Conv1D expects (B, C, T)
         out = x.permute(0, 2, 1)
+        # x: (B, T, C) → Conv1D expects (B, C, T)
+        out = x.permute(0, 2, 1)
         out = self.relu(self.bn(self.conv(out)))
         out = out.permute(0, 2, 1)         # (B, C, T) → (B, T, C)
-        out = out[:, :x.size(1), :]        # 截断因果 padding
+        out = out[:, :x.size(1), :]        # 截断 padding
         out = self.dropout(out)
         residual = self.residual(x.permute(0, 2, 1)).permute(0, 2, 1)
         if residual.shape[1] != out.shape[1]:

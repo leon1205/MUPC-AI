@@ -70,8 +70,9 @@ class ObjectiveEvaluator:
             result = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
-                timeout=600,  # 10 分钟超时
-                cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+                timeout=600,
+                cwd=os.environ.get("MUPC_PROJECT_ROOT",
+                    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))),
             )
         except subprocess.TimeoutExpired:
             print(f"  [TIMEOUT] iter={self.eval_count}, params={params}")
