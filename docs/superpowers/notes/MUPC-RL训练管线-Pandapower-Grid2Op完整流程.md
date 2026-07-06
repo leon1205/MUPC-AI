@@ -199,7 +199,7 @@ wind_speed      ██                    0.08  ← 关联弱，剔除
 
 训练时通过 `--mic <json>` 传入，LSTM 只使用被选中的特征作为输入。
 
-> **对 AI 来说这层是透明的**：MIC 只在训练前跑一次，不影响推理速度。部署时特征维度固定写在配置里。
+> **对 AI 来说这层是透明的**：MIC 只在训练前跑一次，工具位于 `tools/mic_analysis.py`。部署时特征维度固定写在配置里。
 
 ---
 
@@ -618,7 +618,7 @@ LSTM 有很多"旋钮"需要调：hidden_dim 是 64 还是 128？num_layers 是 
 #### MSSA 调用流程
 
 ```
-MSSA 超参搜索通过 train.py --config JSON 接口驱动（工具端位于 tools/ 目录, 规划中）
+MSSA 超参搜索通过 train.py --config JSON 接口驱动，工具位于 `tools/mssa_optimizer/`。
   │  每轮迭代生成临时 JSON 配置文件
   │  {"hidden_size": 96, "num_layers": 2, "lr": 0.001, ...}
   │
@@ -755,11 +755,11 @@ MSSA 超参搜索通过 train.py --config JSON 接口驱动（工具端位于 to
 │  │    ACT-01: |Δp_ref| ≤ 50 kW/步                                   │  │
 │  │    ACT-02: |Δk_droop| ≤ 10 kW/V/步                              │  │
 │  │    ACT-03: √(p_ref² + k_droop²) ≤ 200 kVA (S-circle)           │  │
-│  │    ACT-04: k_droop ∈ [-100, 100] kW/V                           │  │
-│  │    ACT-05: |p_ref| ≤ |dispatch_p|                               │  │
+│  │    ACT-04: k_droop ∈ [0, 30] kW/V (v3.1 对齐下游)               │  │
+│  │    ACT-05: |p_ref| ≤ |dispatch_p| + 方向约束                     │  │
 │  │ ③ 动作反归一化                                                    │  │
-│  │    p_ref   = a[0] × 50.0       (kW)                             │  │
-│  │    k_droop = a[1] × 100.0      (kW/V)                           │  │
+│  │    p_ref   = a[0] × 50.0           (kW)                         │  │
+│  │    k_droop = a[1] × 15.0 + 15.0    (kW/V)                      │  │
 │  │ ④ SOC 更新 + 计算 grid_power / load_rate                          │  │
 │  │ ⑤ 物理仿真 (Grid2Op / VoltageSimulator)                          │  │
 │  │ ⑥ 奖励计算 (9 项归一化 + 3 项附加)                                │  │
@@ -890,7 +890,7 @@ action = model(obs)    # PPO / ONNX forward
 | 维度 | 归一化范围 | 反归一化到物理值 | 物理含义 |
 |------|-----------|-----------------|----------|
 | p_ref | [-1, 1] | × 50 → [-50, 50] kW | 电池有功基准（负=充电, 正=放电） |
-| k_droop | [-1, 1] | × 100 → [-100, 100] kW/V | 电压-有功下垂系数 |
+| k_droop | [-1, 1] | × 15 + 15 → [0, 30] kW/V | 电压-有功下垂系数 |
 
 > **v2.15 精简说明**：load_shedding（切负荷）、pv_limit（光伏限发）已下沉至 strategy-engine 本地策略，confidence 移至 ModelOutput 元数据。AI 仅输出核心 P-Q 控制的 2 维动作。
 
@@ -905,7 +905,7 @@ clamped, violated, violations = self._validator.validate(action, dispatch_p)
 | ACT-01 | \|Δp_ref\| ≤ 50 kW/步 | clamp 到 ±50 |
 | ACT-02 | \|Δk_droop\| ≤ 10 kW/V/步 | clamp 到 ±10 |
 | ACT-03 | √(p_ref² + k_droop²) ≤ 200 kVA | 等比缩放 |
-| ACT-04 | k_droop ∈ [-100, 100] kW/V | clamp 到边界 |
+| ACT-04 | k_droop ∈ [0, 30] kW/V (v3.1 对齐下游) | clamp 到边界 |
 | ACT-05 | \|p_ref\| ≤ \|dispatch_p\| | clamp 到调度限值 |
 
 **下垂控制公式（v3.1 对齐下游）**：
@@ -970,7 +970,7 @@ reset() / 上一步 step() 末尾:
     ┌──────────────┐
     │ ① q_margin   │  模拟 Q-V 闭环
     │ ② 校验       │  ACT-01~05
-    │ ③ 反归一化   │  p_ref × 50, k_droop × 100
+    │ ③ 反归一化   │  p_ref × 50, k_droop × 15 + 15
     │ ④ SOC 更新   │  soc = clip(soc ± ΔE/100, 10%, 90%)
     │ ⑤ 物理仿真   │  Grid2Op → Pandapower.runpp() → 电压
     │ ⑥ 奖励计算   │  9 项归一化 + 3 项附加
@@ -1008,20 +1008,18 @@ action = [0.72, -0.15]
 
 ```
 ① 反归一化:
-   p_ref    = 0.72 × 50  = +36.0 kW  (放电! 向电网注入功率)
-   k_droop  = -0.15 × 100 = -15.0 kW/V
+   p_ref    = 0.72 × 50          = +36.0 kW  (放电! 向电网注入功率)
+   k_droop  = -0.15 × 15 + 15    = 12.75 kW/V
 
 ② 校验:
    ACT-01: |36.0 - 0| = 36.0 ≤ 50 ✓
-   ACT-02: |-15.0 - 0| = 15.0 > 10 ✗ → clamp 到 -10.0
+   ACT-02: |12.75 - 0| = 12.75 > 10 ✗ → clamp 到 10.0
    ACT-03: √(36²+10²) = 37.4 ≤ 200 ✓
-   ACT-04: -10 ∈ [-100, 100] ✓
+   ACT-04: 10.0 ∈ [0, 30] ✓
 
 ③ 下垂公式 (V_actual=0.94, V_target=1.0):
-   droop_adjustment = -(-10.0) × (0.94 - 1.0) × 400
-                    = +10 × (-0.06) × 400 = -240 kW
-   P_output = 36.0 + (-240) = -204 kW → 实际上:
-   训练中简化为 P_output ≈ p_ref = 36.0 kW (droop 对 ΔV 乘系数后影响较小)
+   训练中简化为 P_output ≈ p_ref = 36.0 kW
+   (droop 调整量 = -k_droop × ΔV, 在毫秒级由实时控制模块执行)
 
 ④ SOC 更新:
    ΔE = 36.0 kW × 0.25h = 9.0 kWh
@@ -1161,6 +1159,7 @@ A: 单模式输出 78 维 obs，多模式追加 mode_id 在索引 78 变成 79 �
 | **超参优化** | 人工 grid search | MSSA 自动搜索 |
 | **动作空间** | 3~5 维（历史） | 2 维 [p_ref, k_droop] |
 | **ACT-02 变化率** | 30 kW/V/步（旧） | **10 kW/V/步** |
+| **k_droop 范围** | [-100, 100] kW/V（旧） | **[0, 30] kW/V** |
 | **w7 下垂平滑** | 0.3（旧） | **0.5** |
 | **VMD tol** | 1e-7（旧） | **1e-6** |
 | **下垂公式** | 曾为 +k_droop×ΔV | **P_output = P_ref - k_droop × ΔV** |
