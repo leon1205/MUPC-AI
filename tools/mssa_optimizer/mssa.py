@@ -10,7 +10,7 @@ import sys
 import numpy as np
 
 from .search_space import (
-    DIM, random_population, random_position, decode
+    DIM, random_population, decode
 )
 from .objective import ObjectiveEvaluator
 from .output import format_result, save_result
@@ -59,9 +59,10 @@ class MssaOptimizer:
 
             # ── 发现者更新 (前 n_discoverer) ──
             for i in range(n_discoverer):
+                alpha = np.random.random() + 0.1  # ∈ (0.1, 1.1]
                 if fitness[i] < ST:
-                    # 安全: 广泛搜索
-                    new_positions[i] = positions[i] * np.exp(-i / (0.5 * N * cfg.iterations))
+                    # 安全: 广泛搜索 (标准 SSA 公式)
+                    new_positions[i] = positions[i] * np.exp(-i / (alpha * cfg.iterations))
                 else:
                     # 危险: 飞向安全区
                     new_positions[i] = positions[i] + np.random.randn(DIM) * 0.1

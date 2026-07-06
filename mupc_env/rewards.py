@@ -212,26 +212,21 @@ def _compute_safety_margin(v_avg: float, load_rate: float,
     """
     penalty = 0.0
 
-    # 电压边界 (Log-barrier)
+    # 电压边界 (Log-barrier, 连续可导, 远离边界时自然趋近于0)
     margin_v_upper = 1.15 - v_avg
     margin_v_lower = v_avg - 0.85
-    if margin_v_upper < 0.05:
-        penalty -= max(0.0, -np.log(max(margin_v_upper, epsilon)))
-    if margin_v_lower < 0.05:
-        penalty -= max(0.0, -np.log(max(margin_v_lower, epsilon)))
+    penalty -= max(0.0, -np.log(max(margin_v_upper, epsilon)))
+    penalty -= max(0.0, -np.log(max(margin_v_lower, epsilon)))
 
     # 变压器过载边界 (Log-barrier)
     margin_load = 0.85 - load_rate
-    if margin_load < 0.05:
-        penalty -= max(0.0, -np.log(max(margin_load, epsilon)))
+    penalty -= max(0.0, -np.log(max(margin_load, epsilon)))
 
-    # SOC 边界预警 (Log-barrier, 仅在接近硬约束时生效)
+    # SOC 边界预警 (Log-barrier, 半权重, 远离边界时自然趋近于0)
     margin_soc_upper = 0.90 - soc
     margin_soc_lower = soc - 0.10
-    if margin_soc_lower < 0.05:
-        penalty -= max(0.0, -0.5 * np.log(max(margin_soc_lower, epsilon)))
-    if margin_soc_upper < 0.05:
-        penalty -= max(0.0, -0.5 * np.log(max(margin_soc_upper, epsilon)))
+    penalty -= max(0.0, -0.5 * np.log(max(margin_soc_lower, epsilon)))
+    penalty -= max(0.0, -0.5 * np.log(max(margin_soc_upper, epsilon)))
 
     # 归一化: /5 使 penalty ∈ [-5, 0] → clip 至 [-1, 0]
     return float(np.clip(penalty / 5.0, -1.0, 0.0))
@@ -430,7 +425,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     # v3.1: 安全边界 Log-barrier 软化 (专家评审建议)
     load_rate = r.get("load_rate_unclamped", r.get("load_rate", 0.5))
     r_safety_margin = _compute_safety_margin(v_avg, load_rate, soc_new)
-    r_safety_margin_norm = float(np.clip(r_safety_margin, -1.0, 0.0))
+    r_safety_margin_norm = float(r_safety_margin)  # _compute_safety_margin 已归一化到 [-1,0]
 
     # Welford 原始奖励 (前 4 个分量: r_pv, p_batt_deg, p_overload, r_pq)
     raw_reward = w[0] * r_pv - alpha * w[1] * p_batt_deg - w[2] * p_overload + w4 * r_pq

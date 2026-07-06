@@ -595,7 +595,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             if val is not None:
                 val = float(val)
                 if key not in self._comp_ema:
-                    self._comp_ema[key] = (val, 0.0)
+                    self._comp_ema[key] = (val, 1e-8)  # v3.1: 初始化方差为非零, 防零除
                 old_mean, old_var = self._comp_ema[key]
                 new_mean = old_mean + alpha * (val - old_mean)
                 new_var = old_var + alpha * ((val - new_mean) ** 2 - old_var)

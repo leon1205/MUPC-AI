@@ -7,9 +7,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import hashlib
-import time
 from typing import Optional
 
 

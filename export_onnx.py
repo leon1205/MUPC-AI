@@ -220,8 +220,13 @@ def export_rl_policy(
     )
     print(f"ONNX 导出: {onnx_path}")
 
-    # 验证
+    # 验证 + 注入 metadata
     onnx_model = onnx.load(onnx_path)
+    onnx_model.metadata_props.append(
+        onnx.StringStringEntryProto(key="mupc_input_norm", value="external"))
+    onnx_model.metadata_props.append(
+        onnx.StringStringEntryProto(key="mupc_version", value="v3.1.0"))
+    onnx.save(onnx_model, onnx_path)
     onnx.checker.check_model(onnx_model)
     print("  ONNX checker: 通过")
 

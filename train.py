@@ -79,7 +79,7 @@ def parse_args():
     p.add_argument("--no-lstm", action="store_true",
                    help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
     p.add_argument("--no-error-correction", action="store_true",
-                   help="跳过 BiLSTM 误差修正训练 (v3.1)")
+                   help="跳过 BiLSTM 误差修正训练 (v3.1, 默认启用, 约增1-2分钟)")
     p.add_argument("--use-grid2op", action="store_true", default=True,
                    help="使用 Grid2Op + Pandapower 三相潮流仿真 (默认)")
     p.add_argument("--no-grid2op", action="store_false", dest="use_grid2op",

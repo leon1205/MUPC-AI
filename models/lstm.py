@@ -601,18 +601,23 @@ class LSTMTrainer:
         self.device = "cuda" if _torch.cuda.is_available() else "cpu"
 
     def _apply_vmd(self, data: dict) -> dict | None:
-        """VMD 信号分解预处理 (v3.1 R2 可选)。
+        """VMD 信号分解预处理 (v3.1 R2 可选, 骨架实现)。
 
         将光伏/负荷时间序列分解为 K 个 IMF 子模态，降低 LSTM 学习难度。
         启用后 X 的输入通道数从 7 变为 7*K（每个特征的 K 个 IMF 独立输入）。
 
-        TODO: 替换 VmdDecomposer 骨架为真实 vmdpy.VMD() 实现。
+        **注意**: 当前 VmdDecomposer 返回假正弦波 IMF (骨架占位)。
+        生产使用请安装 vmdpy 并替换 _vmd_numpy() 中的占位实现:
+          pip install vmdpy
+          修改 models/vmd.py _vmd_numpy() 调用 vmdpy.VMD()
 
         Returns:
             扩展后的 data dict (含 vmd_imfs 字段), 若 VMD 不可用则返回 None。
         """
         if not self.config.get("vmd_enabled"):
             return None
+        print("[WARN] VMD 预处理已启用, 但当前使用骨架占位实现 (假正弦波 IMF)。")
+        print("      生产使用请: pip install vmdpy → 替换 models/vmd.py _vmd_numpy()")
         try:
             from models.vmd import VmdDecomposer
         except ImportError:
@@ -633,7 +638,7 @@ class LSTMTrainer:
         data = dict(data)
         data["vmd_pv_imfs"] = pv_imfs      # (K, T)
         data["vmd_load_imfs"] = load_imfs  # (K, T)
-        print(f"  VMD 分解完成: K={vmd.K}, PV IMFs shape={pv_imfs.shape}")
+        print(f"  VMD 分解完成 (骨架): K={vmd.K}, PV IMFs shape={pv_imfs.shape}")
         return data
 
     def prepare_data(self, data: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -800,6 +805,12 @@ class LSTMTrainer:
         print("=" * 56)
 
         cfg = self.config
+
+        # v3.1: VMD 信号分解预处理 (R2 可选)
+        vmd_data = self._apply_vmd(data)
+        if vmd_data is not None:
+            data = vmd_data
+
         X, y = self.prepare_data(data)
         print(f"  训练样本: {len(X)}")
         if val_data is not None:

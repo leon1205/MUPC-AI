@@ -184,8 +184,16 @@ def main():
     method = "MIC (minepy)" if MINE else "Pearson (fallback)"
     print(f"  方法: {method}")
 
-    # 加载数据
-    data = _load_smart_ds_data(args.data_dir)
+    # 加载数据 (--npz 优先)
+    if args.npz:
+        if not os.path.exists(args.npz):
+            print(f"[ERROR] npz 文件不存在: {args.npz}", file=sys.stderr)
+            sys.exit(1)
+        loaded = np.load(args.npz)
+        data = {k: loaded[k] for k in loaded.files}
+        print(f"  从 npz 加载: {args.npz}, 字段: {list(data.keys())}")
+    else:
+        data = _load_smart_ds_data(args.data_dir)
 
     # 构建特征
     X, feature_names, y_pv, y_load = _build_features(data)
