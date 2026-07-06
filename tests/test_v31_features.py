@@ -203,12 +203,12 @@ def test_error_correction_bias_gate():
 
 
 # ═══════════════════════════════════════════════════════════════
-# T-07: TCNFeatureExtractor — 因果膨胀卷积形状验证
+# T-07: TCNFeatureExtractor — 形状 + 参数量 + 因果性验证
 # ═══════════════════════════════════════════════════════════════
 
 def test_tcn_feature_extractor():
     """验证 TCN 层的输入输出形状和参数量."""
-    print("\n[T-06] TCNFeatureExtractor")
+    print("\n[T-06b] TCNFeatureExtractor")
     try:
         import torch
         from models.lstm import TCNFeatureExtractor

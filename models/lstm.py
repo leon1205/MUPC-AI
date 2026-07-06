@@ -164,8 +164,6 @@ class TCNBlock:
     def forward(self, x):
         # x: (B, T, C) → Conv1D expects (B, C, T)
         out = x.permute(0, 2, 1)
-        # x: (B, T, C) → Conv1D expects (B, C, T)
-        out = x.permute(0, 2, 1)
         out = self.relu(self.bn(self.conv(out)))
         out = out.permute(0, 2, 1)         # (B, C, T) → (B, T, C)
         out = out[:, :x.size(1), :]        # 截断 padding
