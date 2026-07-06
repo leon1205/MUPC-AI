@@ -60,7 +60,12 @@ def _build_rl_export_model(obs_dim: int = 78,
 
     act_dim = 2  # v2.15 部署动作空间: [p_ref(tanh), k_droop(tanh)]
 
-    class RLExportModelWithNorm(nn.Module):
+    class RLExportModel(nn.Module):
+        """纯策略网络 (v3.1): 输入已归一化的 78/79 维观测，输出 tanh 动作。
+
+        归一化由下游 Rust normalize_observation() 负责，完全镜像训练环境的
+        mupc_env/observation.py:normalize_obs()。
+        """
         def __init__(self):
             super().__init__()
             prev = obs_dim
@@ -71,32 +76,13 @@ def _build_rl_export_model(obs_dim: int = 78,
                 prev = h
             self.actor = nn.Linear(hidden[-1], act_dim)
 
-        def _normalize(self, x):
-            # 观测归一化: 仅对 D1 前 8 维标量归一化
-            # (D2-D9 维度已在训练时预归一化到 [0,1])
-            d1_norm = torch.tensor([
-                0.5,          # SOC ~ 50%
-                1/150,        # 光伏功率
-                1/60,         # 负荷功率
-                1/200,        # 电网功率
-                1/200,        # 变压器负载
-                1/50,         # 电池功率
-                1/200,        # 三相电压 (A相)
-                1/200,        # 三相电压 (B相)
-            ], device=x.device)
-            x_norm = x.clone()
-            x_norm[..., :8] = x[..., :8] * d1_norm
-            # Q 裕度 (D7 [49]) 直接恒等
-            return x_norm
-
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x_norm = self._normalize(x)
-            latent = self.shared(x_norm)
+            latent = self.shared(x)
             action = self.actor(latent)
             # 2 维 (v2.15): [p_ref(tanh), k_droop(tanh)]
             return torch.tanh(action)
 
-    return RLExportModelWithNorm()
+    return RLExportModel()
 
 
 # ── 权重加载 ──────────────────────────────────────────────────
@@ -376,7 +362,7 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
     export_metadata = metadata or {
         "mupc_model_type": "bilstm" if bidirection else "lstm",
         "mupc_with_attention": str(with_attention).lower(),
-        "mupc_with_vmd": "false",
+        "mupc_with_vmd": "false",     # v3.1: VMD 预处理默认关闭 (R2 可选)
         "mupc_mic_topk": "7",
         "mupc_output_horizon": "15",
         "mupc_input_window": str(input_window),
@@ -408,6 +394,30 @@ def export_lstm(checkpoint_path: str, output_dir: str = "./exported_models/",
     print("  ONNX checker: 通过")
 
     return onnx_path
+
+
+# ── 误差修正 BiLSTM 导出 (v3.1) ───────────────────────────────
+
+def export_error_correction(checkpoint_path: str, output_dir: str = "./exported_models/",
+                             residual_window: int = 24) -> str:
+    """导出误差修正 BiLSTM 模型为 ONNX (v3.1)。
+
+    Args:
+        checkpoint_path: ErrorCorrectionBiLSTM 权重文件路径
+        output_dir: 输出目录
+        residual_window: 残差历史窗口步数 (default 24)
+    """
+    import torch
+    from models.error_correction import ErrorCorrectionBiLSTM, export_error_correction_onnx
+
+    _ensure_export_deps()
+
+    model = ErrorCorrectionBiLSTM(residual_window=residual_window)
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(state_dict)
+    model.eval()
+    print(f"  误差修正模型已加载: {checkpoint_path}")
+    return export_error_correction_onnx(model, output_dir, residual_window)
 
 
 # ── RKNN 转换 (可选) ──────────────────────────────────────────
@@ -474,6 +484,8 @@ def main():
                         help="前置 TCN 特征提取层 (v3.1 R2)")
     parser.add_argument("--metadata", type=str, default=None,
                         help="metadata JSON 文件路径 (v3.0)")
+    parser.add_argument("--error-correction", type=str, default=None,
+                        help="导出误差修正 BiLSTM 模型 (提供 checkpoint 路径, v3.1)")
     parser.add_argument("--to-rknn", action="store_true",
                         help="同时导出 RKNN (需要 rknn-toolkit2)")
     parser.add_argument("--dual-mode", action="store_true",
@@ -496,6 +508,13 @@ def main():
                                     metadata=metadata)
             if args.to_rknn:
                 export_to_rknn(onnx_path, args.output_dir)
+            return
+
+        # 误差修正导出
+        if args.error_correction:
+            ec_path = export_error_correction(args.error_correction, args.output_dir)
+            if ec_path and args.to_rknn:
+                export_to_rknn(ec_path, args.output_dir)
             return
 
         # RL 策略导出

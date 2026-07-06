@@ -78,6 +78,8 @@ def parse_args():
                    help="模型保存目录")
     p.add_argument("--no-lstm", action="store_true",
                    help="使用 Oracle 预测 (真实值+噪声) 代替 LSTM")
+    p.add_argument("--no-error-correction", action="store_true",
+                   help="跳过 BiLSTM 误差修正训练 (v3.1)")
     p.add_argument("--use-grid2op", action="store_true", default=True,
                    help="使用 Grid2Op + Pandapower 三相潮流仿真 (默认)")
     p.add_argument("--no-grid2op", action="store_false", dest="use_grid2op",
@@ -216,7 +218,7 @@ def main():
         }
         KNOWN_KEYS = {"hidden_dim", "num_layers", "learning_rate", "batch_size",
                        "dropout", "input_window", "output_mode", "with_attention",
-                       "attn_score", "vmd_k", "vmd_alpha", "optimizer",
+                       "attn_score", "vmd_k", "vmd_alpha", "vmd_enabled", "optimizer",
                        "with_tcn"}    # v3.1: TCN 特征提取 (R2)
         mapped = {}
         for k, v in mssa_cfg.items():
@@ -255,6 +257,26 @@ def main():
             import torch
             torch.save(predictor.state_dict(), lstm_path)
             print(f"LSTM checkpoint 已保存: {lstm_path}")
+
+            # v3.1: BiLSTM 误差修正训练
+            if not args.no_error_correction:
+                try:
+                    from models.error_correction import ErrorCorrectionTrainer
+                    print("\n── BiLSTM 误差修正训练 ──")
+                    ec_trainer = ErrorCorrectionTrainer()
+                    ec_result = ec_trainer.train(train_data, predictor.predict_numpy)
+                    if ec_result.get("model") is not None:
+                        ec_path = os.path.join(args.checkpoint_path, "error_correction.pt")
+                        torch.save(ec_result["model"].state_dict(), ec_path)
+                        print(f"误差修正 checkpoint 已保存: {ec_path}")
+                        if ec_result.get("bias_gate_enabled"):
+                            print(f"  Bias Gate: 已启用 (MAPE > 3%)")
+                        else:
+                            print(f"  Bias Gate: 未启用 (MAPE <= 3%, 跳过)")
+                    else:
+                        print(f"  误差修正训练跳过: {ec_result.get('reason', '未知')}")
+                except Exception as e:
+                    print(f"[WARN] 误差修正训练失败 (不影响主流程): {e}")
         except Exception as e:
             import traceback
             sys.stderr.write(f"[FATAL] LSTM training failed: {e}\n")
@@ -323,6 +345,15 @@ def main():
                 obs_dim=obs_dim,
             )
             print(f"ONNX 模型已导出: {onnx_path}")
+            # v3.1: 同时导出误差修正模型
+            ec_checkpoint = os.path.join(args.checkpoint_path, "error_correction.pt")
+            if os.path.exists(ec_checkpoint):
+                try:
+                    ec_onnx = export_onnx.export_error_correction(
+                        ec_checkpoint, "./exported_models/")
+                    print(f"误差修正 ONNX 已导出: {ec_onnx}")
+                except Exception as e:
+                    print(f"[WARN] 误差修正 ONNX 导出失败: {e}")
         except Exception as e:
             print(f"ONNX 导出失败: {e}")
 

@@ -91,7 +91,7 @@ action_constraints:
 action_space:
   p_ref_norm_min: -1.0            # p_ref 归一化下限 → 物理值 [-50, 50] kW
   p_ref_norm_max: 1.0             # p_ref 归一化上限
-  k_droop_norm_min: -1.0          # k_droop 归一化下限 → 物理值 [-100, 100] kW/V (v2.17)
+  k_droop_norm_min: -1.0          # k_droop 归一化下限 → 物理值 [0, 30] kW/V (v3.1 对齐下游)
   k_droop_norm_max: 1.0           # k_droop 归一化上限
   # 以下字段 v2.15 已下沉至 strategy-engine, 训练中固定为默认值:
   # load_shedding = 0.0, pv_limit = 1.0, confidence = 0.5
@@ -143,8 +143,8 @@ comm:
 # ═══════════════════════════════════════════════════════════════
 dual_control:
   enabled: true                   # 2 维动作空间 (p_ref + k_droop), v2.15 精简
-  k_droop_min: -100.0             # 下垂系数下限 (kW/V), v2.17 对齐下游
-  k_droop_max: 100.0              # 下垂系数上限 (kW/V), v2.17
+  k_droop_min: 0.0                # 下垂系数下限 (kW/V), v3.1 对齐下游 [0,30]
+  k_droop_max: 30.0               # 下垂系数上限 (kW/V), v3.1 对齐下游 [0,30]
   p_ref_ramp_limit_kw: 50.0      # P_ref 变化率限制 (kW/步)
   k_droop_ramp_limit: 10.0       # k_droop 变化率限制 (kW/V/步), ACT-02 对齐下游 PRD §6.5
   pv_limit_min: 0.0              # 光伏限功率下限（对齐下游无非零下限）

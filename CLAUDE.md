@@ -107,7 +107,7 @@ MUPC AI Engine (Rust, RK3588 NPU)
 **动作空间（2维，v2.15 精简）**：`[p_ref, k_droop]`
 
 - p_ref ∈ [-50, 50] kW（充电<0，放电>0），对齐下游 p_ref 符号约定
-- k_droop ∈ [-100, 100] kW/V（v2.17），对齐下游 Dual 模式
+- k_droop ∈ [0, 30] kW/V（v3.1），对齐下游 parse_action_output clamp(0.0, 30.0)
 - load_shedding/pv_limit 下沉至 strategy-engine, confidence 移至 ModelOutput 元数据 (v2.15)
 
 Q_batt 由实时电压调节器闭环控制，不经过 RL 动作空间。

@@ -87,8 +87,8 @@ class CommConfig:
 class DualControlConfig:
     """双参数下垂控制配置 (v2.15: 2 维动作空间 [p_ref, k_droop])"""
     enabled: bool = True
-    k_droop_min: float = -100.0   # v2.17 对齐下游
-    k_droop_max: float = 100.0    # v2.17 对齐下游
+    k_droop_min: float = 0.0      # v3.1 对齐下游 [0,30]
+    k_droop_max: float = 30.0     # v3.1 对齐下游 [0,30]
     p_ref_ramp_limit_kw: float = 50.0
     k_droop_ramp_limit: float = 10.0  # 对齐下游 PRD §6.5 ACT-02
     pv_limit_min: float = 0.0

@@ -5,11 +5,11 @@
   ACT-01: |Δp_ref| <= 50 kW/步
   ACT-02: |Δk_droop| <= 10 kW/V/步
   ACT-03: √(p_ref² + k_droop²) <= 200 kVA (视在功率圆, 对齐下游 S-circle)
-  ACT-04: k_droop ∈ [-100, 100] kW/V (最终值域 clamp)
+  ACT-04: k_droop ∈ [0, 30] kW/V (最终值域 clamp, v3.1 对齐下游)
   ACT-05: |p_ref| <= |dispatch_p| + 方向约束 (v3.1: dispatch>0 → p_ref>=0)
 
 v2.17 变更:
-  - k_droop 范围 [0,30] → [-100,100] (对齐下游 Dual 模式默认值)
+  - k_droop 范围 [-100,100] → [0,30] (v3.1 对齐下游 PRD §6.3)
   - ACT-03 从简单 p_ref clamp 改为 S-circle (对齐下游标准模式)
   - 新增 MAX_APPARENT_POWER_KVA = 200.0
 
@@ -28,14 +28,14 @@ class ActionValidator:
     """
 
     P_BATT_MAX: float = 50.0              # kW
-    K_DROOP_MIN: float = -100.0           # kW/V (v2.17: 对齐下游 Dual 模式)
-    K_DROOP_MAX: float = 100.0            # kW/V (v2.17: 对齐下游 Dual 模式)
+    K_DROOP_MIN: float = 0.0              # kW/V (v3.1: 对齐下游 [0,30])
+    K_DROOP_MAX: float = 30.0             # kW/V (v3.1: 对齐下游 [0,30])
     DELTA_P_MAX: float = 50.0             # kW/步, ACT-01
     DELTA_K_DROOP_MAX: float = 10.0       # kW/V/步, ACT-02 对齐下游 PRD §6.5
     MAX_APPARENT_POWER_KVA: float = 200.0  # kVA, ACT-03 S-circle
 
     def __init__(self, p_batt_max: float = 50.0,
-                 k_droop_min: float = -100.0, k_droop_max: float = 100.0,
+                 k_droop_min: float = 0.0, k_droop_max: float = 30.0,
                  delta_p_max: float = 50.0,
                  delta_k_droop_max: float = 10.0,
                  max_apparent_power_kva: float = 200.0):
@@ -43,8 +43,8 @@ class ActionValidator:
 
         Args:
             p_batt_max: 电池最大充放电功率 (kW)
-            k_droop_min: 下垂系数下限 (kW/V), v2.17 默认 -100
-            k_droop_max: 下垂系数上限 (kW/V), v2.17 默认 100
+            k_droop_min: 下垂系数下限 (kW/V), v3.1 默认 0
+            k_droop_max: 下垂系数上限 (kW/V), v3.1 默认 30
             delta_p_max: 电池变化率保护 (kW/步), ACT-01
             delta_k_droop_max: 下垂系数变化率保护 (kW/V/步), ACT-02 对齐下游 PRD §6.5
             max_apparent_power_kva: 视在功率上限 (kVA), ACT-03 S-circle
@@ -66,7 +66,7 @@ class ActionValidator:
 
         action_norm: [p_ref, k_droop]
         p_ref ∈ [-1, 1] → [-50, 50] kW
-        k_droop ∈ [-1, 1] → [-100, 100] kW/V (v2.17)
+        k_droop ∈ [-1, 1] → [0, 30] kW/V (v3.1 对齐下游)
         """
         p_ref = float(action_norm[0] * self.P_BATT_MAX)
         k_range = (self.K_DROOP_MAX - self.K_DROOP_MIN) / 2.0
@@ -122,7 +122,7 @@ class ActionValidator:
             k_droop *= scale
             violations["ACT-03"] = True
 
-        # ACT-04: k_droop ∈ [-100, 100] kW/V (v2.17: [0,30]→[-100,100])
+        # ACT-04: k_droop ∈ [0, 30] kW/V (v3.1 对齐下游 PRD §6.3)
         if k_droop < self.K_DROOP_MIN:
             k_droop = self.K_DROOP_MIN
             violations["ACT-04"] = True

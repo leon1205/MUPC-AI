@@ -136,11 +136,11 @@ def ut_03_action_constraint():
         _record("UT-03 [ACT-01 ΔP>50kW]", violations_found["ACT-01"],
                 f"violated={violated}, violations={list(violations.keys())}" if not violations_found["ACT-01"] else "")
 
-        # ── ACT-04 测试：k_droop 越界 (v2.17: [-100,100], k=-1→-100 临界/越界) ──
+        # ── ACT-04 测试：k_droop 越界 (v3.1: [0,30], k=-0.5→7.5 正常, k=-1.1→-1.5<0 → ACT-04) ──
         env3 = MupcEnv(data, mode="MODE-01", use_grid2op=False)
         env3.reset()
         env3._validator.prev_p_ref = 0.0
-        # k_droop ∈ [-1,1]→[-100,100], k=-1.1→-110 < -100 → ACT-04
+        # k_droop ∈ [-1,1]→[0,30], k=-1.1→-1.5 < 0 → ACT-04
         action = np.array([0.0, -1.1])
         _, violated, violations = env3._validator.validate(action, dispatch_p=None)
         if violated and "ACT-04" in violations:

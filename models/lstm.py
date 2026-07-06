@@ -585,6 +585,9 @@ LSTM_TRAIN_CONFIG = {
     "loss": "quantile",              # v3.1: 真分位数回归 (QuantileLoss)
     "quantile_taus": [0.1, 0.5, 0.9],  # v3.1: 分位数目标 (仅 loss="quantile" 时使用)
     "with_tcn": True,                # v3.1: TCN 前置特征提取 (R2 默认开启)
+    "vmd_enabled": False,            # v3.1: VMD 信号分解预处理 (R2 可选)
+    "vmd_k": 5,                      # v3.1: VMD 模态数 (光伏默认5, 负荷默认6)
+    "vmd_alpha": 2000,               # v3.1: VMD 带宽约束
 }
 
 
@@ -596,6 +599,42 @@ class LSTMTrainer:
         self.config = {**LSTM_TRAIN_CONFIG, **(config or {})}
         self.model: Optional[LSTMForecast] = None
         self.device = "cuda" if _torch.cuda.is_available() else "cpu"
+
+    def _apply_vmd(self, data: dict) -> dict | None:
+        """VMD 信号分解预处理 (v3.1 R2 可选)。
+
+        将光伏/负荷时间序列分解为 K 个 IMF 子模态，降低 LSTM 学习难度。
+        启用后 X 的输入通道数从 7 变为 7*K（每个特征的 K 个 IMF 独立输入）。
+
+        TODO: 替换 VmdDecomposer 骨架为真实 vmdpy.VMD() 实现。
+
+        Returns:
+            扩展后的 data dict (含 vmd_imfs 字段), 若 VMD 不可用则返回 None。
+        """
+        if not self.config.get("vmd_enabled"):
+            return None
+        try:
+            from models.vmd import VmdDecomposer
+        except ImportError:
+            print("[WARN] models.vmd 不可用, 跳过 VMD 预处理")
+            return None
+        vmd = VmdDecomposer(
+            K=self.config.get("vmd_k", 5),
+            alpha=self.config.get("vmd_alpha", 2000),
+        )
+        # 对光伏和负荷序列分别分解
+        pv_signal = data["pv_power"]
+        load_signal = data["load_power"]
+        pv_imfs = vmd.decompose(pv_signal)
+        load_imfs = vmd.decompose(load_signal)
+        if pv_imfs is None or load_imfs is None:
+            print("[WARN] VMD 分解失败, 跳过")
+            return None
+        data = dict(data)
+        data["vmd_pv_imfs"] = pv_imfs      # (K, T)
+        data["vmd_load_imfs"] = load_imfs  # (K, T)
+        print(f"  VMD 分解完成: K={vmd.K}, PV IMFs shape={pv_imfs.shape}")
+        return data
 
     def prepare_data(self, data: dict) -> tuple[np.ndarray, np.ndarray]:
         """从 data dict 构建训练样本 (X, y), 昼夜均衡采样。

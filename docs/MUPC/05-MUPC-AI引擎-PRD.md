@@ -946,12 +946,12 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 > | load_power | [-1000, 1000] kW | [0, 60] kW |
 > | grid_power | [-1000, 1000] kW | [-200, 200] kW |
 > | battery_power | [-500, 500] kW | [-50, 50] kW |
-> | transformer_load | [0.0, 2.0] | [0.0, 1.5] |
-> | battery_soc | [0.0, 1.0] | [0.1, 0.9] |
-> | solar_irradiance | [0.0, 1500.0] W/m² | [0.0, 1000.0] W/m² |
-> | temperature | [-20.0, 60.0] °C | [-10.0, 45.0] °C |
+> | transformer_load | [0.0, 2.0] | 不作归一化 (identity 透传) |
+> | battery_soc | [0.0, 1.0] | [0.0, 1.0] |
+> | solar_irradiance | [0.0, 1500.0] W/m² | [0.0, 1500.0] W/m² |
+> | temperature | [-20.0, 60.0] °C | [-20.0, 60.0] °C |
 >
-> 若训练管线更新归一化范围，需同步更新 `data_fusion.rs::normalize_observation()` 和本表。
+> 以上归一化范围与 MUPC-AI2 `mupc_env/constants.py` + `observation.py:normalize_obs()` 严格对齐。
 
 **总维度：** D1(9) + D2(30) + D3(3) + D4(3) + D5(2) + D6(1) + D7(1) + D8(8) + D9(4) + D10(17) = **78 维**（D3 的 peak_price/valley_price 为辅助字段不入向量，D6 的 dispatch_q_set 为辅助字段不入向量）。
 
