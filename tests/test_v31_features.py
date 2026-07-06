@@ -262,6 +262,33 @@ def test_error_correction_shape():
 
 
 # ═══════════════════════════════════════════════════════════════
+# T-08: NumPy PPO 自测 — 前向传播 + 动作采样
+# ═══════════════════════════════════════════════════════════════
+
+def test_numpy_ppo():
+    """验证 NumPy PPO 自测路径可用 (v2.15 2维动作)."""
+    print("\n[T-08] NumPy PPO 自测")
+    from _ppo_core import MLPPolicy
+
+    policy = MLPPolicy(obs_dim=78, act_dim=2)
+    obs = np.random.randn(78).astype(np.float32)
+    action, value = policy.forward(obs[np.newaxis, :])
+    _check("action shape (1,2)", action.shape == (1, 2), f"got {action.shape}")
+    _check(f"p_ref in [-1,1] ({action[0,0]:.3f})", -1 <= action[0,0] <= 1)
+    _check(f"k_droop in [-1,1] ({action[0,1]:.3f})", -1 <= action[0,1] <= 1)
+    _check("value is scalar", value.shape == (1,), f"got {value.shape}")
+
+    # get_action (返回 (action, value_scalar, log_prob_scalar))
+    det_action, det_val, det_lp = policy.get_action(obs, deterministic=True)
+    _check("deterministic action (2,)", det_action.shape == (2,), f"got {det_action.shape}")
+    _check("log_prob 有限", np.isfinite(float(det_lp)))
+
+    stoch_action, stoch_val, stoch_lp = policy.get_action(obs, deterministic=False)
+    _check("stochastic action (2,)", stoch_action.shape == (2,))
+    _check("stochastic log_prob 有限", np.isfinite(float(stoch_lp)))
+
+
+# ═══════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 56)
@@ -276,6 +303,7 @@ def main():
     test_error_correction_bias_gate()
     test_tcn_feature_extractor()
     test_error_correction_shape()
+    test_numpy_ppo()
 
     print(f"\n{'=' * 56}")
     total = PASS + FAIL
