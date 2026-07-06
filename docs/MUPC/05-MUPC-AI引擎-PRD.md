@@ -935,6 +935,24 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | | shock_load_probability | f64 | [0.0, 1.0] | - | 冲击负荷发生概率（v2.11 新增）| LSTM |
 | | base_load | f64 | [0.0, 10000.0] | kW | 基础负荷，50% 分位数（v2.11 新增）| LSTM |
 
+> **v3.1 注释 — 取值范围 vs 归一化范围：**
+> 上表"取值范围"列为理论极值，用于边界检查和异常检测。
+> 实际 ONNX 推理输入的 MinMax 归一化使用**部署典型范围**（来自 MUPC-AI2 `constants.py`），
+> 与训练管线对齐：
+>
+> | 字段 | 理论范围 | 部署归一化范围 |
+> |------|----------|----------------|
+> | pv_power | [-1000, 1000] kW | [0, 150] kW |
+> | load_power | [-1000, 1000] kW | [0, 60] kW |
+> | grid_power | [-1000, 1000] kW | [-200, 200] kW |
+> | battery_power | [-500, 500] kW | [-50, 50] kW |
+> | transformer_load | [0.0, 2.0] | [0.0, 1.5] |
+> | battery_soc | [0.0, 1.0] | [0.1, 0.9] |
+> | solar_irradiance | [0.0, 1500.0] W/m² | [0.0, 1000.0] W/m² |
+> | temperature | [-20.0, 60.0] °C | [-10.0, 45.0] °C |
+>
+> 若训练管线更新归一化范围，需同步更新 `data_fusion.rs::normalize_observation()` 和本表。
+
 **总维度：** D1(9) + D2(30) + D3(3) + D4(3) + D5(2) + D6(1) + D7(1) + D8(8) + D9(4) + D10(17) = **78 维**（D3 的 peak_price/valley_price 为辅助字段不入向量，D6 的 dispatch_q_set 为辅助字段不入向量）。
 
 > **v2.15 修正：** D1(10) → D1(9) — q_realtime_margin 已移至 D7 独立维度（v2.14），但 D1 中残留重复 push 导致输入向量实际 79 维。修正后与 MUPC-AI2 训练管线 `observation.py:to_input_vector` 严格对齐（78 维）。
@@ -1472,6 +1490,11 @@ if safety_override_active {
 | w6 | 0.5 | 电压变化斜率惩罚 | [0.0, 2.0] |
 | w7 | 0.5 | 下垂系数平滑惩罚 | [0.0, 2.0] |
 | w8 | 1.0 | 安全覆盖惩罚 | [0.0, 5.0] |
+| w9 | 1.0 | 冲击负荷预备度奖励 | [0.0, 3.0] |
+
+> **v3.1 新增 w9**：冲击负荷预备度奖励（shock_readiness_reward）。
+> 在 `reward_calculator.rs::calc_agri_v2_8()` 末尾作为独立项加入。
+> 权重通过 `shock_conservative_coefficient`（默认 0.7）调节保守程度。
 
 ### 7.3 SCENE-B1：自主套利模式
 
@@ -1528,13 +1551,16 @@ R_carbon_reduction = 100 * (C_baseline - C_actual) / C_baseline
 
 ### 7.7 场景-权重映射表
 
-| 场景 | w1 | w2 | w3 | w4 | 说明 |
-|------|----|----|----|----|------|
-| 台区季节性负荷 | 1.0 | 0.5 | 2.0 | - | 变压器过载惩罚最重 |
-| 自主套利 | 1.0 | 1.0 | - | - | 经济性主导 |
-| 需量控制 | 1.0 | 0.5 | - | - | 需量费减免为主 |
-| VPP | 1.0 | 2.0 | 1.0 | - | 响应精度权重最高 |
-| 极致绿色 | 1.0 | 1.0 | - | - | 环境效益导向 |
+> 各场景权重维度不同（9/3/2/3/2），完整默认值见 `config.rs::SceneWeights`。
+> 下表列出前 4 项权重供快速参考。
+
+| 场景 | 维度 | w1 | w2 | w3 | w4 | w5 | w6 | w7 | w8 | w9 |
+|------|:--:|----|----|----|----|----|----|----|----|----|
+| 台区季节性负荷 | 9 | 1.0 | 0.5 | 2.0 | 1.0 | 0.5 | 0.5 | 0.5 | 1.0 | 1.0 |
+| 自主套利 | 3 | 1.0 | 1.0 | 2.0 | - | - | - | - | - | - |
+| 需量控制 | 2 | 1.0 | 0.5 | - | - | - | - | - | - | - |
+| VPP | 3 | 1.0 | 2.0 | 1.0 | - | - | - | - | - | - |
+| 极致绿色 | 2 | 1.0 | 1.0 | - | - | - | - | - | - | - |
 
 ### 7.8 动态权重调整
 
@@ -2548,6 +2574,19 @@ output_horizon（固定 15） ──→ ONNX output dim_1（无 VMD）/ dim_2（
 | P10/P50/P90 | 第 10/50/90 百分位数预测值 |
 
 ---
+
+### 14.5 v3.1 交付变更（2026-07-05）
+
+| 变更 | 说明 |
+|------|------|
+| 7维输入升级 | `LstmConfig` 新增 `input_features`/`yesterday_offset_steps`，`HistorySample` 7 字段 |
+| 观测归一化 | `normalize_observation()` MinMax 78 维，完全镜像训练 `normalize_obs()` |
+| 动作反归一化 | `parse_action_output` 改为 2 维 tanh → 物理值反归一化 |
+| VMD 多特征降级 | `input_features > 1` 时 VMD 路径自动降级至 AttentionOnly |
+| FFI 平台条件编译 | `rknn_runtime_sys` 仅在 Linux + npu 链接真实库，其他平台 stub |
+| npu default feature | Linux 默认启用 npu，Windows 自动 stub |
+| 数据库迁移幂等 | ALTER TABLE 前 PRAGMA table_info 检查 |
+| 双边审计 P0/P1 | 消除训练-部署 7 维/1 维 Gap、观测归一化不一致、动作反归一化缺失 |
 
 **文档状态：** 统一版 v3.1（第 3 章已重构为系统统一描述，整合 v1.0~v3.0 全部历史版本）
 
