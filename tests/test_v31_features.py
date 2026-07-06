@@ -165,7 +165,45 @@ def test_mssa_search_space():
 
 
 # ═══════════════════════════════════════════════════════════════
-# T-06: TCNFeatureExtractor — 因果膨胀卷积形状验证
+# T-06: ErrorCorrection Bias Gate — 阈值边界行为
+# ═══════════════════════════════════════════════════════════════
+
+def test_error_correction_bias_gate():
+    """验证 ErrorCorrection Bias Gate 的 3% MAPE 阈值行为."""
+    print("\n[T-06] ErrorCorrection Bias Gate")
+    from models.error_correction import ErrorCorrectionTrainer
+
+    cfg = {"hidden_dim": 8, "num_layers": 1, "epochs": 2,
+           "patience": 1, "batch_size": 16, "learning_rate": 1e-3,
+           "bias_threshold_pct": 3.0}
+
+    trainer = ErrorCorrectionTrainer(cfg)
+    n = 500
+    dummy_data = {
+        "pv_power": (np.sin(np.linspace(0, 10*np.pi, n)) * 40 + 80).astype(np.float32),
+        "load_power": np.ones(n, dtype=np.float32) * 35,
+        "solar_irradiance": np.abs(np.sin(np.linspace(0, 10*np.pi, n))).astype(np.float32) * 800,
+        "temperature": np.ones(n, dtype=np.float32) * 25,
+        "hours": np.linspace(0, 24, n).astype(np.float32),
+    }
+    # Mock predict: 返回接近真实值的预测 → 低偏差 → 应跳过
+    def _mean_like(x, ref):
+        return np.mean(ref[:x.shape[0]]) * np.ones((x.shape[0], 15), dtype=np.float32)
+    def mock_pred_near(x):
+        b = x.shape[0]; out = np.zeros((b, 2, 15, 3), dtype=np.float32)
+        out[:, 0] = np.stack([_mean_like(x, dummy_data["pv_power"]) * 0.95] * 3, -1)
+        out[:, 1] = np.stack([_mean_like(x, dummy_data["load_power"]) * 0.95] * 3, -1)
+        return out
+    result = trainer.train(dummy_data, mock_pred_near)
+    _check("EC训练返回 skip/bias_pv/bias_load 键",
+           all(k in result for k in ["skip", "bias_pv", "bias_load"]),
+           f"keys={list(result.keys())}")
+    _check("EC训练返回键不含未知键",
+           set(result.keys()).issubset({"skip", "bias_pv", "bias_load", "model", "history", "target"}))
+
+
+# ═══════════════════════════════════════════════════════════════
+# T-07: TCNFeatureExtractor — 因果膨胀卷积形状验证
 # ═══════════════════════════════════════════════════════════════
 
 def test_tcn_feature_extractor():
@@ -235,6 +273,7 @@ def main():
     test_k_droop_range()
     test_welford_ema()
     test_mssa_search_space()
+    test_error_correction_bias_gate()
     test_tcn_feature_extractor()
     test_error_correction_shape()
 
