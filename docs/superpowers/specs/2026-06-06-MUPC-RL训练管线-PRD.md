@@ -22,7 +22,7 @@
 
 ---
 
-> **v3.1 变更说明 (预测增强分层混合架构完整化):** v3.0 预测增强架构全面落地。核心变更: (1) TCN 时域卷积特征提取层 (4 层因果膨胀卷积, dilation=[1,2,4,8], kernel=3, 64 filters, ~39K 参数, 默认开启, 插入在 VMD 与 LSTM 之间); (2) QuantileLoss 真分位数回归替代 Huber Loss 成为默认损失函数 (tau=[0.10, 0.50, 0.90], 支持 P90 覆盖率验证 90%±2%); (3) Data Quality 标签 (quality=0正常/1传感器异常/2通信中断/3调度接管, quality>=1 样本不参与 LSTM 训练); (4) ACT-05 方向约束增强 (dispatch_p>0 → p_ref>=0, 调度要求放电时禁止充电); (5) Models 包结构落地 (models/lstm.py, models/error_correction.py, models/vmd.py); (6) mupc_env/ 模块化拆分 (action_validator, observation, rewards, constants, voltage_sim 独立模块); (7) ACT-02 Δk_droop 上限修正 30→10 kW/V/步 (对齐下游 PRD §6.5); (8) CONTRACT_DEMAND 修正 300→200 kW (对齐下游)。**关联文档**: `docs/superpowers/specs/2026-06-06-MUPC-RL训练管线-设计文档.md` v3.1 [DESIGN_APPROVED]。
+> **v3.1 变更说明 (预测增强分层混合架构完整化):** v3.0 预测增强架构全面落地。核心变更: (1) TCN 时域卷积特征提取层 (4 层因果膨胀卷积, dilation=[1,2,4,8], kernel=3, 64 filters, ~39K 参数, 默认开启, 插入在 VMD 与 LSTM 之间); (2) QuantileLoss 真分位数回归替代 Huber Loss 成为默认损失函数 (tau=[0.10, 0.50, 0.90], 支持 P90 覆盖率验证 90%±2%); (3) Data Quality 标签 (quality=0正常/1传感器异常/2通信中断/3调度接管, quality>=1 样本不参与 LSTM 训练); (4) ACT-05 方向约束增强 (dispatch_p>0 → p_ref>=0, 调度要求放电时禁止充电); (5) Models 包结构落地 (models/lstm.py, models/error_correction.py, models/vmd.py); (6) mupc_env/ 模块化拆分 (action_validator, observation, rewards, constants, voltage_sim 独立模块); (7) ACT-02 Δk_droop 上限修正 30→10 kW/V/步 (对齐下游 PRD §6.5); (8) CONTRACT_DEMAND 修正 300→200 kW (对齐下游); (9) k_droop 动作范围修正 [-100,100]→[0,30] kW/V (对齐下游 parse_action_output clamp(0,30)); (10) BiLSTM 误差修正训练集成 (train.py --no-error-correction, 自动在 LSTM 训练后执行, Bias Gate >3% MAPE 启用); (11) ONNX RL 策略导出移除不完整归一化层, 改为下游 normalize_observation() 统一负责; (12) Log-barrier 安全边界软化 (rewards.py _compute_safety_margin, 电压/负载/SOC 逼近边界时连续梯度引导); (13) Welford 逐分量 EMA 自适应归一化 (core.py, 6个关键分量跟踪); (14) MIC 特征筛选工具 tools/mic_analysis.py (minepy/Pearson fallback); (15) MSSA 超参优化工具包 tools/mssa_optimizer/ (麻雀搜索算法, 10维搜索空间, SHA256 缓存)。**关联文档**: `docs/superpowers/specs/2026-06-06-MUPC-RL训练管线-设计文档.md` v3.1 [DESIGN_APPROVED]。
 >
 > **v3.0 变更说明 (预测增强分层混合架构):** LSTM 时序预测模型系统性升级, 对齐下游 v3.0 预测增强分层混合架构。核心变更: (1) 新增 AdditiveAttention (Bahdanau) 注意力机制嵌入 ONNX 计算图 (全 ONNX 标准算子: Gemm+Tanh+Softmax+Mul+ReduceSum); (2) LSTM 输出维度从 (B, 47) 单头点预测升级为 (B, 2, 15, 3) 六头分位数预测 (PV/Load × 15步 × P10/P50/P90); (3) ONNX 导出新增 metadata_props 10 键 (mupc_model_type/with_attention/with_vmd/mic_topk/output_horizon/input_window/hidden_size/num_layers/direction/version); (4) train.py 新增 --config JSON 参数 (MSSA 超参搜索接口) + stdout 结构化 MAPE 输出 (PV_MAPE= LOAD_MAPE=); (5) 新增 MIC 特征筛选 JSON 数据交换接口; (6) 新增 compute_data_fingerprint() 训练数据指纹; (7) LSTMForecast 双模式 (legacy 47维 向后兼容 / p10p50p90 90维 新分位数)。**向后兼容**: 所有新功能通过 feature flag 控制 (with_attention, output_mode, --config), 不传新参数等价于 v2.18 行为。**关联文档**: `docs/superpowers/notes/上游训练管线-MUPC-AI2-改造要求.md` [REVIEWED: PASS], `docs/superpowers/specs/2026-06-21-MUPC-RL训练管线-v3.0-设计文档.md` [DESIGN_APPROVED]。
 
@@ -393,7 +393,7 @@ load_rate = S_transformer / TRANSFORMER_KVA (200)
 | `--data-source` | `smartds` | 数据源：`smartds` / `china` / `merged` / `unified` |
 | `--algo-backend` | `auto` | RL 后端选择：`auto` (默认, SB3优先, 不可用降级NumPy PPO) / `sb3` (强制SB3) / `numpy` (强制NumPy PPO, v2.17新增) |
 | `--train-lstm` | False | 独立训练 LSTM（不跑 RL） |
-| `--lstm-params` | `hidden_dim=64,num_layers=2,epochs=100,patience=15` | LSTM训练参数 |
+| `--lstm-params` | `hidden_dim=64,num_layers=2,epochs=200,patience=20` | LSTM训练参数 (v3.1) |
 | `--export-onnx` | False | 训练结束后导出 ONNX |
 
 **5 种场景与奖励函数**（与 MUPC AI 引擎 PRD 第 6 章完全对齐）：
@@ -706,17 +706,25 @@ MUPC-AI2/
 ├── models/                     # v3.1: ML 模型包
 │   ├── __init__.py
 │   ├── lstm.py                 # F3: LSTM+Attention+TCN+BiLSTM+QuantileLoss
-│   ├── error_correction.py     # BiLSTM 误差修正 (v3.0 R2)
-│   └── vmd.py                  # VMD 变分模态分解 (v3.0 R2)
+│   ├── error_correction.py     # BiLSTM 误差修正 (v3.1 集成)
+│   └── vmd.py                  # VMD 变分模态分解 (v3.1 预处理钩子)
 ├── config/                     # YAML 配置管理
 │   ├── __init__.py
 │   ├── config_manager.py
 │   └── mupc_env_config.yaml
 ├── tools/                      # 训练辅助工具
 │   ├── __init__.py
+│   ├── mic_analysis.py         # MIC 特征筛选 (v3.1)
 │   ├── eval_unified.py
 │   ├── diagnose_mode2.py
-│   └── diag_m1.py
+│   ├── diag_m1.py
+│   └── mssa_optimizer/         # MSSA 超参优化 (v3.1)
+│       ├── __init__.py
+│       ├── mssa.py
+│       ├── search_space.py
+│       ├── objective.py
+│       ├── config.py
+│       └── output.py
 ├── tests/                      # 单元/集成测试
 │   ├── __init__.py
 │   ├── test_modes.py
