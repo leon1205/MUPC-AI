@@ -256,6 +256,7 @@ class LSTMForecast:
         # 双向时折半 hidden_dim 以控制参数量 ≤ 单向的 2.2x
         lstm_hidden = hidden_dim // 2 if bidirectional else hidden_dim
         self.input_dim = input_dim
+        self.input_features = None  # v3.1: MIC 特征名列表 (None=默认7特征)
         self.hidden_dim = hidden_dim  # 对外暴露原始 hidden_dim (metadata)
         self.num_layers = num_layers
         self.forecast_steps = forecast_steps
@@ -524,20 +525,38 @@ class LSTMForecast:
         seq_indices = [step_idx - seq_len + 1 + k for k in range(seq_len)]
         seq_indices = [max(0, min(i, len(self._data["pv_power"]) - 1)) for i in seq_indices]
 
-        # 构建 (seq_len, input_dim) 输入
+        # 构建 (seq_len, input_dim) 输入 (v3.1: 支持 MIC 动态特征)
         x = np.zeros((seq_len, self.input_dim), dtype=np.float32)
         for i, idx in enumerate(seq_indices):
-            x[i, 0] = self._data["pv_power"][idx]
-            x[i, 1] = self._data["load_power"][idx]
-            if self.input_dim >= 4:
-                x[i, 2] = self._data["solar_irradiance"][idx]
-                x[i, 3] = self._data["temperature"][idx]
-            if self.input_dim >= 6:
-                h = hours[idx]
-                x[i, 4] = np.sin(2 * np.pi * h / 24)
-                x[i, 5] = np.cos(2 * np.pi * h / 24)
-            if self.input_dim >= 7:
-                x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
+            if self.input_features is not None:
+                # MIC 特征模式: 按特征名动态构建
+                _builders = {
+                    "pv_power": lambda j: self._data["pv_power"][j],
+                    "load_power": lambda j: self._data["load_power"][j],
+                    "solar_irradiance": lambda j: self._data["solar_irradiance"][j],
+                    "temperature": lambda j: self._data["temperature"][j],
+                    "hour_sin": lambda j: np.sin(2*np.pi*hours[j]/24),
+                    "hour_cos": lambda j: np.cos(2*np.pi*hours[j]/24),
+                    "pv_power_lag96": lambda j: (self._data["pv_power"][j-96]
+                        if j >= 96 else self._data["pv_power"][j]),
+                }
+                for f_idx, name in enumerate(self.input_features):
+                    builder = _builders.get(name)
+                    if builder:
+                        x[i, f_idx] = builder(idx)
+            else:
+                # 默认 7 特征模式
+                x[i, 0] = self._data["pv_power"][idx]
+                x[i, 1] = self._data["load_power"][idx]
+                if self.input_dim >= 4:
+                    x[i, 2] = self._data["solar_irradiance"][idx]
+                    x[i, 3] = self._data["temperature"][idx]
+                if self.input_dim >= 6:
+                    h = hours[idx]
+                    x[i, 4] = np.sin(2 * np.pi * h / 24)
+                    x[i, 5] = np.cos(2 * np.pi * h / 24)
+                if self.input_dim >= 7:
+                    x[i, 6] = self._data["pv_power"][idx - 96] if idx >= 96 else self._data["pv_power"][idx]
 
         out = self.predict_numpy(x[np.newaxis, :, :])
 
@@ -651,6 +670,7 @@ class LSTMTrainer:
         保留全部白天样本 (PV目标>10kW), 随机下采样夜间样本至 1:1。
 
         v3.1: 排除 data_quality >= 1 的异常样本 (不参与 LSTM 训练).
+        v3.1: 支持 MIC 特征筛选 (cfg["mic_features"] → 动态选择特征列).
         """
         pv = data["pv_power"]
         load = data["load_power"]
@@ -658,6 +678,28 @@ class LSTMTrainer:
         temp = data["temperature"]
         hours = data.get("hours", np.arange(len(pv), dtype=np.float32) * 15 / 60 % 24)
         quality = data.get("data_quality")  # v3.1: 质量标注
+
+        # v3.1: MIC 特征筛选 — 动态构建特征列表
+        mic_features = self.config.get("mic_features")
+        _ALL_FEATURES = [
+            ("pv_power", lambda idx: pv[idx]),
+            ("load_power", lambda idx: load[idx]),
+            ("solar_irradiance", lambda idx: ghi[idx]),
+            ("temperature", lambda idx: temp[idx]),
+            ("hour_sin", lambda idx: math.sin(hours[idx] * 2 * math.pi / 24)),
+            ("hour_cos", lambda idx: math.cos(hours[idx] * 2 * math.pi / 24)),
+            ("pv_power_lag96", lambda idx: pv[idx - 96] if idx >= 96 else pv[idx]),
+        ]
+        if mic_features is not None:
+            selected = [(n, f) for n, f in _ALL_FEATURES if n in mic_features]
+            if len(selected) == 0:
+                print(f"  [WARN] MIC 特征为空, 使用全部 7 个默认特征")
+                selected = _ALL_FEATURES
+            else:
+                print(f"  MIC 特征: {len(selected)}/{len(_ALL_FEATURES)} ({[n for n,_ in selected]})")
+        else:
+            selected = _ALL_FEATURES
+        input_dim = len(selected)
 
         # v3.0: MSSA 搜索的 input_window 优先, legacy input_seq_len 作为 fallback
         seq_len = self.config.get("input_window") or self.config["input_seq_len"]
@@ -702,20 +744,14 @@ class LSTMTrainer:
         output_mode = self.config.get("output_mode", "legacy")
         if output_mode == "p10p50p90":
             # (N, 2, 15, 3): PV/Load × 15步 × (P10, P50, P90)
-            X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
+            X = np.zeros((n_samples, seq_len, input_dim), dtype=np.float32)
             y = np.zeros((n_samples, 2, forecast, 3), dtype=np.float32)
 
             for out_i, src_i in enumerate(balanced):
                 for j in range(seq_len):
                     idx = src_i + j
-                    h = hours[idx]
-                    X[out_i, j, 0] = pv[idx]
-                    X[out_i, j, 1] = load[idx]
-                    X[out_i, j, 2] = ghi[idx]
-                    X[out_i, j, 3] = temp[idx]
-                    X[out_i, j, 4] = math.sin(h * 2 * math.pi / 24)
-                    X[out_i, j, 5] = math.cos(h * 2 * math.pi / 24)
-                    X[out_i, j, 6] = pv[idx - 96] if idx >= 96 else pv[idx]
+                    for f_idx, (_, builder) in enumerate(selected):
+                        X[out_i, j, f_idx] = builder(idx)
 
                 for k in range(forecast):
                     target_idx = src_i + seq_len + k
@@ -733,7 +769,7 @@ class LSTMTrainer:
             # legacy: (N, 47) 或 (N, 30)
             d10_dim = 17
             total_output = forecast * 2 + d10_dim
-            X = np.zeros((n_samples, seq_len, 7), dtype=np.float32)
+            X = np.zeros((n_samples, seq_len, input_dim), dtype=np.float32)
             y = np.zeros((n_samples, total_output), dtype=np.float32)
 
             d10_horizon_steps = [forecast // 3, forecast * 2 // 3, forecast - 1]
@@ -820,8 +856,10 @@ class LSTMTrainer:
             X_val, y_val = self.prepare_data(val_data)
             print(f"  验证样本: {len(X_val)}")
 
+        mic_features = self.config.get("mic_features")
+        model_input_dim = len(mic_features) if mic_features else 7
         self.model = LSTMForecast(
-            input_dim=7, hidden_dim=cfg["hidden_dim"],
+            input_dim=model_input_dim, hidden_dim=cfg["hidden_dim"],
             num_layers=cfg["num_layers"], forecast_steps=cfg["forecast_steps"],
             dropout=cfg["dropout"],
             with_d10=cfg.get("with_d10", True),
@@ -830,6 +868,8 @@ class LSTMTrainer:
             with_tcn=cfg.get("with_tcn", True),   # v3.1: TCN 特征提取 (R2 默认开启)
         )
         self.model.input_window = cfg.get("input_window", 12)
+        if mic_features:
+            self.model.input_features = mic_features
         self.model.to(self.device)
 
         optimizer = _torch.optim.Adam(self.model.parameters(), lr=cfg["learning_rate"])

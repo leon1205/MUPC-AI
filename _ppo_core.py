@@ -487,7 +487,7 @@ if __name__ == "__main__":
     # 1. MLPPolicy 2 维输出验证 (v2.15)
     print("\n[1] MLPPolicy 2 维输出...")
     policy = MLPPolicy(obs_dim=78, act_dim=2)
-    obs = np.random.randn(58).astype(np.float32)
+    obs = np.random.randn(78).astype(np.float32)
     action, value = policy.forward(obs[np.newaxis, :])
     assert action.shape == (1, 2), f"action shape {action.shape} != (1,2)"
     assert -1.0 <= action[0, 0] <= 1.0, f"p_ref {action[0,0]} out of [-1,1]"

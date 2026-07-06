@@ -391,9 +391,9 @@ def main():
                     ec_onnx = export_onnx.export_error_correction(
                         ec_checkpoint, "./exported_models/")
                     print(f"误差修正 ONNX 已导出: {ec_onnx}")
-                except Exception as e:
+                except (RuntimeError, ImportError, OSError) as e:
                     print(f"[WARN] 误差修正 ONNX 导出失败: {e}")
-        except Exception as e:
+        except (RuntimeError, ImportError, OSError) as e:
             print(f"ONNX 导出失败: {e}")
 
 
