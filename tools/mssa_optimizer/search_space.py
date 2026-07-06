@@ -34,13 +34,7 @@ SEARCH_SPACE = [
 
 DIM = len(SEARCH_SPACE)
 
-# 训练端 KEY_MAP: MSSA 参数名 → train.py lstm_cfg 参数名
-KEY_MAP = {
-    "hidden_size": "hidden_dim",
-    "num_layers": "num_layers",
-    "learning_rate": "learning_rate",
-    "batch_size": "batch_size",
-}
+# 注意: KEY_MAP 权威定义在 train.py (parse_mssa_config), 此处为参考副本, 请勿以此为准
 
 
 def encode(params: dict[str, Any]) -> np.ndarray:

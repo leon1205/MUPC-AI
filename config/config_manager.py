@@ -27,6 +27,7 @@ import yaml
 
 @dataclass
 class PhysicalConfig:
+    """物理常量配置 (权威来源: mupc_env/constants.py, 此处默认值需与之对齐)"""
     transformer_kva: float = 200.0
     battery_capacity_kwh: float = 100.0
     p_batt_max_kw: float = 50.0
@@ -132,27 +133,25 @@ class ActionConstraintConfig:
 
 @dataclass
 class ActionSpaceConfig:
+    """v2.15 精简为 2 维 [p_ref, k_droop]"""
     p_ref_norm_min: float = -1.0
     p_ref_norm_max: float = 1.0
     k_droop_norm_min: float = -1.0
     k_droop_norm_max: float = 1.0
-    load_shed_norm_min: float = 0.0
-    load_shed_norm_max: float = 1.0
-    pv_limit_min: float = 0.0
-    pv_limit_max: float = 1.0
-    confidence_min: float = 0.0
-    confidence_max: float = 1.0
+    # 以下字段 v2.15 已下沉至 strategy-engine, 不再作为动作维度:
+    # load_shedding=0.0, pv_limit=1.0, confidence=0.5
 
 
 @dataclass
 class ObsNormalizationConfig:
+    """v3.1 对齐 mupc_env/constants.py NORM_* 常量"""
     d1_pv_range: list = field(default_factory=lambda: [0.0, 150.0])
     d1_load_range: list = field(default_factory=lambda: [0.0, 60.0])
-    d1_power_range: list = field(default_factory=lambda: [-500.0, 500.0])
+    d1_power_range: list = field(default_factory=lambda: [-200.0, 200.0])     # v3.1: -500→-200
     d1_voltage_range: list = field(default_factory=lambda: [0.85, 1.15])
     d5_irradiance_range: list = field(default_factory=lambda: [0.0, 1500.0])
     d5_temp_range: list = field(default_factory=lambda: [-20.0, 60.0])
-    d6_dispatch_range: list = field(default_factory=lambda: [-500.0, 500.0])
+    d6_dispatch_range: list = field(default_factory=lambda: [-200.0, 200.0])  # v3.1: -500→-200
 
 
 @dataclass

@@ -102,11 +102,11 @@ action_space:
 obs_normalization:
   d1_pv_range: [0.0, 150.0]      # D1 光伏归一化范围 (匹配 pv_array_kw)
   d1_load_range: [0.0, 60.0]      # D1 负荷归一化范围 (匹配 load_peak_kw)
-  d1_power_range: [-500.0, 500.0] # D1 功率归一化范围
+  d1_power_range: [-200.0, 200.0] # D1 功率归一化范围 (v3.1 对齐 constants.py)
   d1_voltage_range: [0.85, 1.15]  # D1 电压归一化范围
   d5_irradiance_range: [0.0, 1500.0] # D5 辐照归一化范围
   d5_temp_range: [-20.0, 60.0]    # D5 温度归一化范围
-  d6_dispatch_range: [-500.0, 500.0] # D6 调度归一化范围
+  d6_dispatch_range: [-200.0, 200.0] # D6 调度归一化范围 (v3.1 对齐 constants.py)
 
 # ═══════════════════════════════════════════════════════════════
 # 场景奖励权重 (MODE-01~MODE-05, v2.15 对齐下游)
