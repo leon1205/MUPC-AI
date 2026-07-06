@@ -194,6 +194,49 @@ def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
     return -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
 
 
+def _compute_safety_margin(v_avg: float, load_rate: float,
+                            soc: float, epsilon: float = 0.01) -> float:
+    """安全边界 Log-barrier 软化 (v3.1 专家评审建议).
+
+    将硬截断的安全边界替换为连续可导的 Log-barrier:
+      - 远离边界时 ≈ 0 (几乎不影响奖励)
+      - 接近边界时 → 负值增大 (引导智能体"远离"边界)
+
+    监控边界:
+      - 电压上限 1.15 p.u. / 下限 0.85 p.u.
+      - 变压器负载 0.85 过载阈值
+      - SOC 下限 0.10 / 上限 0.90 (硬约束, 仅做预警)
+
+    Returns:
+        float ∈ [-5.0, 0.0], 已归一化至与其它奖励分量可比的尺度。
+    """
+    penalty = 0.0
+
+    # 电压边界 (Log-barrier)
+    margin_v_upper = 1.15 - v_avg
+    margin_v_lower = v_avg - 0.85
+    if margin_v_upper < 0.05:
+        penalty -= max(0.0, -np.log(max(margin_v_upper, epsilon)))
+    if margin_v_lower < 0.05:
+        penalty -= max(0.0, -np.log(max(margin_v_lower, epsilon)))
+
+    # 变压器过载边界 (Log-barrier)
+    margin_load = 0.85 - load_rate
+    if margin_load < 0.05:
+        penalty -= max(0.0, -np.log(max(margin_load, epsilon)))
+
+    # SOC 边界预警 (Log-barrier, 仅在接近硬约束时生效)
+    margin_soc_upper = 0.90 - soc
+    margin_soc_lower = soc - 0.10
+    if margin_soc_lower < 0.05:
+        penalty -= max(0.0, -0.5 * np.log(max(margin_soc_lower, epsilon)))
+    if margin_soc_upper < 0.05:
+        penalty -= max(0.0, -0.5 * np.log(max(margin_soc_upper, epsilon)))
+
+    # 归一化: /5 使 penalty ∈ [-5, 0] → clip 至 [-1, 0]
+    return float(np.clip(penalty / 5.0, -1.0, 0.0))
+
+
 def _compute_safety_override(active: bool, consecutive: int,
                              ratio: float) -> float:
     """安全覆盖惩罚 (v2.17 对齐下游 v2.14 safety_override_penalty_impl).
@@ -384,6 +427,11 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
     w8 = w[7] if len(w) > 7 else 0.0
     w9 = w[8] if len(w) > 8 else 0.0
 
+    # v3.1: 安全边界 Log-barrier 软化 (专家评审建议)
+    load_rate = r.get("load_rate_unclamped", r.get("load_rate", 0.5))
+    r_safety_margin = _compute_safety_margin(v_avg, load_rate, soc_new)
+    r_safety_margin_norm = float(np.clip(r_safety_margin, -1.0, 0.0))
+
     # Welford 原始奖励 (前 4 个分量: r_pv, p_batt_deg, p_overload, r_pq)
     raw_reward = w[0] * r_pv - alpha * w[1] * p_batt_deg - w[2] * p_overload + w4 * r_pq
 
@@ -413,6 +461,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
              + w7 * r_smooth_norm
              + w8 * r_safety_norm
              + w9 * r_readiness
+             + 0.1 * r_safety_margin_norm    # v3.1: Log-barrier 安全边界 (小权重)
              + r_shaping
              + r_soc_balance
              + r_state_improve)
@@ -426,6 +475,7 @@ def _reward_agri(r: dict, w: list[float]) -> tuple[float, dict]:
         "r_voltage_slope": float(r_voltage_slope),
         "r_smooth": float(r_smooth),
         "r_safety_override": float(r_safety),
+        "r_safety_margin": float(r_safety_margin),  # v3.1 Log-barrier
         "r_shock_readiness": float(r_readiness),
         "r_shaping": float(r_shaping),
         "r_soc_balance": float(r_soc_balance),

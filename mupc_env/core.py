@@ -142,11 +142,16 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
         self._safety_override_active: bool = False
         self._safety_override_p_ref: float = 0.0
 
-        # v2.13: Welford 动态归一化
+        # v2.13: Welford 动态归一化 (总分)
         self._welford_mean: float = 0.0
         self._welford_m2: float = 1.0
         self._welford_count: int = 0
         self._prev_v_dev: float = 0.0
+
+        # v3.1: 逐分量 EMA 自适应归一化 (专家评审建议)
+        # 跟踪每个奖励分量的 EMA mean/std，用于检测固定归一化除数的漂移
+        self._ema_alpha: float = 0.001  # EMA 平滑系数
+        self._comp_ema: dict[str, tuple[float, float]] = {}  # name → (mean, var)
 
         # v2.14: SafetyOverride 精细化跟踪
         self._override_count: int = 0
@@ -251,6 +256,10 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             "mean": float(self._welford_mean),
             "std": std,
             "is_normalized": self._welford_count >= 100,
+            # v3.1: 逐分量 EMA 统计 (专家评审建议, 用于检测分量漂移)
+            "component_ema": {k: {"mean": round(float(m), 6),
+                                   "std": round(float(np.sqrt(v)), 6)}
+                              for k, (m, v) in self._comp_ema.items()},
         }
 
     # ── 辅助状态构建 ────────────────────────────────────
@@ -575,7 +584,25 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
             delta2 = welford_raw - self._welford_mean
             self._welford_m2 += delta * delta2
 
-        # ── Welford 奖励归一化 (v2.18) ──
+        # v3.1: 逐分量 EMA 自适应归一化更新 (专家评审建议)
+        # 跟踪 6 个关键奖励分量的 moving average mean/var
+        _tracked_keys = ["r_pv_consumption", "p_transformer_overload",
+                         "r_pq_coordination", "r_safety_override",
+                         "r_smooth", "r_safety_margin"]
+        alpha = self._ema_alpha
+        for key in _tracked_keys:
+            val = reward_info.get(key, None)
+            if val is not None:
+                val = float(val)
+                if key not in self._comp_ema:
+                    self._comp_ema[key] = (val, 0.0)
+                old_mean, old_var = self._comp_ema[key]
+                new_mean = old_mean + alpha * (val - old_mean)
+                new_var = old_var + alpha * ((val - new_mean) ** 2 - old_var)
+                self._comp_ema[key] = (new_mean, max(new_var, 1e-8))
+        reward_info["ema_component_count"] = len(self._comp_ema)
+
+        # ── Welford 奖励归一化 (v2.18, v3.1 增强) ──
         # 历史 bug: Welford 仅累积, 从未读取用于归一化奖励. 这导致 PPO
         # 在奖励尺度变化时训练不稳定. 修复: 累积到足够样本后, 用
         # Welford 统计量把原始奖励归一化到 N(0, 1) 区间, 再返回给 trainer.
