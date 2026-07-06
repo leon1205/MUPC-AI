@@ -371,7 +371,7 @@ def export_error_correction_onnx(model: ErrorCorrectionBiLSTM,
             "mupc_model_type": "error_correction",
             "mupc_residual_window": str(residual_window),
             "mupc_output_horizon": str(model.output_horizon),
-            "mupc_version": "v3.0.1",
+            "mupc_version": "v3.1.0",
         },
     )
 

@@ -62,6 +62,7 @@ class ObjectiveEvaluator:
             "--no-error-correction",
             "--mode", self.mode,
             "--data-source", self.data_source,
+            "--total-timesteps", str(self.train_steps),
             "--config", config_path,
         ]
 

@@ -586,6 +586,7 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
 
         # v3.1: 逐分量 EMA 自适应归一化更新 (专家评审建议)
         # 跟踪 6 个关键奖励分量的 moving average mean/var
+        # 注意: 仅 MODE-01 (_reward_agri) 输出全部 6 个分量; 多模式训练时仅 MODE-01 步计入
         _tracked_keys = ["r_pv_consumption", "p_transformer_overload",
                          "r_pq_coordination", "r_safety_override",
                          "r_smooth", "r_safety_margin"]

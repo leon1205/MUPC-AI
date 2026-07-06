@@ -269,12 +269,14 @@ def main():
                         ec_path = os.path.join(args.checkpoint_path, "error_correction.pt")
                         torch.save(ec_result["model"].state_dict(), ec_path)
                         print(f"误差修正 checkpoint 已保存: {ec_path}")
-                        if ec_result.get("bias_gate_enabled"):
-                            print(f"  Bias Gate: 已启用 (MAPE > 3%)")
-                        else:
-                            print(f"  Bias Gate: 未启用 (MAPE <= 3%, 跳过)")
+                        bias_pv = ec_result.get("bias_pv", 0.0)
+                        bias_load = ec_result.get("bias_load", 0.0)
+                        print(f"  Bias Gate: 已启用 (PV={bias_pv:.1%}, Load={bias_load:.1%} > 3%)")
                     else:
-                        print(f"  误差修正训练跳过: {ec_result.get('reason', '未知')}")
+                        bias_pv = ec_result.get("bias_pv", 0.0)
+                        bias_load = ec_result.get("bias_load", 0.0)
+                        skip_reason = "Bias不足" if ec_result.get("skip") else "未知"
+                        print(f"  误差修正跳过: {skip_reason} (PV={bias_pv:.1%}, Load={bias_load:.1%})")
                 except Exception as e:
                     print(f"[WARN] 误差修正训练失败 (不影响主流程): {e}")
         except Exception as e:

@@ -79,7 +79,6 @@ class MssaOptimizer:
                 else:
                     # 跟随: 在最优麻雀附近觅食
                     A = np.random.choice([-1, 1], DIM)
-                    A_plus = A @ A.T
                     new_positions[i] = best_pos + np.abs(positions[i] - best_pos) * A
 
             # ── 警戒者更新 (最后 n_sentinel) ──

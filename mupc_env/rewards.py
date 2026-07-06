@@ -33,6 +33,7 @@ from .constants import (
     P_REF_RESERVE_TARGET,
     SHOCK_READINESS_W_SOC,
     SHOCK_READINESS_W_P,
+    K_DROOP_MAX,
 )
 
 
@@ -188,47 +189,51 @@ def _compute_droop_smoothness(k_droop: float, prev_k_droop: float) -> float:
     """下垂系数平滑惩罚 (v2.17 对齐下游 Rust K_MAX=30, lambda=10)。"""
     if k_droop == 0.0 and prev_k_droop == 0.0:
         return 0.0
-    K_MAX = 30.0           # v2.17: 50→30 (对齐下游)
     lambda_smooth = 10.0   # v2.17: 1→10 (对齐下游)
     delta_k = abs(k_droop - prev_k_droop)
-    return -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_MAX))
+    return -(delta_k + lambda_smooth * max(0.0, abs(k_droop) - K_DROOP_MAX))
 
 
 def _compute_safety_margin(v_avg: float, load_rate: float,
                             soc: float, epsilon: float = 0.01) -> float:
     """安全边界 Log-barrier 软化 (v3.1 专家评审建议).
 
-    将硬截断的安全边界替换为连续可导的 Log-barrier:
-      - 远离边界时 ≈ 0 (几乎不影响奖励)
-      - 接近边界时 → 负值增大 (引导智能体"远离"边界)
+    使用参考边界 (reference margin) 重缩放的 Log-barrier:
+      - margin >= ref → penalty = 0 (远离边界, 无干扰)
+      - margin <  ref → penalty = -log(margin/ref) (连续递增)
+      - margin → 0   → penalty → ∞ (饱和到 -1.0)
 
-    监控边界:
-      - 电压上限 1.15 p.u. / 下限 0.85 p.u.
-      - 变压器负载 0.85 过载阈值
-      - SOC 下限 0.10 / 上限 0.90 (硬约束, 仅做预警)
+    参考边界: 电压 0.10 (10%), 负载 0.20 (20%), SOC 0.20 (20%)
 
     Returns:
-        float ∈ [-5.0, 0.0], 已归一化至与其它奖励分量可比的尺度。
+        float ∈ [-1.0, 0.0]
+
+    典型值:
+      安全态 (v=1.0,load=0.5,soc=0.5) → 0.0
+      警告态 (v=1.10,load=0.80,soc=0.15) → ~-0.55
+      危险态 (v=1.145,load=0.849,soc=0.11) → -1.0 (饱和)
     """
     penalty = 0.0
+    ref_v = 0.10         # 电压参考边界: margin >= 10% = 安全
+    ref_load = 0.20      # 负载参考边界: margin >= 20% = 安全
+    ref_soc = 0.20       # SOC 参考边界: margin >= 20% = 安全
 
-    # 电压边界 (Log-barrier, 连续可导, 远离边界时自然趋近于0)
-    margin_v_upper = 1.15 - v_avg
-    margin_v_lower = v_avg - 0.85
-    penalty -= max(0.0, -np.log(max(margin_v_upper, epsilon)))
-    penalty -= max(0.0, -np.log(max(margin_v_lower, epsilon)))
+    # 电压边界 (margin/ref >= 1 → -log>=0 → max(0, neg)=0)
+    margin_v_upper = max(1.15 - v_avg, epsilon)
+    margin_v_lower = max(v_avg - 0.85, epsilon)
+    penalty -= max(0.0, -np.log(margin_v_upper / ref_v))
+    penalty -= max(0.0, -np.log(margin_v_lower / ref_v))
 
-    # 变压器过载边界 (Log-barrier)
-    margin_load = 0.85 - load_rate
-    penalty -= max(0.0, -np.log(max(margin_load, epsilon)))
+    # 变压器过载边界
+    margin_load = max(0.85 - load_rate, epsilon)
+    penalty -= max(0.0, -np.log(margin_load / ref_load))
 
-    # SOC 边界预警 (Log-barrier, 半权重, 远离边界时自然趋近于0)
-    margin_soc_upper = 0.90 - soc
-    margin_soc_lower = soc - 0.10
-    penalty -= max(0.0, -0.5 * np.log(max(margin_soc_lower, epsilon)))
-    penalty -= max(0.0, -0.5 * np.log(max(margin_soc_upper, epsilon)))
+    # SOC 边界预警 (半权重)
+    margin_soc_upper = max(0.90 - soc, epsilon)
+    margin_soc_lower = max(soc - 0.10, epsilon)
+    penalty -= max(0.0, -0.5 * np.log(margin_soc_lower / ref_soc))
+    penalty -= max(0.0, -0.5 * np.log(margin_soc_upper / ref_soc))
 
-    # 归一化: /5 使 penalty ∈ [-5, 0] → clip 至 [-1, 0]
     return float(np.clip(penalty / 5.0, -1.0, 0.0))
 
 
