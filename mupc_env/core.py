@@ -265,116 +265,55 @@ class MupcEnv(gym.Env if _GYM_AVAILABLE else _GymStubEnv):
     # ── 辅助状态构建 ────────────────────────────────────
 
     def _make_env_state(self, forecast: np.ndarray | None = None) -> observation.EnvState:
-        """从当前 self._* 状态构建 EnvState 快照 (用于观测构建)。
-
-        v2.18: forecast 参数用于 D10 字段 (LSTM 推理结果, 47 维)
-        - 训练时 D10 走 LSTM 头 (47 维), 消除训练-部署 gap
-        - 冷启动保护: LSTM D10 头 count < 阈值时, D10 fallback 到 data 合成
-        - Oracle / 无 LSTM 时: D10 完全走 data 合成 (向后兼容)
-        """
-        # D10 概率负荷预测: 优先 LSTM 推理 (forecast 47 维), fallback 到 data 合成
-        use_lstm_d10 = (
-            forecast is not None
-            and len(forecast) >= 47
-            and hasattr(self._predictor, "_d10_trained_count")
-            and self._predictor._d10_trained_count >= self._D10_WARMUP_THRESHOLD
-        )
-        if use_lstm_d10:
-            # LSTM D10 头输出: forecast[30:45]=quantiles, [45]=shock_prob, [46]=base_load
-            quantiles = forecast[30:45].astype(np.float32)
-            shock_prob = float(np.clip(forecast[45], 0.0, 1.0))
-            base_load = float(max(0.0, forecast[46]))
-        elif "load_forecast_quantiles" in self._data:
-            # fallback 1: data 合成 (LSTM 未达 warmup 阈值)
-            quantiles = self._data["load_forecast_quantiles"][self._step_idx].astype(np.float32)
-            shock_prob = float(self._data["shock_load_probability"][self._step_idx]) \
-                if "shock_load_probability" in self._data else 0.0
-            base_load = float(self._data["base_load"][self._step_idx]) \
-                if "base_load" in self._data else float(self._data["load_power"][self._step_idx])
-        else:
-            # fallback 2: 简单数学合成
-            base = float(self._data["load_power"][self._step_idx])
-            quantiles = (base * np.linspace(0.85, 1.27, 15)).astype(np.float32)
-            shock_prob = 0.0
-            base_load = base
-
-        return observation.EnvState(
-            soc=self._soc,
-            pv_power=float(self._data["pv_power"][self._step_idx]),
-            load_power=float(self._data["load_power"][self._step_idx]),
-            grid_power=self._grid_power,
-            load_rate=self._load_rate,
+        """构建 EnvState 快照 — v3.1 委托给 state_builder (A-4)."""
+        from .state_builder import build_env_state
+        d10_count = getattr(self._predictor, "_d10_trained_count", 0)
+        return build_env_state(
+            soc=self._soc, step_idx=self._step_idx, data=self._data,
+            grid_power=self._grid_power, load_rate=self._load_rate,
             battery_power_prev=self._battery_power_prev,
             va=self._va, vb=self._vb, vc=self._vc,
             q_realtime_margin=self._q_realtime_margin,
-            current_price=float(self._data["current_electricity_price"][self._step_idx]),
-            next_price=float(self._data["next_period_price"][self._step_idx]),
-            tariff_id=float(self._data["price_tariff_id"][self._step_idx]),
-            peak_price=float(self._data.get("peak_price",
-                np.array([1.5]))[self._step_idx] if "peak_price" in self._data else 1.5),
-            valley_price=float(self._data.get("valley_price",
-                np.array([0.40]))[self._step_idx] if "valley_price" in self._data else 0.40),
-            current_demand=self._current_demand,
-            peak_demand=self._peak_demand,
-            solar_irradiance=float(self._data["solar_irradiance"][self._step_idx]),
-            temperature=float(self._data["temperature"][self._step_idx]),
-            dispatch_p_set=float(self._data["dispatch_p_set"][self._step_idx]),
-            dispatch_q_set=float(self._data["dispatch_q_set"][self._step_idx])
-                if "dispatch_q_set" in self._data else 0.0,
             season_encoding=self._season_encoding,
             time_period_encoding=self._time_period_encoding,
+            current_demand=self._current_demand, peak_demand=self._peak_demand,
             safety_override_active=self._safety_override_active,
             safety_override_p_ref=self._safety_override_p_ref,
             override_consecutive=self._override_consecutive,
             override_ratio=self._override_ratio,
-            load_forecast_quantiles=quantiles,
-            shock_load_probability=shock_prob,
-            base_load=base_load,
             current_mode=self._current_mode,
             is_multi_mode=(self._mode == "all"),
+            forecast=forecast, d10_warmup_count=d10_count,
         )
 
     def _make_reward_dict(self, **extra) -> dict:
-        """组装奖励函数所需的 r dict (纯数据，不引用 self)。"""
-        r = {
-            "p_batt": extra["p_batt"],
-            "q_batt": extra["q_batt"],
-            "load_shed": extra["load_shed"],
-            "pv_limit": extra["pv_limit"],
-            "p_pv_raw": extra["p_pv_raw"],
-            "p_load_raw": extra["p_load_raw"],
-            "p_load_eff": extra["p_load_eff"],
-            "grid_power": extra["grid_power"],
-            "load_rate": extra["load_rate"],
-            "load_rate_unclamped": extra.get("load_rate_unclamped", extra["load_rate"]),
-            "soc": self._soc,
-            "soc_new": extra["soc_new"],
-            "soc_clipped": extra.get("soc_clipped", False),
-            "va": extra["va"], "vb": extra["vb"], "vc": extra["vc"],
-            "prev_p_batt": extra["prev_p_batt"],
-            "prev_v_avg": extra["prev_v_avg"],
-            "prev_v_dev": extra["prev_v_dev"],
-            "k_droop": extra.get("k_droop", 0.0),
-            "prev_k_droop": extra.get("prev_k_droop", 0.0),
-            "voltage_violation_count": self._voltage_violation_count,
-            "safety_override_active": self._safety_override_active,
-            "safety_override_p_ref": self._safety_override_p_ref,
-            "override_consecutive": self._override_consecutive,
-            "override_ratio": self._override_ratio,
-            # 奖励函数中隐式依赖的附加字段
-            "q_realtime_margin": self._q_realtime_margin,
-            "current_demand": self._current_demand,
-            "prev_p_batt_raw": self._prev_p_batt,
-            "dispatch_p_set": float(self._data["dispatch_p_set"][self._step_idx]),
-            "current_price": float(self._data["current_electricity_price"][self._step_idx]),
-            # v2.17: D10 冲击负荷预备度奖励所需字段
-            "base_load": float(self._data["base_load"][self._step_idx])
-                if "base_load" in self._data else float(self._data["load_power"][self._step_idx]),
-            "load_forecast_quantiles": self._data["load_forecast_quantiles"][self._step_idx].astype(np.float32)
-                if "load_forecast_quantiles" in self._data
-                else (float(self._data["load_power"][self._step_idx]) * np.linspace(0.85, 1.27, 15)).astype(np.float32),
-        }
-        return r
+        """组装奖励函数 r dict — v3.1 委托给 state_builder (A-4)."""
+        from .state_builder import build_reward_dict
+        return build_reward_dict(
+            p_batt=extra["p_batt"], q_batt=extra["q_batt"],
+            load_shed=extra["load_shed"], pv_limit=extra["pv_limit"],
+            p_pv_raw=extra["p_pv_raw"], p_load_raw=extra["p_load_raw"],
+            p_load_eff=extra["p_load_eff"],
+            grid_power=extra["grid_power"], load_rate=extra["load_rate"],
+            load_rate_unclamped=extra.get("load_rate_unclamped"),
+            k_droop=extra.get("k_droop", 0.0),
+            prev_k_droop=extra.get("prev_k_droop", 0.0),
+            soc=self._soc, soc_new=extra["soc_new"],
+            soc_clipped=extra.get("soc_clipped", False),
+            va=extra["va"], vb=extra["vb"], vc=extra["vc"],
+            prev_p_batt=extra["prev_p_batt"],
+            prev_v_avg=extra["prev_v_avg"],
+            prev_v_dev=extra["prev_v_dev"],
+            voltage_violation_count=self._voltage_violation_count,
+            safety_override_active=self._safety_override_active,
+            safety_override_p_ref=self._safety_override_p_ref,
+            override_consecutive=self._override_consecutive,
+            override_ratio=self._override_ratio,
+            q_realtime_margin=self._q_realtime_margin,
+            current_demand=self._current_demand,
+            prev_p_batt_raw=self._prev_p_batt,
+            step_idx=self._step_idx, data=self._data,
+        )
 
     # ── Gymnasium 接口 ────────────────────────────────────
 
