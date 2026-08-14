@@ -1,20 +1,4 @@
-# MUPC AI 优化引擎 - 模块产品需求文档（统一版 v3.1）
-
-> **版本：** v3.1 | **状态：** [REVIEWED: PASS] | **更新日期：** 2026-06-21
-
-### 变更记录
-
-| 版本 | 日期 | 作者 | 变更说明 | 评审状态 |
-|------|------|------|----------|----------|
-| v3.1 | 2026-06-21 | 架构师 | 第 3 章系统性重构：将 v2.16/v3.0 版本增量描述合并为统一分层混合架构描述（MIC→VMD→LSTM+Attention→误差修正→MSSA），§3.7 安全 RL 包装器移至 §6.7 | [REVIEWED: PASS] |
-| v3.0 | 2026-06-21 | 需求分析师 | 预测增强分层混合架构：VMD 信号分解 + Attention 注意力机制 + BiLSTM 增强 + 误差修正 BiLSTM + MSSA 超参优化，五层混合架构提升光伏/负荷预测精度 | [REVIEWED: PASS] |
-| v2.17 | 2026-06-18 | 需求分析师 | 安全 RL 包装器：物理模型事前预测拒绝、线路阻抗配置化、RobustnessManager 协同、Web API 状态端点、Web UI 监控面板 | [REVIEWED: PASS] |
-| v2.16 | 2026-06-18 | 需求分析师 | LSTM 模型优化：步长统一为 15 分钟、15 步分位数预测、D10 数据流通、删除 confidence 字段、消除冗余推理 | [REVIEWED: PASS] |
-| v2.15 | 2026-06-17 | 需求分析师 | 动作空间精简：5维→2维（移除load_shedding/pv_limit/confidence），下沉至策略引擎 | [REVIEWED: PASS] |
-| v2.14 | 2026-06-15 | - | SafetyOverride 奖励函数重构、FusedSystemState 78维统一 | [REVIEWED: PASS] |
-| v2.13 | 2026-06-14 | - | Sigmoid P-Q平滑化、Welford奖励归一化、confidence字段 | [REVIEWED: PASS] |
-
----
+# MUPC AI 优化引擎 - 模块产品需求文档（统一版）
 
 ## 1. 产品概述
 
@@ -692,10 +676,6 @@ prediction_enhancement:
 
 ## 4. 多源数据融合
 
----
-
-## 4. 多源数据融合
-
 ### 4.1 功能概述
 
 DataFusionEngine 负责周期性（默认 1Hz，可配置 1s~60s）从多个数据源采集数据，融合为统一的 `FusedSystemState`，供场景分类器和 RL 决策器使用。
@@ -736,15 +716,14 @@ DataFusionEngine 负责周期性（默认 1Hz，可配置 1s~60s）从多个数�
 | FUSION-09 | 数据源连续 3 周期无更新时，产生 WARN 级别告警 | 集成测试 |
 | FUSION-10 | 数据源健康状态通过 Web UI 实时展示（绿色=正常，黄色=延迟，红色=断连）| UI 集成测试 |
 
-### 4.5 SafetyOverride 帧类型接口规范（v2.10）
-
+### 4.5 SafetyOverride 帧类型接口规范
 核间 TCP 通信定义 `FrameType::SafetyOverride = 0x0040` 帧类型（hex 值 0x0040），供实时控制模块在极端工况下临时覆盖 AI 有功指令。
 
 **SafetyOverridePayload 结构体：**
 
 | 字段 | 类型 | 单位 | 说明 |
 |------|------|------|------|
-| trigger_reason | String | - | 触发原因：voltage_violation / q_exhausted / emergency / other。**v2.15 起仅用于日志/审计**，不进入 FusedSystemState D9，奖励函数不再按 reason 差异化 |
+| trigger_reason | String | - | 触发原因：voltage_violation / q_exhausted / emergency / other。**仅用于日志/审计**，不进入 FusedSystemState D9，奖励函数不再按 reason 差异化 |
 | override_p_ref | f64 | kW | 强制放电功率（实时模块计算的代际参考值） |
 | duration_ms | u32 | ms | 覆盖持续时间 |
 | recovery_condition | String | - | 恢复条件：voltage_recovered / q_margin_available / manual_reset |
@@ -798,8 +777,7 @@ DataFusionEngine 负责周期性（默认 1Hz，可配置 1s~60s）从多个数�
 | 并发控制 | 多来源同时切换时，以时间戳最晚的指令为准（Last-Write-Wins） |
 | 切换通知 | 通过消息总线 topic `ai/mode_switch` 广播切换事件 |
 
-### 5.5 场景切换平滑过渡（v2.10）
-
+### 5.5 场景切换平滑过渡
 场景切换时奖励函数权重线性插值过渡，避免策略震荡：
 
 ```rust
@@ -881,7 +859,7 @@ pub struct ModeSwitchEvent {
 
 RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场景标签，输出 2 维动作空间的最优控制指令。
 
-**电压感知 P/Q 协同控制（v2.2）：** AI 引擎感知台区电压水平，在以下场景执行有功/无功协调控制：
+**电压感知 P/Q 协同控制：** AI 引擎感知台区电压水平，在以下场景执行有功/无功协调控制：
 
 | 场景 | 电压特征 | P 控制 | Q 控制 | 物理机理 |
 |------|----------|--------|--------|----------|
@@ -889,11 +867,11 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | 农网灌溉（抽水） | 电压降低（<0.95 p.u.） | 放电补充能量缺口 | 释放容性无功补偿励磁 | 减少线路无功流 → 降低压降 |
 | 末端低电压（夜间） | 电压降低（<0.95 p.u.） | 放电（仅当 Q 不足时） | 释放容性无功（优先） | 就地补偿减少传输损耗 |
 
-**v2.2 架构说明：** 三相电压幅值（D1 实时数据）与 v2.1 移除的电能质量 D5 是不同用途：
-- v2.1 移除的 D5：三相不平衡度 + 频率 → 电能质量监测，由实时控制核心独立处理
-- v2.2 新增到 D1：三相电压幅值 → 过/低电压检测 → P/Q 控制策略，是 AI 引擎决策的必要输入
+**架构说明：** 三相电压幅值（D1 实时数据）与移除的电能质量 D5 是不同用途：
+- 移除的 D5：三相不平衡度 + 频率 → 电能质量监测，由实时控制核心独立处理
+- 新增到 D1：三相电压幅值 → 过/低电压检测 → P/Q 控制策略，是 AI 引擎决策的必要输入
 
-### 6.2 状态空间定义（10 大类，78 维，v2.14）
+### 6.2 状态空间定义（10 大类，78 维）
 
 ⚠️ **[⚠️待确认冲突]** PRD 历史版本标题写"59 维"为错误，实际为 **78 维**
 
@@ -908,7 +886,7 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | | voltage_phase_a | f64 | [0.8, 1.2] | p.u. | A 相电压标幺值（用于过/低电压检测，指导 P/Q 控制）| intercore |
 | | voltage_phase_b | f64 | [0.8, 1.2] | p.u. | B 相电压标幺值 | intercore |
 | | voltage_phase_c | f64 | [0.8, 1.2] | p.u. | C 相电压标幺值 | intercore |
-| | q_realtime_margin | f64 | [0.0, 1.0] | - | 实时模块剩余无功容量比例（0=打满，1=空闲，v2.5 新增）。**v2.14 移入 D7 独立维度，输入向量仅出现在 D7[48]** | intercore |
+| | q_realtime_margin | f64 | [0.0, 1.0] | - | 实时模块剩余无功容量比例（0=打满，1=空闲）。**移入 D7 独立维度，输入向量仅出现在 D7[48]** | intercore |
 | **D2-预测数据** | pv_forecast_15min | Vec\<f64\>(15) | [-1000.0, 1000.0] | kW | 未来 15 分钟光伏预测 | LSTM |
 | | load_forecast_15min | Vec\<f64\>(15) | [-1000.0, 1000.0] | kW | 未来 15 分钟负荷预测 | LSTM |
 | **D3-电价** | current_electricity_price | f64 | [0.0, 2.0] | 元/kWh | 当前实时电价 | 物联平台 |
@@ -923,19 +901,19 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | | temperature | f64 | [-20.0, 60.0] | °C | 环境温度 | 气象 API |
 | **D6-调度** | dispatch_p_set | Option\<f64\> | [-1000.0, 1000.0] | kW | 调度主站下发的有功设定值 | gateway |
 | | dispatch_q_set | Option\<f64\> | [-1000.0, 1000.0] | kVar | 调度主站下发的无功设定值 | gateway |
-| **D7-实时模块** | q_realtime_margin | f64 | [0.0, 1.0] | - | 实时模块剩余无功容量比例（0=打满，1=空闲）。**v2.14 从 D1 移入独立维度，输入向量索引 [48]** | intercore |
+| **D7-实时模块** | q_realtime_margin | f64 | [0.0, 1.0] | - | 实时模块剩余无功容量比例（0=打满，1=空闲）。**从 D1 移入独立维度，输入向量索引 [48]** | intercore |
 | **D8-季节时段** | season_encoding | [f64; 6] | one-hot | - | 季节编码：[灌溉季, 炒茶季, 空调季, 常规季, 保留, 保留] | data-processing |
 | | time_period_encoding | [f64; 2] | one-hot | - | 时段编码：[白天, 夜间] | data-processing |
-| **D9-安全覆盖** | safety_override_active | bool | {true, false} | - | 安全覆盖激活标志，true=实时模块正在覆盖 AI 有功指令（v2.10 新增）| intercore |
+| **D9-安全覆盖** | safety_override_active | bool | {true, false} | - | 安全覆盖激活标志，true=实时模块正在覆盖 AI 有功指令| intercore |
 | | safety_override_reason | Option\<String\> | - | - | 触发原因（voltage_violation/q_exhausted/emergency，仅 active=true 时有效）| intercore |
 | | safety_override_p_ref | Option\<f64\> | [-50.0, 50.0] | kW | 安全覆盖强制放电功率（仅 active=true 时有效）| intercore |
-| | safety_override_consecutive | u32 | [0, ∞) | - | 连续触发次数（v2.14 新增）| intercore |
-| | safety_override_ratio | f64 | [0.0, 1.0] | - | 滑动窗口内覆盖比例（v2.14 新增）| intercore |
-| **D10-概率负荷** | load_forecast_quantiles | Vec\<f64\>(15) | [0.0, 10000.0] | kW | 分位数负荷预测（v2.16：15 步 P90 值；P10/P50 数据生成后未消费，待真分位数回归上线后扩展）| LSTM |
-| | shock_load_probability | f64 | [0.0, 1.0] | - | 冲击负荷发生概率（v2.11 新增）| LSTM |
-| | base_load | f64 | [0.0, 10000.0] | kW | 基础负荷，50% 分位数（v2.11 新增）| LSTM |
+| | safety_override_consecutive | u32 | [0, ∞) | - | 连续触发次数| intercore |
+| | safety_override_ratio | f64 | [0.0, 1.0] | - | 滑动窗口内覆盖比例| intercore |
+| **D10-概率负荷** | load_forecast_quantiles | Vec\<f64\>(15) | [0.0, 10000.0] | kW | 分位数负荷预测（15 步 P90 值；P10/P50 数据生成后未消费，待真分位数回归上线后扩展）| LSTM |
+| | shock_load_probability | f64 | [0.0, 1.0] | - | 冲击负荷发生概率| LSTM |
+| | base_load | f64 | [0.0, 10000.0] | kW | 基础负荷，50% 分位数| LSTM |
 
-> **v3.1 注释 — 取值范围 vs 归一化范围：**
+> **注释 — 取值范围 vs 归一化范围：**
 > 上表"取值范围"列为理论极值，用于边界检查和异常检测。
 > 实际 ONNX 推理输入的 MinMax 归一化使用**部署典型范围**（来自 MUPC-AI2 `constants.py`），
 > 与训练管线对齐：
@@ -946,30 +924,35 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 > | load_power | [-1000, 1000] kW | [0, 60] kW |
 > | grid_power | [-1000, 1000] kW | [-200, 200] kW |
 > | battery_power | [-500, 500] kW | [-50, 50] kW |
-> | transformer_load | [0.0, 2.0] | 不作归一化 (identity 透传) |
+> | transformer_load | [0.0, 2.0] | identity（不归一化） |
 > | battery_soc | [0.0, 1.0] | [0.0, 1.0] |
 > | solar_irradiance | [0.0, 1500.0] W/m² | [0.0, 1500.0] W/m² |
 > | temperature | [-20.0, 60.0] °C | [-20.0, 60.0] °C |
 >
-> 以上归一化范围与 MUPC-AI2 `mupc_env/constants.py` + `observation.py:normalize_obs()` 严格对齐。
+> **同步（2026-07-06）：** 归一化范围已对齐上游 MUPC-AI2 `constants.py`：
+> - `battery_soc` [0.1,0.9]→[0.0,1.0]、`transformer_load` MinMax→identity、
+> - `solar_irradiance` [0,1000]→[0,1500]、`temperature` [-10,45]→[-20,60]。
+> 详见 `docs/TODO/下游同步要求-v3.1-归一化与动作空间修正.md`。
+>
+> 若训练管线更新归一化范围，需同步更新 `data_fusion.rs::normalize_observation()` 和本表。
 
 **总维度：** D1(9) + D2(30) + D3(3) + D4(3) + D5(2) + D6(1) + D7(1) + D8(8) + D9(4) + D10(17) = **78 维**（D3 的 peak_price/valley_price 为辅助字段不入向量，D6 的 dispatch_q_set 为辅助字段不入向量）。
 
-> **v2.15 修正：** D1(10) → D1(9) — q_realtime_margin 已移至 D7 独立维度（v2.14），但 D1 中残留重复 push 导致输入向量实际 79 维。修正后与 MUPC-AI2 训练管线 `observation.py:to_input_vector` 严格对齐（78 维）。
+> **修正：** D1(10) → D1(9) — q_realtime_margin 已移至 D7 独立维度，但 D1 中残留重复 push 导致输入向量实际 79 维。修正后与 MUPC-AI2 训练管线 `observation.py:to_input_vector` 严格对齐（78 维）。
 >
-> **v2.14 说明：** D9 新增 `safety_override_consecutive` 和 `safety_override_ratio`，用于精细化 SafetyOverride 惩罚计算。D9 从 2 维扩展至 4 维，输入向量从 76 维扩展至 78 维。
+> **说明：** D9 新增 `safety_override_consecutive` 和 `safety_override_ratio`，用于精细化 SafetyOverride 惩罚计算。D9 从 2 维扩展至 4 维，输入向量从 76 维扩展至 78 维。
 >
-> **v2.11 说明：** D10 新增分位数负荷预测，支撑冲击负荷预备度奖励计算。输入向量从 61 维扩展至 76 维。
+> **说明：** D10 新增分位数负荷预测，支撑冲击负荷预备度奖励计算。输入向量从 61 维扩展至 76 维。
 >
-> **v2.10 说明：** D9 新增安全覆盖状态（3 维），AI 引擎感知实时控制模块临时覆盖事件。输入向量从 56 维扩展至 59 维，RL 模型文件需重新训练或填充默认值向后兼容。
+> **说明：** D9 新增安全覆盖状态（3 维），AI 引擎感知实时控制模块临时覆盖事件。输入向量从 56 维扩展至 59 维，RL 模型文件需重新训练或填充默认值向后兼容。
 >
-> **v2.5 说明：** D1 新增 `q_realtime_margin`（v2.14 已移至 D7 独立维度）和 D8 新增季节/时段编码。
+> **说明：** D1 新增 `q_realtime_margin`（已移至 D7 独立维度）和 D8 新增季节/时段编码。
 >
-> **历史说明：** PRD v2.10/v2.11 中 59 维的描述不准确，实际应为 61 维（v2.10）和 76 维（v2.11）。
+> **历史说明：** PRD 中 59 维的描述不准确，实际应为 61 维和 76 维。
 
 序列化为推理输入向量时，各维度按定义顺序拼接。
 
-### 6.3 动作空间定义（2 维，v2.15）
+### 6.3 动作空间定义（2 维）
 
 > ## 符号约定：p_ref > 0 = 放电（向电网注入功率），p_ref < 0 = 充电（从电网吸收功率）
 > 此约定与实时控制模块、MUPC-AI2 训练管线三方一致。k_droop >= 0，不下垂时为 0。
@@ -979,7 +962,7 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | A1 | p_ref | f64 | [-50.0, 50.0] | kW | 有功基准点（负值=充电，正值=放电）| 核间→实时控制模块 |
 | A2 | k_droop | f64 | [0.0, 30.0] | kW/V | 电压-有功下垂系数，范围由实时控制模块提供 | 核间→实时控制模块 |
 
-> **v2.15 精简说明：** 原 A3(load_shedding)、A4(pv_limit)、A5(confidence) 已从动作空间移除：
+> **精简说明：** 原 A3(load_shedding)、A4(pv_limit)、A5(confidence) 已从动作空间移除：
 > - **load_shedding（可中断负荷切除）**：属于南向设备直控，由策略引擎的需量控制策略独立执行，不作为 AI 引擎输出维度
 > - **pv_limit（光伏限功率）**：属于南向设备直控，由策略引擎的防逆流策略独立执行，不作为 AI 引擎输出维度
 > - **confidence（决策置信度）**：属于 ActionOutput 元数据而非动作维度，已移至 `ModelOutput`，由 ActionValidator 校验后注入，不参与 AI 决策
@@ -992,11 +975,11 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 - `k_droop`：AI 输出的下垂系数（电压-有功下垂系数）
 - `ΔV`：电压偏差 = V_actual - V_target，单位 V
 
-**符号约定（v2.15 统一声明）：** **p_ref > 0 = 放电（向电网注入功率），p_ref < 0 = 充电（从电网吸收功率）。** 此约定与实时控制模块、MUPC-AI2 上游训练管线三方一致。k_droop >= 0 为正常下垂方向。
+**符号约定（统一声明）：** **p_ref > 0 = 放电（向电网注入功率），p_ref < 0 = 充电（从电网吸收功率）。** 此约定与实时控制模块、MUPC-AI2 上游训练管线三方一致。k_droop >= 0 为正常下垂方向。
 
 **k_droop 物理含义：** 电压每升高 1V（ΔV > 0），P_output 减小 k_droop kW（趋向充电方向 → 从电网吸收更多功率，拉低电压）；电压每降低 1V（ΔV < 0），P_output 增大 k_droop kW（趋向放电方向 → 向电网注入更多功率，抬升电压）。下垂公式中的减号保证负反馈：电压偏高时自动减少出力，电压偏低时自动增加出力。
 
-### 6.4 双参数动作空间（v2.7）
+### 6.4 双参数动作空间
 
 动作空间从单参数升级为双参数（P_ref + k_droop），实现时间尺度解耦：
 - **AI 负责稳态全局优化**（P_ref）
@@ -1018,9 +1001,9 @@ RLModel 使用 MADDPG 或 PPO 算法，基于融合状态、LSTM 预测值和场
 | ACT-04 | k_droop ∈ [k_droop_min, k_droop_max] | 下垂系数范围约束 |
 | ACT-05 | dispatch_p_set 有效时，\|p_ref\| <= \|dispatch_p_set\| | 调度指令权限约束 |
 
-> **v2.15 说明：** load_shedding、pv_limit 的约束校验（原 ACT-05、ACT-06）已下沉至策略引擎独立执行，不再纳入 AI 动作约束规则。confidence 校验移至 ActionValidator → ModelOutput 流程。
+> **说明：** load_shedding、pv_limit 的约束校验（原 ACT-05、ACT-06）已下沉至策略引擎独立执行，不再纳入 AI 动作约束规则。confidence 校验移至 ActionValidator → ModelOutput 流程。
 
-#### 6.5.1 调度指令与 AI 目标冲突消解（v3.1）
+#### 6.5.1 调度指令与 AI 目标冲突消解
 
 当调度主站下发强制指令（如紧急功率支撑、计划性充放电）与 AI 最优策略发生持续冲突时，需明确调度优先级的硬约束逻辑，防止 AI 价值网络因长期被迫执行次优动作而估计失真。
 
@@ -1047,9 +1030,9 @@ pub struct ActionOutput {
 }
 ```
 
-> **v2.15 说明：** v2.15 从 ActionOutput 中移除 `load_shedding`（下沉至策略引擎需量控制）、`pv_limit`（下沉至策略引擎防逆流）、`confidence`（移至 `ModelOutput` 作为校验结果元数据）。
+> **说明：** 从 ActionOutput 中移除 `load_shedding`（下沉至策略引擎需量控制）、`pv_limit`（下沉至策略引擎防逆流）、`confidence`（移至 `ModelOutput` 作为校验结果元数据）。
 >
-> **legacy 版本：** v2.6 及之前的 `ActionOutput` 结构体（使用 `p_batt_set` 字段）已废弃，仅用于兼容旧模式。
+> **legacy 版本：** 早期 `ActionOutput` 结构体（使用 `p_batt_set` 字段）已废弃，仅用于兼容旧模式。
 
 ### 6.7 消息总线集成
 
@@ -1062,10 +1045,10 @@ pub struct ActionOutput {
 | `ai/droop_range` | intercore | ActionValidator | {k_min, k_max} JSON | 按需更新 |
 | `ai/current_mode` | ModeSelector | Web UI（心跳查询）| RunningMode JSON | 按需查询 |
 
-**指令分发说明（v2.15）：** ActionOutput 的 2 个控制维度按以下路径分发：
+**指令分发说明：** ActionOutput 的 2 个控制维度按以下路径分发：
 - `p_ref` + `k_droop` → 通过 intercore（TCP/RJ45）发送到**实时控制模块**，用于下垂控制公式
 
-**下沉至策略引擎执行的功能（v2.15）：**
+**下沉至策略引擎执行的功能：**
 - `load_shedding`（可中断负荷切除）→ 策略引擎的需量控制策略通过南向 RS485/HPLC 发送到负荷控制装置，AI 引擎不再直接输出
 - `pv_limit`（光伏限功率）→ 策略引擎的防逆流策略通过南向 RS485/HPLC 发送到光伏逆变器，AI 引擎不再直接输出
 - `confidence`（决策置信度）→ 从 ActionOutput 移至 ModelOutput，由 ActionValidator 校验后注入，作为决策质量评估元数据在 Web UI 展示
@@ -1079,12 +1062,12 @@ pub struct ActionOutput {
 | STATE-03 | 状态输入到推理开始的总延迟 < 5ms | 性能测试 |
 | STATE-04 | Option 字段为 None 时，RL 决策器自动取其维度值 = 0.0 并跳过相关约束 | 集成测试 |
 | STATE-05 | 预测数据向量长度固定 15 维，超出/不足时自动裁剪/补零 | 单元测试 |
-| STATE-v2.10-01 | FusedSystemState 新增 safety_override_active/reason/p_ref 字段 | P0 | v2.10 PRD |
-| STATE-v2.10-02 | to_input_vector() 返回 59 维向量（向后兼容）| P0 | v2.10 PRD |
-| STATE-v2.10-03 | q_realtime_margin 数据来源为核间 DataUpload 帧 | P0 | v2.10 PRD |
-| OVERRIDE-01 | SafetyOverride 帧（0x0040）可正确解析 | P0 | v2.10 PRD |
-| OVERRIDE-02 | FusedSystemState.safety_override_active 在收到帧后正确设置 | P0 | v2.10 PRD |
-| OVERRIDE-03 | AI 感知 override_active=true 时获得 R_safety_override 惩罚 | P0 | v2.10 PRD |
+| STATE-v2.10-01 | FusedSystemState 新增 safety_override_active/reason/p_ref 字段 | P0 | PRD |
+| STATE-v2.10-02 | to_input_vector() 返回 59 维向量（向后兼容）| P0 | PRD |
+| STATE-v2.10-03 | q_realtime_margin 数据来源为核间 DataUpload 帧 | P0 | PRD |
+| OVERRIDE-01 | SafetyOverride 帧（0x0040）可正确解析 | P0 | PRD |
+| OVERRIDE-02 | FusedSystemState.safety_override_active 在收到帧后正确设置 | P0 | PRD |
+| OVERRIDE-03 | AI 感知 override_active=true 时获得 R_safety_override 惩罚 | P0 | PRD |
 | ACT-01 | 动作空间包含全部 2 个动作维度 | 单元测试 |
 | ACT-02 | 每个动作维度的取值范围严格执行定义边界 | 单元测试 + clamp 验证 |
 | ACT-03 | 约束校验违反时自动 clamp 并记录 WARN 日志 | 集成测试 |
@@ -1104,7 +1087,7 @@ pub struct ActionOutput {
 | RL-02 | RL 决策延迟 < 1s | 性能测试 |
 | RL-03 | RL 决策综合回报相比固定策略提升 >= 20% | 对比实验 |
 
-### 6.9 电压异常应急策略（v2.9）
+### 6.9 电压异常应急策略
 
 RobustnessManager 负责检测电压异常和电池 SOC 异常，在 RL 决策前返回应急动作，保障本质安全。
 
@@ -1154,19 +1137,19 @@ async fn dispatch_ai_decision(&self, action: ActionOutput) -> Result<(), AiError
 | RB-04 | 异常恢复后自动切回 AI 模式 | 集成测试 |
 
 
-### 6.7 安全 RL 包装器（Safety RL Wrapper）
+### 6.10 安全 RL 包装器（Safety RL Wrapper）
 
-#### 6.7.1 背景与动机
+#### 6.10.1 背景与动机
 
 | 现存问题 | 说明 |
 |----------|------|
 | ActionValidator 仅做静态数值校验（值域、变化率、调度约束）| 无法预测动作施加后电网的短时动态响应 |
-| RobustnessManager（v2.9）属被动防御 | 仅在异常已发生（电压<0.9p.u.）时才介入，存在滞后窗口 |
+| RobustnessManager 属被动防御 | 仅在异常已发生（电压<0.9p.u.）时才介入，存在滞后窗口 |
 | 合法的 `p_ref` 在特定工况下可能引发低电压 | 例如 -30kW 在低电压工况下可致电压从 0.98 骤降至 0.92 |
 
 **设计目标**：在 RL 决策后、ActionValidator 前插入**物理模型前置过滤器**，基于戴维南等效电路预测电压变化，提前拒绝高风险动作。
 
-#### 6.7.2 SafetyRLWrapper 模块（核心）
+#### 6.10.2 SafetyRLWrapper 模块（核心）
 
 **位置**：`crates/ai-engine/src/safety_wrapper.rs`（新增）
 
@@ -1235,7 +1218,7 @@ pub enum CheckResult {
 }
 ```
 
-#### 6.7.3 ModelManager 集成
+#### 6.10.3 ModelManager 集成
 
 **集成位置**：`model_manager.full_decision_cycle` 第 6 步（RL 决策）后、ActionValidator 前
 
@@ -1254,7 +1237,7 @@ strategy-engine
 - RobustnessManager **事中**应急响应（异常已发生时）
 - 两者串联：先 SafetyRLWrapper，再 RobustnessManager，最后 ActionValidator
 
-#### 6.7.4 线路阻抗配置
+#### 6.10.4 线路阻抗配置
 
 **新增配置字段**（`mupc/config/ai.toml`）：
 
@@ -1275,7 +1258,7 @@ soc_margin = 0.02               # SOC 安全裕度（比临界多 2%）
 max_check_latency_ms = 5        # 单次检查最大延迟
 ```
 
-#### 6.7.5 检查结果推送
+#### 6.10.5 检查结果推送
 
 **事件流架构**：
 
@@ -1309,7 +1292,7 @@ Web UI EventSource（自动接收）
 }
 ```
 
-#### 6.7.6 Web API 状态端点
+#### 6.10.6 Web API 状态端点
 
 **新增端点**（`crates/web-api/src/routes/ai/safety_wrapper.rs`）：
 
@@ -1319,7 +1302,7 @@ Web UI EventSource（自动接收）
 | GET | `/api/v1/safety_wrapper/recent_violations` | 最近 100 条违规记录 | Operator+ |
 | GET | `/api/v1/safety_wrapper/stats` | 统计（拒绝率、平均延迟等）| Operator+ |
 
-#### 6.7.7 Web UI 监控面板
+#### 6.10.7 Web UI 监控面板
 
 **位置**：`crates/web-api/src/static/ai-monitor.html`（新增）
 
@@ -1331,7 +1314,7 @@ Web UI EventSource（自动接收）
 | 安全边界配置展示 | `GET /status` | 30s |
 | 实时电压预测曲线 | `GET /status` + 历史数据 | 5s |
 
-#### 6.7.8 接口定义
+#### 6.10.8 接口定义
 
 ```rust
 /// 单条违规记录（持久化到 storage）
@@ -1357,7 +1340,7 @@ pub struct SafetyStats {
 }
 ```
 
-#### 6.7.9 验收标准
+#### 6.10.9 验收标准
 
 | ID | 标准 | 验证方法 |
 |----|------|----------|
@@ -1379,7 +1362,7 @@ pub struct SafetyStats {
 | SAFETY-16 | 拒绝率超过阈值（默认 20%）时触发 Web UI 告警 | 集成测试 |
 | SAFETY-17 | 端到端延迟增加 < 5ms（< 120ms 总预算的 5%）| 性能测试 |
 
-#### 6.7.10 兼容性说明
+#### 6.10.10 兼容性说明
 
 | 项 | 影响 | 处理 |
 |----|------|------|
@@ -1390,7 +1373,7 @@ pub struct SafetyStats {
 | Web UI 新增面板 | 不影响现有 UI | 独立页面 `ai-monitor.html` |
 | 配置文件新增 `[safety_wrapper]` 段 | 默认值兜底 | 缺失时使用代码内默认值 |
 
-#### 6.7.11 非目标
+#### 6.10.11 非目标
 
 | 项 | 状态 | 理由 |
 |----|------|------|
@@ -1399,7 +1382,7 @@ pub struct SafetyStats {
 | 复杂小信号模型（替换线性灵敏度）| 推迟 | 5ms 性能预算下不适用 |
 | 拒绝率历史趋势机器学习预测 | 推迟 | 增加复杂度，收益有限 |
 
-#### 6.7.12 改动文件清单
+#### 6.10.12 改动文件清单
 
 | 模块 | 文件 | 类型 |
 |------|------|------|
@@ -1424,7 +1407,7 @@ RewardCalculator 根据当前场景标签，选择对应的奖励函数公式计
 
 **优化目标：** 最大化光伏消纳 + 防止变压器过载 + 电池寿命保护 + P-Q 协同优化
 
-**v2.5 分层架构原则：**
+**分层架构原则：**
 - AI 仅在实时模块无功耗尽时才对电压偏差负责（q_realtime_margin <= 10% + 越限连续 2 步）
 - 实时模块有裕度时，电压问题由实时模块自行处理，AI 不因"旁观"被惩罚
 - 自适应损耗系数 α(s) ∈ {1.0, 0.2, 3.0} 区分"常规调度"与"应急处置"的电池损耗价值差异
@@ -1448,7 +1431,7 @@ R_agri = w1 * R_pv_consumption
 | q_realtime_margin <= 10% 且 \|ΔV\| > 5% 连续 >= 2 步 | 0.2 | 电压支撑模式 |
 | 其他 | 1.0 | 常规调度 |
 
-**P-Q 协同度奖励 R_PQ_coordination（v2.8 + v2.13 Sigmoid 平滑化）：**
+**P-Q 协同度奖励 R_PQ_coordination（Sigmoid 平滑化）：**
 ```rust
 w_save = 1 / (1 + exp(-k * (q_margin - q_threshold)));
 w_support = 1 - w_save;
@@ -1457,14 +1440,14 @@ r_pq = w_save * r_lazy + w_support * r_correct;
 - Q 有裕度（q_margin > 10%）：AI"偷懒"省电池 → +50
 - Q 饱和（q_margin <= 10%）：低电压 + 放电 或 高电压 + 充电 → +50
 
-**弃光奖励差异化（v2.8）：**
+**弃光奖励差异化：**
 - v_avg >= 1.05 时：充电消纳 → 正常奖励；放电 → -20 惩罚
 
-**SafetyOverride 惩罚 R_safety_override（v2.14 重构）：**
+**SafetyOverride 惩罚 R_safety_override（重构）：**
 ```rust
 if safety_override_active {
     if safety_override_consecutive < 10 {
-        // 样本不足：使用固定中等惩罚（v2.15：删除 reason 差异化，因 D9 无 reason_code 字段）
+        // 样本不足：使用固定中等惩罚（删除 reason 差异化，因 D9 无 reason_code 字段）
         -3.33
     } else {
         // 样本充足：比例 + 连续次数惩罚，归一化至 [-1, 0]
@@ -1475,9 +1458,9 @@ if safety_override_active {
 }
 ```
 
-**互斥逻辑（v2.14）：** `safety_override_active = true` 时，跳过该步的 P-Q 协同度惩罚
+**互斥逻辑：** `safety_override_active = true` 时，跳过该步的 P-Q 协同度惩罚
 
-> **v2.15 更新：** 删除 v2.13 中的 `match reason { voltage_violation/q_exhausted/emergency/... }` 分支。原因：D9 字段表（§3.5）已无 `safety_override_reason_code` 字段（4 维收窄为 active/p_ref/consecutive/ratio），样本不足时无 reason 数据可用。改用统一固定惩罚 -3.33（≈ 原 voltage_violation -50/15 档位）。
+> **更新：** 删除 `match reason { voltage_violation/q_exhausted/emergency/... }` 分支。原因：D9 字段表（§3.5）已无 `safety_override_reason_code` 字段（4 维收窄为 active/p_ref/consecutive/ratio），样本不足时无 reason 数据可用。改用统一固定惩罚 -3.33（≈ 原 voltage_violation -50/15 档位）。
 
 **权重配置：**
 | 权重 | 默认值 | 说明 | 可配置范围 |
@@ -1492,7 +1475,7 @@ if safety_override_active {
 | w8 | 1.0 | 安全覆盖惩罚 | [0.0, 5.0] |
 | w9 | 1.0 | 冲击负荷预备度奖励 | [0.0, 3.0] |
 
-> **v3.1 新增 w9**：冲击负荷预备度奖励（shock_readiness_reward）。
+> **新增 w9**：冲击负荷预备度奖励（shock_readiness_reward）。
 > 在 `reward_calculator.rs::calc_agri_v2_8()` 末尾作为独立项加入。
 > 权重通过 `shock_conservative_coefficient`（默认 0.7）调节保守程度。
 
@@ -1500,7 +1483,7 @@ if safety_override_active {
 
 **优化目标：** 最大化峰谷电价差收益 + 最小化电池损耗
 
-> **v2.4 说明：** Q 由实时控制模块调节，本奖励函数中 Q 的影响体现在 P_batt 物理方程中。
+> **说明：** Q 由实时控制模块调节，本奖励函数中 Q 的影响体现在 P_batt 物理方程中。
 
 ```
 R_arbitrage = w1 * R_price_spread - w2 * P_battery_degradation
@@ -1509,9 +1492,9 @@ R_price_spread = sum(p_ref * delta_t * (price_sell - price_buy)) * conversion_fa
 P_battery_degradation = beta * (|p_ref| / E_battery_total)²    # C-rate² × β
 ```
 
-> **v2.15 修正：** `P_battery_degradation` 公式由 v2.13 累积能量模型改为 C-rate² 应力模型。
-> - **原公式（v2.13）：** `β · Σ(|P_batt_set| · Δt) / E_battery_total · 100`（累积绝对能量，梯度信号弱）
-> - **新公式（v2.15）：** `β · (|p_ref| / E_battery_total)²`（瞬时 C-rate²，符合电池应力疲劳物理模型，与上游训练管线对齐）
+> **修正：** `P_battery_degradation` 公式由累积能量模型改为 C-rate² 应力模型。
+> - **原公式：** `β · Σ(|P_batt_set| · Δt) / E_battery_total · 100`（累积绝对能量，梯度信号弱）
+> - **新公式：** `β · (|p_ref| / E_battery_total)²`（瞬时 C-rate²，符合电池应力疲劳物理模型，与上游训练管线对齐）
 > - 与 §5.3 SCENE-01 子项定义、`reward_calculator.rs` 实现、上游训练管线三处保持一致
 > - REWARD-A3 验收（delta_SOC=0 → P_batt_deg=0）仍满足：`|p_ref|=0` 时 C-rate²=0
 > - SCENE-01 还引入了自适应系数 α(s)（SOC 极低时=3.0 强化保护，电压支撑时=0.2 放宽），SCENE-B1 可选启用（β 即此处 α）
@@ -1594,18 +1577,18 @@ R_carbon_reduction = 100 * (C_baseline - C_actual) / C_baseline
 | REWARD-E3 | C_actual >= C_baseline 时 R_carbon_reduction = 0 | 单元测试 |
 | REWARD-E4 | 电网排放因子从配置文件读取，默认 0.581 kg CO2/kWh | 配置验证 |
 | REWARD-ALL | 奖励函数完整计算时间 < 1ms | 性能测试 |
-| REWARD-v2.5-01 | q_realtime_margin > 0.10 时 R_voltage = 0（条件不触发）| P0 | v2.5 PRD |
-| REWARD-v2.5-02 | q_realtime_margin <= 0.10 且电压越限连续2步时触发电压惩罚 | P0 | v2.5 PRD |
-| REWARD-v2.5-03 | SOC < 10% 时 α = 3.0，电池损耗惩罚加重 | P0 | v2.5 PRD |
-| REWARD-v2.5-04 | v_avg >= 1.05 p.u. 时弃光奖励 = 0 | P0 | v2.5 PRD |
-| REWARD-v2.5-05 | α(s) 三状态（常规/电压支撑/SOC极低）互斥，取最高优先级 | P0 | v2.5 PRD |
-| REWARD-v2.8-01 | Q 有裕度时 AI 不动作（|p_ref| < 5kW）→ R_PQ = +50.0 | P0 | v2.8 PRD |
-| REWARD-v2.8-02 | Q 饱和 + 低电压时 AI 放电（p_ref < 0）→ R_PQ = +50.0；不放电 → R_PQ = -30.0 | P0 | v2.8 PRD |
-| REWARD-v2.8-03 | Q 饱和 + 高电压时 AI 充电（p_ref > 0）→ R_PQ = +50.0；不充电 → R_PQ = -30.0 | P0 | v2.8 PRD |
-| REWARD-v2.8-04 | v_avg >= 1.05 时 AI 充电消纳 → R_pv 正常；放电 → R_pv = -20.0 | P0 | v2.8 PRD |
-| REWARD-v2.8-05 | R_smooth 惩罚项存在（|Δk_droop| + λ·超限惩罚）| P0 | v2.8 PRD |
-| REWARD-v2.10-01 | safety_override_active=true 时 R_safety_override 根据触发原因惩罚 | P0 | v2.10 PRD |
-| CONFIG-v2.5-01 | reward_thresholds 配置项可通过 ai.toml 加载，缺失时自动回退默认值 | P1 | v2.5 PRD |
+| REWARD-v2.5-01 | q_realtime_margin > 0.10 时 R_voltage = 0（条件不触发）| P0 | PRD |
+| REWARD-v2.5-02 | q_realtime_margin <= 0.10 且电压越限连续2步时触发电压惩罚 | P0 | PRD |
+| REWARD-v2.5-03 | SOC < 10% 时 α = 3.0，电池损耗惩罚加重 | P0 | PRD |
+| REWARD-v2.5-04 | v_avg >= 1.05 p.u. 时弃光奖励 = 0 | P0 | PRD |
+| REWARD-v2.5-05 | α(s) 三状态（常规/电压支撑/SOC极低）互斥，取最高优先级 | P0 | PRD |
+| REWARD-v2.8-01 | Q 有裕度时 AI 不动作（|p_ref| < 5kW）→ R_PQ = +50.0 | P0 | PRD |
+| REWARD-v2.8-02 | Q 饱和 + 低电压时 AI 放电（p_ref < 0）→ R_PQ = +50.0；不放电 → R_PQ = -30.0 | P0 | PRD |
+| REWARD-v2.8-03 | Q 饱和 + 高电压时 AI 充电（p_ref > 0）→ R_PQ = +50.0；不充电 → R_PQ = -30.0 | P0 | PRD |
+| REWARD-v2.8-04 | v_avg >= 1.05 时 AI 充电消纳 → R_pv 正常；放电 → R_pv = -20.0 | P0 | PRD |
+| REWARD-v2.8-05 | R_smooth 惩罚项存在（|Δk_droop| + λ·超限惩罚）| P0 | PRD |
+| REWARD-v2.10-01 | safety_override_active=true 时 R_safety_override 根据触发原因惩罚 | P0 | PRD |
+| CONFIG-v2.5-01 | reward_thresholds 配置项可通过 ai.toml 加载，缺失时自动回退默认值 | P1 | PRD |
 | TO-01 | L=0.70 时变压器过载惩罚为 0 | 单元测试 |
 | TO-02 | L=0.90 时变压器过载惩罚为 10 | 单元测试 |
 | TO-03 | L=1.00 时变压器过载惩罚为 50 | 单元测试 |
@@ -1616,7 +1599,7 @@ R_carbon_reduction = 100 * (C_baseline - C_actual) / C_baseline
 | DV-03 | k 值可配置，范围 [0.0, 5.0] | 配置测试 |
 | DV-04 | 电压波动幅度降低 >= 25% | 对比实验 |
 | SH-01 | 无冲击负荷时 R_shock = 0 | 单元测试 |
-| SH-02 | 冲击负荷发生时，策略引擎执行 load_shedding 越大奖励越高（v2.15：load_shedding 值从策略引擎观测获取，非 AI 直接输出）| 单元测试 |
+| SH-02 | 冲击负荷发生时，策略引擎执行 load_shedding 越大奖励越高（load_shedding 值从策略引擎观测获取，非 AI 直接输出）| 单元测试 |
 | SH-03 | 响应时间越长惩罚越大 | 单元测试 |
 | SH-04 | 需量超标次数降低 >= 30% | 对比实验 |
 | TH-01 | Q_THRESHOLD 可通过配置修改 | 配置测试 |
@@ -1735,8 +1718,7 @@ OnlineUpdater 模块负责基于新产生的运行数据，在设备运行期间
 | 安全保护 | loss 连续 10 周期不下降或上升时，停止微调并回滚至上一检查点 |
 | 数据存储 | 保留最近 30 天训练数据，本地存储 <= 1GB |
 
-### 9.3 影子模型验证 + 渐进式切换（v2.10）
-
+### 9.3 影子模型验证 + 渐进式切换
 ```rust
 pub enum UpdateError {
     SafetyViolation { score: f32, threshold: f32 },
@@ -1787,8 +1769,7 @@ async fn safe_update(&self, new_weights: &[f32]) -> Result<bool, UpdateError> {
 | AC3 | 渐进式切换权重，每步间隔可配置（默认 1 秒）| 集成测试 |
 | AC4 | 切换过程记录日志，包含每步权重混合比例 | 日志审查 |
 
-### 9.5 自适应权重优化器（v2.11）
-
+### 9.5 自适应权重优化器
 AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化，自动调优 SCENE-01 奖励函数的 w1~w7 权重，减少人工调参依赖。
 
 #### 9.5.1 核心组件
@@ -1843,12 +1824,12 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | LSTM 预测延迟 | < 1s | 性能测试 |
 | RL 决策延迟 | < 1s | 性能测试 |
 | AI 完整决策周期 | 1Hz（默认，与融合周期一致）| 运行时观测 |
-| 权重优化推理延迟（v2.11）| < 100ms | 性能测试 |
-| 权重优化更新周期（v2.11）| >= 1 小时 | 运行时观测 |
-| 分位数预测延迟（v2.11）| <= 1s | 性能测试 |
-| 冲击负荷概率计算延迟（v2.11）| <= 10ms | 性能测试 |
+| 权重优化推理延迟 | < 100ms | 性能测试 |
+| 权重优化更新周期 | >= 1 小时 | 运行时观测 |
+| 分位数预测延迟 | <= 1s | 性能测试 |
+| 冲击负荷概率计算延迟 | <= 10ms | 性能测试 |
 
-**v3.0 预测增强管线新增：**
+**预测增强管线新增：**
 
 | 指标 | 要求 | 测量方法 |
 |------|------|----------|
@@ -1859,7 +1840,7 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 误差修正 BiLSTM 推理延迟 | <= 200ms | 性能测试 |
 | 误差修正 + 主预测总延迟 | < 1s | 性能测试 |
 
-**v3.1 最坏情况执行时间（WCET）分析：**
+**最坏情况执行时间（WCET）分析：**
 
 在多任务并发或 NPU 负载较高时，增强模型推理可能超时。以下为各降级路径的 WCET 预算与备份策略：
 
@@ -1869,9 +1850,9 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | No-Go A | VMD(CPU 50ms) + LSTM(NPU 40ms) + EC(NPU 200ms) | 350ms | 超时1s→降级至 Level 3 |
 | No-Go B | VMD(CPU 50ms) + LSTM(NPU 40ms) | 150ms | 超时1s→降级至 Level 3 |
 | Level 3 | LSTM/Attention(NPU 60ms) | 100ms | 超时500ms→降级至 Level 4 |
-| **Level 4 轻量备份** | **纯 LSTM v2.16 基线(NPU 40ms)** | **60ms** | **超时500ms→Level 5 安全兜底** |
+| **Level 4 轻量备份** | **纯 LSTM 基线(NPU 40ms)** | **60ms** | **超时500ms→Level 5 安全兜底** |
 
-**轻量级备份策略：** Level 4（Baseline）即 v2.16 纯 LSTM 模型，不依赖 VMD/Attention/BiLSTM/误差修正任何增强模块。当增强模型推理超时或内存溢出时，8 级降级机制自动逐级回退至 Level 4，保障业务连续性。Level 4 模型与增强模型独立 OTA，增强模型升级失败不影响轻量备份可用性。
+**轻量级备份策略：** Level 4（Baseline）即纯 LSTM 模型，不依赖 VMD/Attention/BiLSTM/误差修正任何增强模块。当增强模型推理超时或内存溢出时，8 级降级机制自动逐级回退至 Level 4，保障业务连续性。Level 4 模型与增强模型独立 OTA，增强模型升级失败不影响轻量备份可用性。
 
 ### 10.2 模型精度
 
@@ -1881,9 +1862,9 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 负荷预测 MAPE | <= 15% | 回测验证 |
 | RL 决策综合回报 | 相比固定策略提升 >= 20% | 对比实验 |
 
-**v3.0 预测增强精度目标（分轮迭代）：**
+**预测增强精度目标（分轮迭代）：**
 
-| 指标 | 基线（v2.16） | 第一轮目标 | 第二轮目标 |
+| 指标 | 基线 | 第一轮目标 | 第二轮目标 |
 |------|---------------|------------|------------|
 | 光伏预测 MAPE（第 1 步） | <= 10% | <= 8.5% | <= 7.5% |
 | 负荷预测 MAPE（第 1 步） | <= 15% | <= 13% | <= 12% |
@@ -1896,7 +1877,7 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 **精度测量环境：**
 - 测试集：与训练集无时间重叠的 >= 30 天连续数据
 - 指标计算：MAPE 按天计算后取月均值
-- 对比基线：v2.16 纯 LSTM（无 VMD、无 Attention、无误差修正）在同一测试集上的表现
+- 对比基线：纯 LSTM（无 VMD、无 Attention、无误差修正）在同一测试集上的表现
 
 ### 10.3 模型大小与资源占用
 
@@ -1907,7 +1888,7 @@ AdaptiveWeightOptimizer 基于元学习（MetaRL）和 NSGA-II 多目标优化�
 | 训练数据本地存储 | <= 1GB（30 天） |
 | 日志存储 | 按系统滚动策略（单文件 10MB，保留 10 个） |
 
-**v3.0 预测增强新增：**
+**预测增强新增：**
 
 | 指标 | 要求 |
 |------|------|
@@ -2044,19 +2025,19 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 数据恢复 5 连续周期后 → 自动切回 AI 模式
 ```
 
-**v3.0 预测增强降级层级（6 级）：**
+**预测增强降级层级（6 级）：**
 
 ```
 第 1 级: VMD → LSTM/BiLSTM + Attention → 误差修正 BiLSTM   [全功能]
 第 2 级: VMD → LSTM + Attention → 无误差修正                  [误差修正降级]
 第 3 级: 无VMD → LSTM + Attention → 无误差修正                [VMD降级]
 第 4 级: 无VMD → LSTM（无Attention）→ 无误差修正              [Attention降级]
-第 5 级: v2.16 基线 LSTM 推理                                  [全降级]
+第 5 级: 基线 LSTM 推理                                  [全降级]
 ```
 
 降级触发为**单模块粒度**：某个模块失败时仅降级该模块及其下游依赖，不影响其他正常模块。系统启动时自检所有可用模块，确定初始运行层级。运行中模块恢复后自动升回更高层级（需连续 5 次成功）。
 
-### 11.4 预测增强异常处理（v3.0）
+### 11.4 预测增强异常处理
 
 #### 11.4.1 信号分解异常
 
@@ -2081,7 +2062,7 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 
 | 异常场景 | 检测条件 | 处理措施 | 恢复策略 |
 |----------|----------|----------|----------|
-| 增强模型文件缺失 | 文件路径不存在 | 回退至 v2.16 基线模型文件，增强功能全部降级 | 记录 WARN，等待 OTA 下发增强模型 |
+| 增强模型文件缺失 | 文件路径不存在 | 回退至基线模型文件，增强功能全部降级 | 记录 WARN，等待 OTA 下发增强模型 |
 | 增强模型文件损坏 | SHA256 校验失败 | 拒绝加载，回退至基线模型 | 记录 ERROR，触发 OTA 备份恢复流程 |
 | 增强模型与 RKNN Runtime 版本不兼容 | rknn_init 返回 -4（SDK 版本不匹配） | 拒绝加载，回退至基线模型 | 记录 ERROR，等待 RKNN Runtime 升级 |
 | 输入维度不匹配 | rknn_init 返回 -5（输入数量不匹配） | 拒绝加载，回退至基线模型 | 记录 ERROR，检查训练管线输出与部署配置一致性 |
@@ -2093,7 +2074,7 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 |----------|----------|----------|----------|
 | VMD K 值超出了合理范围 | K < 2 或 K > 10 | 使用默认 K 值（光伏 K=5，负荷 K=6） | 记录 WARN，以默认值启动 |
 | Attention 配置启用但模型不含 Attention 层 | 模型元数据中无 Attention 层标记 | 自动回退到无 Attention 模式 | 记录 WARN |
-| 配置文件格式错误 | YAML/TOML 解析失败 | 使用 v2.16 默认配置（全部增强功能禁用） | 记录 ERROR，启动后通知运维 |
+| 配置文件格式错误 | YAML/TOML 解析失败 | 使用默认配置（全部增强功能禁用） | 记录 ERROR，启动后通知运维 |
 | MSSA 搜索超时 | 搜索时间 > 2 小时 | 输出当前最优解并终止 | 记录 WARN，增加最大迭代次数或缩小搜索空间后可重试 |
 | MSSA 搜索结果退化 | 最优 MAPE > 人工基线 MAPE * 1.1 | 标记结果为"不可用"，使用人工基线超参 | 记录 WARN，检查搜索空间配置是否合理 |
 
@@ -2104,11 +2085,11 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 | VMD + Attention 均正常 | 全功能运行 |
 | VMD 失败，Attention 正常 | 跳过 VMD，原始序列 + Attention |
 | VMD 正常，Attention 失败 | VMD 分解 + 无 Attention（权重退化为等权） |
-| VMD + Attention 均失败 | 回退至 v2.16 基线纯 LSTM 推理 |
+| VMD + Attention 均失败 | 回退至基线纯 LSTM 推理 |
 | 误差修正失败 | 主预测值直接输出，不修正 |
 | BiLSTM 启用但 Attention 禁用 | BiLSTM 输出直接到全连接层（跳过 Attention），记录 INFO |
 
-#### 11.4.6 数据缺失值语义与处理（v3.1）
+#### 11.4.6 数据缺失值语义与处理
 
 78 维状态空间中包含多个 `Option` 字段和外部 API 数据（气象、电价）。`unwrap_or(0.0)` 的简单补零策略对不同类型的缺失值应区分处理：
 
@@ -2138,23 +2119,22 @@ AI引擎异常 → 检测异常（心跳/状态码/连续失败计数）→ 切�
 
 ```toml
 [reward_thresholds]
-# === 核心阈值（v2.5 初版，v2.12 R-07 可配置化）===
+# === 核心阈值（初版，R-07 可配置化）===
 voltage_deadband = 0.05       # ±5% 死区
 q_margin_threshold = 0.10     # Q 裕度阈值，低于此值视为"无功耗尽"
 p_threshold_kw = 5.0          # P 阈值（kW），省电策略判定阈值
 pv_high_limit = 1.05          # 弃光前置电压阈值
 soc_critical = 0.10           # SOC 极低保护阈值，<此值触发 α=3.0
 
-# === 电压惩罚系数（v2.5）===
+# === 电压惩罚系数 ===
 voltage_penalty_high = 2.0   # 高电压侧（光伏超发）
 voltage_penalty_low = 1.0     # 低电压侧（灌溉/炒茶/空调负荷）
 
-# === 默认值行为（v2.5）===
+# === 默认值行为 ===
 # 配置文件缺失 `reward_thresholds` 时，所有参数自动回退至默认值，保证向后兼容
 ```
 
-### 12.2 折扣累积奖励机制（v2.10）
-
+### 12.2 折扣累积奖励机制
 ```toml
 [discounted_reward]
 gamma = 0.99                 # 折扣因子，范围 [0.9, 0.999]
@@ -2170,7 +2150,7 @@ buffer_size = 1000            # 奖励历史缓冲区大小
 | BC3 | gamma=0.99 时 100 步前奖励权重约 0.366 | 数学验证 |
 | BC4 | 与现有奖励函数正交，不影响即时奖励计算 | 回归测试 |
 
-### 12.3 v2.12 奖励函数改进配置
+### 12.3 奖励函数改进配置
 
 #### 12.3.1 R-01 奖励子项标准化（已实现）
 
@@ -2240,9 +2220,9 @@ lambda_shock = 5.0            # 响应时间惩罚系数
 shock_threshold_kw = 10.0     # 冲击负荷判定阈值（P90 - P50 > threshold）
 ```
 
-### 12.4 v2.13 精细化改进配置
+### 12.4 精细化改进配置
 
-> **v2.13 核心变更：** 基于专家建议（2026-06-14）中有参考意义的 P0/P1 项，解决以下问题：
+> **核心变更：** 基于专家建议（2026-06-14）中有参考意义的 P0/P1 项，解决以下问题：
 
 | 来源 | 问题 | 解决方案 |
 |------|------|----------|
@@ -2282,7 +2262,7 @@ policy_mix_enabled = true     # a_blended = (1-α)*a_old + α*a_new
 mix_steps = 10                # 过渡步数
 ```
 
-### 12.5 下垂控制参数（v2.7/v2.8）
+### 12.5 下垂控制参数
 
 ```toml
 [droop_control]
@@ -2291,8 +2271,7 @@ lambda_smooth = 10.0         # 超限惩罚系数
 # R_smooth = -|Δk_droop| - λ * max(0, k_droop - K_MAX)
 ```
 
-### 12.6 在线微调参数（v2.10）
-
+### 12.6 在线微调参数
 ```toml
 [online_updater]
 batch_size = 32              # 触发微调的样本数
@@ -2301,24 +2280,6 @@ max_retention_days = 30     # 训练数据保留天数
 max_storage_mb = 1024        # 本地存储上限（MB）
 rollback_checkpoints = 1      # 回滚检查点数量
 ```
-
----
-
-## 13. 历史遗留问题与技术债
-
-| 编号 | 问题 | 说明 | 优先级 | 状态 |
-|------|------|------|--------|------|
-| T-01 | 状态空间维度描述错误 | PRD 历史版本标题写 59 维，实际应为 78 维 | **高** | ✅ 已修复（v2.14 统一版全部修正） |
-| T-02 | R-04 变压器过载分段惩罚 | 分段函数：安全区(0~75%) / 线性(75~90%) / 指数(90~100%) / 硬惩罚(>100%) | 中 | ✅ 已实现（`overload_penalty_piecewise`） |
-| T-03 | R-05 电压斜率动态权重 | w6(v) = base_w6 × (1.0 + k × \|ΔV\|) | 中 | ✅ 已实现（`dynamic_voltage_slope_weight`） |
-| T-04 | R-06 冲击负荷响应奖励 | v2.13 重构为冲击负荷**预备度奖励**：`R_readiness = w1×(SOC预留-SOC) + w2×(P预留-\|p_ref\|)`，当 P90-P50 > threshold 时触发。替代 v2.12 原始 `response_time` 设计（专家建议 §2.5：1Hz RL 无法感知 ms 级冲击）| 中 | ✅ 已实现（`shock_readiness_reward` + `calc_shock_readiness_reward`） |
-| T-05 | R-07 P-Q 阈值可配置化 | Q_THRESHOLD / P_THRESHOLD 从硬编码改为配置文件读取 | 中 | ✅ 已实现（`PqCoordinationThresholds` + Default） |
-| T-06 | 在线微调 Phase 3C.2 | 原为占位框架，现已完整实现影子模型验证+渐进式切换 | 中 | ✅ 已实现（`SafeOnlineUpdater::safe_update`） |
-| T-07 | v2.0 前 SceneClassifier | 已废弃，替换为 ModeSelector | 低 | ✅ 已关闭 |
-| T-08 | v2.1 前 D5 电能质量 | 已从 AI 引擎移除，实时控制模块独立处理 | 低 | ✅ 已关闭 |
-| T-09 | AI 引擎与 strategy-engine 集成测试 | RobustnessManager 异常检测→应急动作→正常恢复的端到端测试覆盖不足 | 中 | ⚠️ 待补充 |
-| T-10 | Phase 2+ 协议支持 | IEC 61850-7-420、MQTT over TLS、SM2/SM4 国密（影响 AI 引擎数据管道安全） | 低 | 📋 规划中 |
-| T-11 | P90 分位数误差离线评估 | PLF-06 要求 P90 误差 < 15%，需离线回测数据验证 | 低 | ⚠️ 待验证 |
 
 ---
 
@@ -2339,13 +2300,8 @@ mupc/crates/ai-engine/
 │   ├── action_validator.rs       # 动作约束校验器
 │   ├── online_updater.rs         # 在线微调
 │   ├── rknn_runtime.rs           # RKNN Runtime 推理
-│   ├── robustness_manager.rs    # 电压异常应急策略（v2.9）
-│   ├── reward_normalizer.rs      # Welford 动态归一化（v2.13）
-│   ├── adaptive_weight_optimizer.rs  # 自适应权重优化器（v2.11）
-│   ├── pareto_optimizer.rs       # NSGA-II 多目标优化（v2.11）
-│   ├── performance_collector.rs  # 性能指标收集器（v2.11）
-│   ├── load_covariates.rs        # 负荷协变量（v2.11）
-│   ├── error.rs                  # 错误类型
+│   ├── robustness_manager.rs    # 电压异常应急策略
+│   ├── reward_normalizer.rs      # Welford 动态归一化│   ├── adaptive_weight_optimizer.rs  # 自适应权重优化器│   ├── pareto_optimizer.rs       # NSGA-II 多目标优化│   ├── performance_collector.rs  # 性能指标收集器│   ├── load_covariates.rs        # 负荷协变量│   ├── error.rs                  # 错误类型
 │   └── config.rs                 # 配置结构
 ```
 
@@ -2359,49 +2315,11 @@ mupc/crates/ai-engine/
 | 5 | 在线微调是否需要经过审批流程（安全考虑）？还是自动触发？ | 中 | 影响 OnlineUpdater 触发策略 |
 | 6 | 气象数据连续缺失时长"10 个周期"是以融合周期（10 秒）还是气象更新周期（150 分钟）计？ | 中 | 影响 FUSION 告警阈值配置 |
 
-### 14.3 预测增强改动范围（v3.0）
-
-#### 14.3.1 涉及 Crate
-
-| Crate | 改动类型 | 说明 |
-|-------|----------|------|
-| `mupc-ai-engine` | 修改 | 新增 VMD 预处理模块、Attention 层配置、误差修正管线集成 |
-| `mupc-ai-engine` | 修改 | `LstmConfig` 新增增强模块开关字段 |
-| `mupc-ai-engine` | 修改 | `lstm_model.rs` 推理流程扩展（VMD 分解 -> 推理 -> 误差修正），LstmInput 构造适配 MIC 筛选后的特征维度 |
-| `mupc-ai-engine` | 修改 | `data_fusion.rs` 中 FusedSystemState 序列化逻辑适配 MIC 筛选后特征增/减维 |
-| `mupc-ai-engine` | 修改 | 错误类型新增增强模块相关变体 |
-| `mupc-common` | - | 不涉及（特征向量序列化逻辑在 mupc-ai-engine 而非 mupc-common，预测增强对下游 crate 透明） |
-| `mupc-strategy-engine` | - | 不涉及（FusedSystemState 接口不变） |
-
-#### 14.3.2 配置文件变更
-
-`mupc/config/mupc_env_config.yaml`（或新增预测增强独立配置文件）：
-
-```yaml
-prediction_enhancement:
-  vmd:
-    enabled: true
-    k_pv: 5                   # 光伏模态数
-    k_load: 6                 # 负荷模态数
-    alpha: 2000               # 惩罚因子
-    tol: 1.0e-6               # 收敛容差
-    max_iter: 500             # 最大迭代次数
-  attention:
-    enabled: true
-    score_type: "additive"    # additive / dot / general
-  bilstm:
-    enabled: false            # 默认禁用，Attention 验证后按需启用
-  error_correction:
-    enabled: false            # 默认禁用，主预测模型偏差 > 3% 时启用
-  feature_selection:
-    mic_top_k: 7              # MIC 筛选 Top-K 特征数
-```
-
-#### 14.3.3 跨项目接口契约（与 MUPC-AI2 训练管线对接）
+### 14.3 跨项目接口契约（与 MUPC-AI2 训练管线对接）
 
 本节定义 MUPC 推理端与 MUPC-AI2 训练管线之间的数据交换接口，确保 MIC 分析、MSSA 搜索、ONNX 模型转换三个跨项目环节的输出可直接被对端消费，无需人工转录。
 
-##### 14.3.3.1 MIC 分析输出 JSON Schema
+#### 14.3.1 MIC 分析输出 JSON Schema
 
 MIC 离线分析脚本输出 JSON 文件，由训练管线读取以确定模型输入特征集。
 
@@ -2451,7 +2369,7 @@ MIC 离线分析脚本输出 JSON 文件，由训练管线读取以确定模型�
 - 若 `selected` 特征数 != `top_k`（如部分扩展候选特征不可用），训练管线以实际选中数量为准
 - `mic_value` 数组按 `rank` 升序排列（rank=1 为最强相关性）
 
-##### 14.3.3.2 MSSA 搜索结果 JSON Schema
+#### 14.3.2 MSSA 搜索结果 JSON Schema
 
 MSSA 超参搜索输出 JSON 文件，由训练管线读取以设置最优超参组合。
 
@@ -2521,7 +2439,7 @@ MSSA 超参搜索输出 JSON 文件，由训练管线读取以设置最优超参
 }
 ```
 
-##### 14.3.3.3 增强后 ONNX 模型输入/输出维度约定
+#### 14.3.3 增强后 ONNX 模型输入/输出维度约定
 
 **通用约定（MUPC-AI2 训练管线与 MUPC RT 推理端共同遵守）：**
 
@@ -2556,7 +2474,7 @@ output_horizon（固定 15） ──→ ONNX output dim_1（无 VMD）/ dim_2（
 | `mupc_input_window` | 整数 | 12 / 24 / 36 |
 | `mupc_version` | 字符串 | 模型版本号，与 OTA 模型管理联动 |
 
-### 14.4 预测增强术语表（v3.0 新增）
+### 14.4 预测增强术语表
 
 | 术语 | 全称/说明 |
 |------|-----------|
@@ -2575,22 +2493,16 @@ output_horizon（固定 15） ──→ ONNX output dim_1（无 VMD）/ dim_2（
 
 ---
 
-### 14.5 v3.1 交付变更（2026-07-05）
+## 附录：版本演进
 
-| 变更 | 说明 |
-|------|------|
-| 7维输入升级 | `LstmConfig` 新增 `input_features`/`yesterday_offset_steps`，`HistorySample` 7 字段 |
-| 观测归一化 | `normalize_observation()` MinMax 78 维，完全镜像训练 `normalize_obs()` |
-| 动作反归一化 | `parse_action_output` 改为 2 维 tanh → 物理值反归一化 |
-| VMD 多特征降级 | `input_features > 1` 时 VMD 路径自动降级至 AttentionOnly |
-| FFI 平台条件编译 | `rknn_runtime_sys` 仅在 Linux + npu 链接真实库，其他平台 stub |
-| npu default feature | Linux 默认启用 npu，Windows 自动 stub |
-| 数据库迁移幂等 | ALTER TABLE 前 PRAGMA table_info 检查 |
-| 双边审计 P0/P1 | 消除训练-部署 7 维/1 维 Gap、观测归一化不一致、动作反归一化缺失 |
+> 正文已整合全部历史补丁，本表仅作演进追溯。
 
-**文档状态：** 统一版 v3.1（第 3 章已重构为系统统一描述，整合 v1.0~v3.0 全部历史版本）
-
-**来源文档：**
-- `docs/superpowers/specs/modules/05-MUPC-AI引擎-PRD.md`（v1.0~v3.0 历史版本合并，v3.1 重构）
-- `docs/superpowers/specs/2026-06-21-预测增强分层混合架构-PRD.md`（v1.1 [REVIEWED: PASS]，已合并至第 3 章）
-- `docs/superpowers/plans/modules/05-MUPC-AI引擎-设计文档.md`（设计文档 v3.1）
+| 版本 | 主要变更 |
+|------|----------|
+| v3.1 | 第 3 章重构为统一分层混合架构描述（整合 v2.16/v3.0 增量，安全 RL 包装器移入第 6 章） |
+| v3.0 | 预测增强分层混合架构（VMD 分解 + Attention + BiLSTM + 误差修正 + MSSA 超参优化） |
+| v2.17 | 安全 RL 包装器（物理模型事前预测拒绝 + 线路阻抗配置化） |
+| v2.16 | LSTM 步长统一 15 分钟、15 步分位数预测、D10 数据流 |
+| v2.15 | 动作空间精简 5 维→2 维（load_shedding/pv_limit 下沉策略引擎） |
+| v2.14 | SafetyOverride 奖励重构 + FusedSystemState 78 维统一 |
+| v2.13 | Sigmoid P-Q 平滑化 + Welford 奖励归一化 |
