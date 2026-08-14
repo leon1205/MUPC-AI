@@ -57,6 +57,12 @@ python export_onnx.py --lstm checkpoints/lstm_checkpoint.pt
 
 # 下载 SMART-DS 数据集
 python data/download_smart_ds.py
+
+# 运行测试
+python tests/test_v31_features.py        # v3.1 核心功能（QuantileLoss/Log-barrier/ErrorCorrection 等）
+python tests/test_grid2op_replacement.py # Grid2Op 替换/降级
+python tests/test_modes.py               # 多模式训练结果验证（需 SB3，独立脚本）
+python -m pytest tests/ -q               # 等价运行可被 pytest 收集的单元测试
 ```
 
 ## 架构
@@ -72,7 +78,11 @@ models/                 → ML 模型 (v3.1)
   └── vmd.py            → VMD 变分模态分解
         ↓
 mupc_env/               → Gymnasium 环境：78/79维观测 + 2维动作 + 5场景奖励
+  ├── core.py           → MupcEnv 主类
+  ├── observation.py    → EnvState + build_observation + normalize_obs
+  ├── rewards.py        → 5 场景奖励 + SCENE-01 子奖励
   ├── action_validator.py → 动作约束 ACT-01~05
+  ├── state_builder.py  → 状态/奖励构建纯函数 (A-4 从 core.py 拆出)
   └── grid2op/          → Grid2Op + Pandapower 电压仿真
         ↓
 train.py                → SB3 PPO/SAC 训练（主路径），NumPy PPO 后备
@@ -134,12 +144,20 @@ Q_batt 由实时电压调节器闭环控制，不经过 RL 动作空间。
 ```
 train.py
 ├── data_loader.py              (SmartDSLoader + ChinaDataLoader + UnifiedDataLoader)
+├── config/                     (YAML 环境配置)
+│   ├── config_manager.py       (YAML → dataclass, load_config/get_config)
+│   └── mupc_env_config.yaml    (物理常数/动作空间/奖励权重, v3.0 版本指纹)
 ├── models/                     (ML 模型)
-│   ├── lstm.py                 (LSTM + TCN + Attention + BiLSTM)
+│   ├── lstm.py                 (LSTM + TCN + Attention + BiLSTM + QuantileLoss)
 │   ├── error_correction.py     (BiLSTM 误差修正)
-│   └── vmd.py                  (VMD 分解)
+│   └── vmd.py                  (VMD 变分模态分解)
 ├── mupc_env/                   (Gymnasium 环境)
 │   ├── core.py                 (MupcEnv 主类)
+│   ├── observation.py          (EnvState + build_observation + normalize_obs)
+│   ├── rewards.py              (5 场景奖励 + SCENE-01 子奖励)
+│   ├── constants.py            (物理常数 + 归一化边界)
+│   ├── voltage_sim.py          (VoltageSimulator 降级电压模型)
+│   ├── state_builder.py        (build_env_state/build_reward_dict 纯函数)
 │   ├── action_validator.py     (ACT-01~05 动作约束)
 │   └── grid2op/                (Grid2Op + Pandapower 电压仿真)
 ├── stable_baselines3           (PPO/SAC，主路径)
